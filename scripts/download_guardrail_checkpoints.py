@@ -18,10 +18,12 @@ from typing import List
 
 from huggingface_hub import snapshot_download
 
+from scripts.modelscope_utils import modelscope_download
+
 
 def download_models(models: List[str], destination_root: str):
     """
-    Download models from Hugging Face Hub and save them in org/project structure.
+    Download guardrail-related models and save them in org/project structure.
 
     Args:
         models: List of model IDs in format 'org/project'
@@ -35,12 +37,20 @@ def download_models(models: List[str], destination_root: str):
         model_path = os.path.join(destination_root, model_id)
 
         try:
-            # Download the model
-            snapshot_download(
-                repo_id=model_id,
-                local_dir=model_path,
-                revision=revision,
-            )
+            # Cosmos-Guardrail1 已在 ModelScope 上以 nv-community 组织提供.
+            if model_id == "nvidia/Cosmos-Guardrail1":
+                modelscope_download(
+                    "nv-community/Cosmos-Guardrail1",
+                    model_path,
+                    revision=revision,
+                )
+            else:
+                # 其余 guardrail 组件(例如 Llama-Guard)仍从 Hugging Face Hub 下载.
+                snapshot_download(
+                    repo_id=model_id,
+                    local_dir=model_path,
+                    revision=revision,
+                )
             print(f"Successfully downloaded {model_id} to {model_path}")
 
         except Exception as e:
@@ -49,7 +59,7 @@ def download_models(models: List[str], destination_root: str):
 
 def download_guardrail_checkpoints(destination_root: str):
     """
-    Download guardrail checkpoints from Hugging Face Hub and save them in org/project structure.
+    Download guardrail checkpoints and save them in org/project structure.
 
     Args:
         destination_root: Root directory where checkpoints will be saved

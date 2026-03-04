@@ -18,14 +18,13 @@ import hashlib
 import os
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
-
 from scripts.download_guardrail_checkpoints import download_guardrail_checkpoints
+from scripts.modelscope_utils import modelscope_download
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="A script to download NVIDIA Cosmos-Tokenizer1 models from Hugging Face"
+        description="A script to download NVIDIA Cosmos-Tokenizer1 models from ModelScope"
     )
     parser.add_argument(
         "--tokenizer_types",
@@ -54,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--checkpoint_dir", type=str, default="checkpoints", help="Directory to save the downloaded checkpoints."
+    )
+    parser.add_argument(
+        "--download_guardrail",
+        action="store_true",
+        help="Whether to also download guardrail checkpoints (optional).",
     )
     args = parser.parse_args()
     return args
@@ -112,9 +116,10 @@ def get_md5_checksum(checkpoints_dir, model_name):
 
 
 def main(args) -> None:
-    ORG_NAME = "nvidia"
+    # ModelScope 上的 NVIDIA 权重仓库目前以 nv-community 组织提供.
+    ORG_NAME = "nv-community"
 
-    # Mapping from size argument to Hugging Face repository name
+    # Mapping from size argument to repository name
     model_map = {
         "CV8x8x8-720p": "Cosmos-Tokenize1-CV8x8x8-720p",
         "DV8x16x16-720p": "Cosmos-Tokenize1-DV8x16x16-720p",
@@ -130,7 +135,7 @@ def main(args) -> None:
     checkpoints_dir = Path(args.checkpoint_dir)
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
-    download_kwargs = dict(allow_patterns=["README.md", "model.pt", "mean_std.pt", "config.json", "*.jit"])
+    include_patterns = ["README.md", "model.pt", "mean_std.pt", "config.json", "*.jit"]
 
     # Download the requested Tokenizer models
     for tokenizer_type in args.tokenizer_types:
@@ -141,11 +146,13 @@ def main(args) -> None:
         if not get_md5_checksum(checkpoints_dir, model_name):
             local_dir.mkdir(parents=True, exist_ok=True)
             print(f"Downloading {repo_id} to {local_dir}...")
-            snapshot_download(
-                repo_id=repo_id, local_dir=str(local_dir), local_dir_use_symlinks=False, **download_kwargs
-            )
+            modelscope_download(repo_id, local_dir, include=include_patterns)
 
-    download_guardrail_checkpoints(args.checkpoint_dir)
+    # guardrail 属于可选组件, 便于在网络受限时先完成主流程.
+    if args.download_guardrail:
+        download_guardrail_checkpoints(args.checkpoint_dir)
+    else:
+        print("Skipping guardrail checkpoints download. (Use --download_guardrail to enable.)")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,22 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+
+# 下载/生成的大文件目录(避免误提交)
+checkpoints/
+assets/demo/
+lyra_dataset/
+
+# VS Code 本地配置(不进入仓库)
+.vscode/
+
+# Codex/Agent 工作记忆文件(本地使用,避免污染仓库)
+task_plan*.md
+notes*.md
+WORKLOG*.md
+LATER_PLANS*.md
+ERRORFIX*.md

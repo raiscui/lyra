@@ -21,10 +21,33 @@ from megatron.core import mpu, parallel_state
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.autograd import Function
 from torch.distributed import broadcast, get_process_group_ranks
-from transformer_engine.pytorch.jit import no_torch_dynamo
-from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
-from transformer_engine.pytorch.module.rmsnorm import RMSNorm as RMSNormTE
-from transformer_engine.pytorch.module.rmsnorm import _RMSNorm
+
+# ------------------------------------------------------------
+# Transformer Engine (TE) 在很多环境里需要额外编译 torch 扩展.
+# 推理侧只需要本文件中的并行工具函数, 不应被 TE 依赖阻塞.
+# 因此这里将 TE 相关 import 做成可选, 训练路径若需要 TE 会在运行时报错提示.
+# ------------------------------------------------------------
+try:
+    from transformer_engine.pytorch.jit import no_torch_dynamo
+    from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
+    from transformer_engine.pytorch.module.rmsnorm import RMSNorm as RMSNormTE
+    from transformer_engine.pytorch.module.rmsnorm import _RMSNorm
+
+    _HAS_TRANSFORMER_ENGINE = True
+except Exception:  # noqa: BLE001 - 缺少 TE/torch 扩展时需要兜底, 让推理可继续.
+    no_torch_dynamo = None
+    TransformerEngineBaseModule = None
+    RMSNormTE = None
+    _RMSNorm = None
+    _HAS_TRANSFORMER_ENGINE = False
+
+    def no_torch_dynamo():  # type: ignore[no-redef]
+        """TE 不可用时的装饰器兜底: 不做任何事情."""
+
+        def _decorator(fn):
+            return fn
+
+        return _decorator
 
 from cosmos_predict1.utils import log
 
@@ -191,45 +214,60 @@ class AllReduceBWD(Function):
         return grad_output, None
 
 
-class AllReduceBWDRMSNormTE(RMSNormTE):
-    """
-    A custom RMSNorm layer that applies all-reduce operation during backward pass.
-    Used in tensor parallel training with Transformer Engine.
+if _HAS_TRANSFORMER_ENGINE:
 
-    Args:
-        hidden_size (int): The size of the hidden dimension.
-        process_group: Megatron Core's process group.
-        **kwargs: Additional arguments to be passed to RMSNormTE.
-    """
+    class AllReduceBWDRMSNormTE(RMSNormTE):
+        """
+        A custom RMSNorm layer that applies all-reduce operation during backward pass.
+        Used in tensor parallel training with Transformer Engine.
 
-    def __init__(self, hidden_size, process_group, **kwargs):
-        super().__init__(hidden_size, **kwargs)
-        self.process_group = process_group
+        Args:
+            hidden_size (int): The size of the hidden dimension.
+            process_group: Megatron Core's process group.
+            **kwargs: Additional arguments to be passed to RMSNormTE.
+        """
 
-    @no_torch_dynamo()
-    def forward(self, inp: torch.Tensor) -> torch.Tensor:
-        """RMSNorm FWD"""
+        def __init__(self, hidden_size, process_group, **kwargs):
+            super().__init__(hidden_size, **kwargs)
+            self.process_group = process_group
 
-        # Set the activation type for AMP.
-        TransformerEngineBaseModule.set_activation_dtype(self, inp)
+        @no_torch_dynamo()
+        def forward(self, inp: torch.Tensor) -> torch.Tensor:
+            """RMSNorm FWD"""
 
-        if torch.is_grad_enabled():
-            fwd_fn = _RMSNorm.apply
-            args = []
-        else:
-            fwd_fn = _RMSNorm.forward
-            args = [None]
+            # Set the activation type for AMP.
+            TransformerEngineBaseModule.set_activation_dtype(self, inp)
 
-        args += (
-            inp,
-            AllReduceBWD.apply(self.weight, self.process_group),
-            self.eps,
-            self.fwd_rmsnorm_sm_margin,
-            self.bwd_rmsnorm_sm_margin,
-            self.inf_rmsnorm_sm_margin,
-            self.zero_centered_gamma,
-            torch.is_grad_enabled(),
-            self.activation_dtype,
-        )
+            if torch.is_grad_enabled():
+                fwd_fn = _RMSNorm.apply
+                args = []
+            else:
+                fwd_fn = _RMSNorm.forward
+                args = [None]
 
-        return fwd_fn(*args)
+            args += (
+                inp,
+                AllReduceBWD.apply(self.weight, self.process_group),
+                self.eps,
+                self.fwd_rmsnorm_sm_margin,
+                self.bwd_rmsnorm_sm_margin,
+                self.inf_rmsnorm_sm_margin,
+                self.zero_centered_gamma,
+                torch.is_grad_enabled(),
+                self.activation_dtype,
+            )
+
+            return fwd_fn(*args)
+
+else:
+
+    class AllReduceBWDRMSNormTE(torch.nn.Module):
+        """TE 不可用时的占位实现, 避免 import 直接失败."""
+
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            super().__init__()
+            raise ImportError(
+                "Transformer Engine 不可用, 无法使用 AllReduceBWDRMSNormTE. "
+                "如果你在跑训练/TE 后端, 请安装匹配版本的 transformer_engine_torch."
+            )

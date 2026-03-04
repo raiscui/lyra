@@ -1,49 +1,68 @@
 ### Environment setup
 
 Cosmos runs only on Linux systems. We have tested the installation with Ubuntu 24.04, 22.04, and 20.04.
-Cosmos requires the Python version to be `3.10.x`. Please also make sure you have `conda` installed ([instructions](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)).
+Cosmos requires the Python version to be `3.10.x`.
 
-The below commands creates the `lyra` conda environment and installs the dependencies for inference:
+We manage the environment with [pixi](https://pixi.sh). The workspace is defined in `pixi.toml`.
 ```bash
-# Create the lyra conda environment.
-conda env create --file lyra.yaml
-# Activate the lyra conda environment.
-conda activate lyra
+# Create / update the pixi environment (conda dependencies).
+pixi install
+
+# Enter the environment.
+pixi shell
+
+# (Optional) If you have connectivity issues, configure a proxy first.
+# Example (Clash default ports):
+export https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 all_proxy=socks5://127.0.0.1:7897
+
 # Install the dependencies.
-pip install -r requirements_gen3c.txt
-pip install -r requirements_lyra.txt
-# Patch Transformer engine linking issues in conda environments.
-ln -sf $CONDA_PREFIX/lib/python3.10/site-packages/nvidia/*/include/* $CONDA_PREFIX/include/
-ln -sf $CONDA_PREFIX/lib/python3.10/site-packages/nvidia/*/include/* $CONDA_PREFIX/include/python3.10
-# Install Transformer engine.
-pip install transformer-engine[pytorch]==1.12.0
+python -m pip install -r requirements_gen3c.txt
+python -m pip install -r requirements_lyra.txt
+
+# (Optional) Install Transformer Engine (TE).
+# - Cosmos can run without TE (it will fall back to the PyTorch attention backend).
+# - If you need TE acceleration, install prebuilt wheels to avoid long compilation time.
+#   1) Core package (prebuilt on PyPI):
+#      python -m pip install "transformer-engine==1.12.0"
+#   2) PyTorch extension (install a prebuilt wheel that matches your Python/Torch/CUDA versions):
+#      python -m pip install /path/to/transformer_engine_torch-*.whl
+ pip install --no-build-isolation transformer_engine[pytorch]
 # Install Apex for inference.
-git clone https://github.com/NVIDIA/apex
-CUDA_HOME=$CONDA_PREFIX pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./apex
+test -d apex || git clone https://github.com/NVIDIA/apex
+CUDA_HOME="$CONDA_PREFIX" python -m pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./apex
+
 # Install MoGe for inference.
-pip install git+https://github.com/microsoft/MoGe.git
+python -m pip install git+https://github.com/microsoft/MoGe.git
+
 # Install Mamba for reconstruction model.
-pip install --no-build-isolation "git+https://github.com/state-spaces/mamba@v2.2.4"
+python -m pip install --no-build-isolation "git+https://github.com/state-spaces/mamba@v2.2.4"
 ```
 
 You can test the environment setup for inference with
 ```bash
-CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) python scripts/test_environment.py
+CUDA_HOME="$CONDA_PREFIX" PYTHONPATH="$(pwd)" python scripts/test_environment.py
+```
+
+Optionally, check training-specific dependencies as well:
+```bash
+CUDA_HOME="$CONDA_PREFIX" PYTHONPATH="$(pwd)" python scripts/test_environment.py --training
 ```
 
 ### Download Cosmos-Predict1 tokenizer
 
-1. Generate a [Hugging Face](https://huggingface.co/settings/tokens) access token (if you haven't done so already). Set the access token to `Read` permission (default is `Fine-grained`).
+Tokenizer checkpoints are hosted on ModelScope:
+- https://modelscope.cn/models/nv-community/Cosmos-Tokenize1-CV8x8x8-720p
 
-2. Log in to Hugging Face with the access token:
-   ```bash
-   huggingface-cli login
-   ```
-
-3. Download the Cosmos Tokenize model weights from [Hugging Face](https://huggingface.co/collections/nvidia/cosmos-predict1-67c9d1b97678dbf7669c89a7):
+Download the Cosmos Tokenize model weights from ModelScope:
 ```bash
 python3 -m scripts.download_tokenizer_checkpoints --checkpoint_dir checkpoints/cosmos_predict1 --tokenizer_types CV8x8x8-720p
 ```
+
+Optionally, download guardrail checkpoints (not required if you run with `--disable_guardrail`):
+```bash
+python3 -m scripts.download_tokenizer_checkpoints --checkpoint_dir checkpoints/cosmos_predict1 --tokenizer_types CV8x8x8-720p --download_guardrail
+```
+Note: the guardrail download includes `meta-llama/Llama-Guard-3-8B`, which is currently fetched from Hugging Face Hub.
 
 The downloaded files should be in the following structure:
 ```
@@ -70,21 +89,20 @@ Under the checkpoint repository `checkpoints/<model-name>`, we provide the encod
 
 ### Download GEN3C checkpoints
 
-1. Generate a [Hugging Face](https://huggingface.co/settings/tokens) access token (if you haven't done so already). Set the access token to `Read` permission (default is `Fine-grained`).
+GEN3C checkpoints are hosted on ModelScope:
+- https://modelscope.cn/models/nv-community/GEN3C-Cosmos-7B
 
-2. Log in to Hugging Face with the access token:
+Download the GEN3C model weights:
    ```bash
-   huggingface-cli login
-   ```
-
-3. Download the GEN3C model weights from [Hugging Face](https://huggingface.co/nvidia/GEN3C-Cosmos-7B):
-   ```bash
-   CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) python scripts/download_gen3c_checkpoints.py --checkpoint_dir checkpoints
+   CUDA_HOME="$CONDA_PREFIX" PYTHONPATH="$(pwd)" python scripts/download_gen3c_checkpoints.py --checkpoint_dir checkpoints
    ```
 
 ### Download Lyra checkpoints
 
-1. Download the Lyra model weights from [Hugging Face](https://huggingface.co/nvidia/Lyra):
+Lyra checkpoints are hosted on ModelScope:
+- https://modelscope.cn/models/nv-community/Lyra
+
+Download the Lyra model weights:
    ```bash
-   CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) python scripts/download_lyra_checkpoints.py --checkpoint_dir checkpoints
+   CUDA_HOME="$CONDA_PREFIX" PYTHONPATH="$(pwd)" python scripts/download_lyra_checkpoints.py --checkpoint_dir checkpoints
    ```

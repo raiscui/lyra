@@ -17,11 +17,106 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-import transformer_engine as te
+import warnings
 from einops import rearrange
 from torch import nn
 from torch.utils.checkpoint import checkpoint
-from transformer_engine.pytorch.attention import DotProductAttention, apply_rotary_pos_emb
+
+# ------------------------------------------------------------
+# Transformer Engine (TE) 在 pip 安装时, torch 扩展通常会触发源码编译.
+# 为了让推理环境更容易装起来,这里把 TE 依赖做成可选:
+# - TE 可用: 使用 TE 的 DotProductAttention/RMSNorm/融合 RoPE.
+# - TE 不可用: 自动回退到纯 PyTorch 实现(功能优先, 性能可能略低).
+# ------------------------------------------------------------
+try:
+    import transformer_engine as te
+    from transformer_engine.pytorch.attention import DotProductAttention as _TeDotProductAttention
+    from transformer_engine.pytorch.attention import apply_rotary_pos_emb as _te_apply_rotary_pos_emb
+
+    _HAS_TRANSFORMER_ENGINE = True
+except Exception:  # noqa: BLE001 - import 失败需要兜底, 包括缺少编译好的 torch 扩展.
+    te = None
+    _TeDotProductAttention = None
+    _te_apply_rotary_pos_emb = None
+    _HAS_TRANSFORMER_ENGINE = False
+
+_WARNED_TE_FALLBACK = False
+
+
+class _FallbackRmsNorm(nn.Module):
+    """
+    一个最小实现的 RMSNorm, 用于在缺少 Transformer Engine 时继续推理.
+
+    说明:
+    - PyTorch 新版本通常自带 `torch.nn.RMSNorm`, 但为了兼容性这里保留兜底实现.
+    - 该实现只支持 elementwise affine(weight), 不包含 bias, 行为与常见 RMSNorm 一致.
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # RMSNorm: x * rsqrt(mean(x^2) + eps) * weight
+        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps).to(dtype=x.dtype)
+        return x * self.weight
+
+
+def _build_rms_norm(channels: int, eps: float = 1e-6) -> nn.Module:
+    """根据运行环境选择 RMSNorm 实现, 优先使用 PyTorch 内置版本."""
+    rms_norm_cls = getattr(nn, "RMSNorm", None)
+    if rms_norm_cls is not None:
+        return rms_norm_cls(channels, eps=eps)
+    return _FallbackRmsNorm(channels, eps=eps)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """与 Transformer Engine 保持一致的 RoPE half-rotation 实现."""
+    x = x.view(x.shape[:-1] + torch.Size((2, x.shape[-1] // 2)))
+    x1, x2 = x.unbind(dim=-2)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(
+    t: torch.Tensor,
+    freqs: torch.Tensor,
+    tensor_format: str = "sbhd",
+    fused: bool = False,
+    **kwargs,
+) -> torch.Tensor:
+    """
+    对齐 Transformer Engine 的 `apply_rotary_pos_emb` 行为.
+
+    - 若 TE 可用, 直接调用 TE(支持 fused kernel).
+    - 若 TE 不可用, 使用纯 PyTorch 版本(忽略 fused 参数).
+    """
+    del kwargs
+
+    if _te_apply_rotary_pos_emb is not None:
+        return _te_apply_rotary_pos_emb(t, freqs, tensor_format=tensor_format, fused=fused)
+
+    # 纯 PyTorch 兜底实现, 参考 TE 的非 fused 路径.
+    if tensor_format not in ("sbhd", "bshd"):
+        raise ValueError(f"Unsupported tensor_format={tensor_format} without Transformer Engine.")
+
+    max_seq_len = freqs.shape[0]
+    cur_seq_len = t.shape[1] if tensor_format == "bshd" else t.shape[0]
+    if cur_seq_len > max_seq_len:
+        raise ValueError(f"Rotary Embeddings only supported up to {max_seq_len} sequence length!")
+
+    freqs = freqs[:cur_seq_len]
+    if tensor_format == "bshd":
+        freqs = freqs.transpose(0, 1)  # [seq, 1, 1, dim] -> [1, seq, 1, dim]
+
+    cos_ = torch.cos(freqs).to(t.dtype)
+    sin_ = torch.sin(freqs).to(t.dtype)
+
+    rot_dim = freqs.shape[-1]
+    t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+    t = (t * cos_) + (_rotate_half(t) * sin_)
+    return torch.cat((t, t_pass), dim=-1)
 
 # ---------------------- Feed Forward Network -----------------------
 
@@ -128,7 +223,9 @@ def get_normalization(name: str, channels: int):
     if name == "I":
         return nn.Identity()
     elif name == "R":
-        return te.pytorch.RMSNorm(channels, eps=1e-6)
+        if _HAS_TRANSFORMER_ENGINE:
+            return te.pytorch.RMSNorm(channels, eps=1e-6)
+        return _build_rms_norm(channels, eps=1e-6)
     else:
         raise ValueError(f"Normalization {name} not found")
 
@@ -202,6 +299,17 @@ class Attention(nn.Module):
             raise ValueError(f"Normalization mode {self.qkv_norm_mode} not found, only support 'per_head'")
 
         self.backend = backend
+        if self.backend == "transformer_engine" and not _HAS_TRANSFORMER_ENGINE:
+            # 推理场景下不强依赖 TE, 缺失时自动回退到 PyTorch 实现.
+            global _WARNED_TE_FALLBACK
+            if not _WARNED_TE_FALLBACK:
+                warnings.warn(
+                    "Transformer Engine 不可用, Attention backend 自动回退为 torch. "
+                    "如需 TE 加速, 请安装匹配版本的 transformer_engine_torch 预编译 wheel.",
+                    RuntimeWarning,
+                )
+                _WARNED_TE_FALLBACK = True
+            self.backend = "torch"
         self.tp_size = 1  # TP is not included in this Attention implementation.
 
         self.to_q = nn.Sequential(
@@ -225,7 +333,7 @@ class Attention(nn.Module):
         if attn_op:  # use what is given
             self.attn_op = attn_op
         elif self.backend == "transformer_engine":
-            self.attn_op: BaseAttentionOp = DotProductAttention(
+            self.attn_op: BaseAttentionOp = _TeDotProductAttention(
                 self.heads,
                 self.dim_head,
                 num_gqa_groups=self.heads,
@@ -288,11 +396,21 @@ class Attention(nn.Module):
             out = self.attn_op(q, k, v, core_attention_bias_type="no_bias", core_attention_bias=None)  # [B, Mq, H, V]
             return self.to_out(out)
         elif self.backend == "torch":
-            q = rearrange(q, "s b h d -> b h s d")
-            k = rearrange(k, "s b h d -> b h s d")
-            v = rearrange(v, "s b h d -> b h s d")
-            out = self.attn_op(q, k, v)  # [B, Mq, H, V]
-            return self.to_out(rearrange(out, " b h s d -> s b (h d)"))
+            if self.qkv_format == "sbhd":
+                q = rearrange(q, "s b h d -> b h s d")
+                k = rearrange(k, "s b h d -> b h s d")
+                v = rearrange(v, "s b h d -> b h s d")
+                out = self.attn_op(q, k, v)  # [B, H, S, D]
+                out = rearrange(out, "b h s d -> s b (h d)")
+            elif self.qkv_format == "bshd":
+                q = rearrange(q, "b s h d -> b h s d")
+                k = rearrange(k, "b s h d -> b h s d")
+                v = rearrange(v, "b s h d -> b h s d")
+                out = self.attn_op(q, k, v)  # [B, H, S, D]
+                out = rearrange(out, "b h s d -> b s (h d)")
+            else:
+                raise ValueError(f"Unsupported qkv_format={self.qkv_format} for torch backend.")
+            return self.to_out(out)
         else:
             raise ValueError(f"Backend {self.backend} not found")
 

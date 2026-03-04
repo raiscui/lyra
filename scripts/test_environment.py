@@ -24,7 +24,7 @@ def parse_args():
     parser.add_argument(
         "--training",
         action="store_true",
-        help="Whether to check training-specific dependencies",
+        help="Whether to check training-specific dependencies (e.g. apex, transformer_engine)",
     )
     return parser.parse_args()
 
@@ -49,7 +49,7 @@ if not (sys.version_info.major == 3 and sys.version_info.minor >= 10):
     sys.exit(1)
 
 if "CONDA_PREFIX" not in os.environ:
-    print("\033[93m[WARNING]\033[0m Cosmos should be run under a conda environment.")
+    print("\033[93m[WARNING]\033[0m Cosmos should be run under a pixi/conda-style environment (e.g. `pixi shell`).")
 
 print("Attempting to import critical packages...")
 
@@ -59,9 +59,9 @@ packages = [
     "diffusers",
     "transformers",
     "megatron.core",
-    "transformer_engine",
 ]
 packages_training = [
+    "transformer_engine",
     "apex.multi_tensor_apply",
 ]
 all_success = True

@@ -26,10 +26,13 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
 from scripts.download_guardrail_checkpoints import download_guardrail_checkpoints
+from scripts.modelscope_utils import modelscope_download
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Download NVIDIA Cosmos Predict1 Gen3C models from Hugging Face")
+    parser = argparse.ArgumentParser(
+        description="Download NVIDIA Cosmos Predict1 Gen3C checkpoints (ModelScope preferred)"
+    )
     parser.add_argument(
         "--checkpoint_dir", type=str, default="checkpoints", help="Directory to save the downloaded checkpoints."
     )
@@ -252,7 +255,8 @@ def get_md5_checksum(checkpoints_dir, model_name):
 
 
 def main(args):
-    ORG_NAME = "nvidia"
+    # ModelScope 上的 NVIDIA 权重仓库目前以 nv-community 组织提供.
+    MODELSCOPE_ORG_NAME = "nv-community"
 
     # Additional models that are always downloaded
     extra_models = [
@@ -264,47 +268,46 @@ def main(args):
     checkpoints_dir = Path(args.checkpoint_dir)
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
-    download_kwargs = dict(
-        allow_patterns=[
-            "README.md",
-            "model.pt",
-            "mean_std.pt",
-            "image_mean_std.pt",
-            "config.json",
-            "*.jit",
-            "guardrail/*",
-        ]
-    )
+    include_patterns = [
+        "README.md",
+        "model.pt",
+        "mean_std.pt",
+        "image_mean_std.pt",
+        "config.json",
+        "*.jit",
+        "guardrail/*",
+    ]
 
     # Download the requested diffusion models
-    model_name = "Gen3C-Cosmos-7B"
-    repo_id = f"{ORG_NAME}/{model_name}"
-    local_dir = checkpoints_dir.joinpath(model_name)
+    local_model_name = "Gen3C-Cosmos-7B"
+    repo_id = f"{MODELSCOPE_ORG_NAME}/GEN3C-Cosmos-7B"
+    local_dir = checkpoints_dir.joinpath(local_model_name)
 
-    if not get_md5_checksum(checkpoints_dir, model_name):
+    if not get_md5_checksum(checkpoints_dir, local_model_name):
         local_dir.mkdir(parents=True, exist_ok=True)
         print(f"Downloading {repo_id} to {local_dir}...")
-        snapshot_download(
-            repo_id=repo_id, local_dir=str(local_dir), local_dir_use_symlinks=False, **download_kwargs
-        )
+        modelscope_download(repo_id, local_dir, include=include_patterns)
 
     # Download the always-included models
     for model_name in extra_models:
         if model_name == "google-t5/t5-11b":
             repo_id = model_name
         else:
-            repo_id = f"{ORG_NAME}/{model_name}"
+            repo_id = f"{MODELSCOPE_ORG_NAME}/{model_name}"
         local_dir = checkpoints_dir.joinpath(model_name)
 
         if not get_md5_checksum(checkpoints_dir, model_name):
             local_dir.mkdir(parents=True, exist_ok=True)
             print(f"Downloading {repo_id} to {local_dir}...")
-            # Download all files for Guardrail
-            snapshot_download(
-                repo_id=repo_id,
-                local_dir=str(local_dir),
-                local_dir_use_symlinks=False,
-            )
+            if model_name == "google-t5/t5-11b":
+                # 该模型体积较大且可能存在权限限制, 目前保持与上游一致: 仍使用 Hugging Face Hub 下载.
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=str(local_dir),
+                    local_dir_use_symlinks=False,
+                )
+            else:
+                modelscope_download(repo_id, local_dir)
 
 
 if __name__ == "__main__":

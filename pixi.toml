@@ -1,0 +1,20 @@
+[workspace]
+# 默认使用 conda-forge 的镜像源, 解决部分网络环境下 conda.anaconda.org 的访问/DNS 问题.
+# 如果你的网络可以稳定直连官方源, 也可以把这里改回 ["conda-forge"].
+channels = ["https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge"]
+name = "lyra"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "3.10.*"
+pip = "25.0.*"
+cmake = "*"
+ninja = "*"
+gcc = "12.4.0.*"
+gxx = "12.4.0.*"
+cuda = "12.4.*"
+cuda-nvcc = "12.4.*"
+cuda-toolkit = "12.4.*"
