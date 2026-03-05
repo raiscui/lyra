@@ -177,6 +177,24 @@ def main_single(
     # Set depth (was only used for supervision)
     main_config.use_depth = config.use_depth
 
+    # ---------------------------------------------
+    # 推理时可覆盖少量关键超参数,避免为了做对比实验去改训练配置文件.
+    # 用法示例:
+    #   accelerate launch sample.py --config ... gaussians_prune_ratio=0.95
+    # ---------------------------------------------
+    override_keys = [
+        "gaussians_prune_ratio",
+        "gaussians_random_ratio",
+        "gaussian_scale_cap",
+        "dnear",
+        "dfar",
+        "pre_sigmoid_distance_shift",
+    ]
+    for key in override_keys:
+        value = OmegaConf.select(config, key)
+        if value is not None:
+            main_config[key] = value
+
     # Get data loader and model
     train_dataloader, test_dataloader = get_multi_dataloader(main_config)
     if transformer is None and vae is None and distributed_state is None:

@@ -91,7 +91,7 @@ Follow the installation instructions for [ViPE](https://github.com/nv-tlabs/vipe
 
 1) Run ViPE to extract depth, intrinsics, and camera poses (make sure to use the --lyra flag to use the same depth estimator as us):
 ```bash
-vipe infer YOUR_VIDEO.mp4 -p lyra --output <vipe_results_dir>
+vipe infer assets/demo/dynamic/diffusion_input/rgb/641936f28bcb490f9d6b0026da1a453a.mp4 -p lyra --output outputs/myvideo
 ```
 
 2) Define the new data path in src/models/data/registry.py as dataset following the structure of our provided datasets

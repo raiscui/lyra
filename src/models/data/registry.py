@@ -30,7 +30,7 @@ dataset_registry['default'] = {
 # Training static
 
 dataset_registry['lyra_static'] = {
-    'cls': RadymWrapper, 
+    'cls': RadymWrapper,
     'kwargs': {
         "root_path": "/path/to/static",
         "is_static": True,
@@ -48,7 +48,7 @@ dataset_registry['lyra_static'] = {
 # Training dynamic
 
 dataset_registry['lyra_dynamic'] = {
-    'cls': RadymWrapper, 
+    'cls': RadymWrapper,
     'kwargs': {
         "root_path": "/path/to/dynamic",
         "is_static": False,
@@ -69,7 +69,7 @@ dataset_registry['lyra_dynamic'] = {
 # Static demo (pre-generated)
 
 dataset_registry['lyra_static_demo'] = {
-    'cls': RadymWrapper, 
+    'cls': RadymWrapper,
     'kwargs': {
         "root_path": "assets/demo/static/diffusion_output",
         "is_static": True,
@@ -87,9 +87,27 @@ dataset_registry['lyra_static_demo'] = {
 # Static demo (self-generated)
 
 dataset_registry['lyra_static_demo_generated'] = {
-    'cls': RadymWrapper, 
+    'cls': RadymWrapper,
     'kwargs': {
         "root_path": "assets/demo/static/diffusion_output_generated",
+        "is_static": True,
+        "is_multi_view": True,
+        "has_latents": True,
+        "is_generated_cosmos_latent": True,
+        "sampling_buckets": [['0'], ['1'], ['2'], ['3'], ['4'], ['5']],
+        "start_view_idx": 0,
+    },
+    'scene_scale': 1.,
+    'max_gap': 121,
+    'min_gap': 45,
+}
+
+# Static demo (self-generated) one view
+
+dataset_registry['lyra_static_demo_generated_one'] = {
+    'cls': RadymWrapper,
+    'kwargs': {
+        "root_path": "assets/demo/static/diffusion_output_generated_one",
         "is_static": True,
         "is_multi_view": True,
         "has_latents": True,
@@ -105,7 +123,7 @@ dataset_registry['lyra_static_demo_generated'] = {
 # Dynamic demo (pre-generated)
 
 dataset_registry['lyra_dynamic_demo'] = {
-    'cls': RadymWrapper, 
+    'cls': RadymWrapper,
     'kwargs': {
         "root_path": "assets/demo/dynamic/diffusion_output",
         "is_static": False,
@@ -126,7 +144,7 @@ dataset_registry['lyra_dynamic_demo'] = {
 # Dynamic demo (self-generated)
 
 dataset_registry['lyra_dynamic_demo_generated'] = {
-    'cls': RadymWrapper, 
+    'cls': RadymWrapper,
     'kwargs': {
         "root_path": "assets/demo/dynamic/diffusion_output_generated",
         "is_static": False,
