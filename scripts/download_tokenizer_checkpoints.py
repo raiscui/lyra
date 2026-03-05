@@ -18,7 +18,6 @@ import hashlib
 import os
 from pathlib import Path
 
-from scripts.download_guardrail_checkpoints import download_guardrail_checkpoints
 from scripts.modelscope_utils import modelscope_download
 
 
@@ -150,6 +149,11 @@ def main(args) -> None:
 
     # guardrail 属于可选组件, 便于在网络受限时先完成主流程.
     if args.download_guardrail:
+        # 说明:
+        # - guardrail 里仍包含部分从 Hugging Face 下载的权重(例如 Llama-Guard).
+        # - 为了不让主流程硬依赖 huggingface_hub,这里使用惰性导入.
+        from scripts.download_guardrail_checkpoints import download_guardrail_checkpoints
+
         download_guardrail_checkpoints(args.checkpoint_dir)
     else:
         print("Skipping guardrail checkpoints download. (Use --download_guardrail to enable.)")

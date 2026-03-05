@@ -16,12 +16,13 @@
 import argparse
 import os
 import cv2
-from moge.model.v1 import MoGeModel
 import torch
 import numpy as np
+from typing import Any
 from cosmos_predict1.diffusion.inference.inference_utils import (
     add_common_arguments,
     check_input_frames,
+    load_moge_model,
     validate_args,
 )
 from cosmos_predict1.diffusion.inference.gen3c_pipeline import Gen3cPipeline
@@ -43,6 +44,23 @@ def create_parser() -> argparse.ArgumentParser:
         default="Pixtral-12B",
         help="Prompt upsampler weights directory relative to checkpoint_dir",
     ) # TODO: do we need this?
+    parser.add_argument(
+        "--moge_model_id",
+        type=str,
+        default="Ruicheng/moge-2-vitl",
+        help="MoGe model HF repo_id (e.g., Ruicheng/moge-2-vitl or Ruicheng/moge-vitl). Can also be a local model.pt path.",
+    )
+    parser.add_argument(
+        "--moge_checkpoint_path",
+        type=str,
+        default=None,
+        help="Optional local path to MoGe checkpoint (model.pt). If provided, it takes precedence over --moge_model_id.",
+    )
+    parser.add_argument(
+        "--hf_local_files_only",
+        action="store_true",
+        help="Pass local_files_only=True to hf_hub_download for MoGe weights (offline mode requires cached files).",
+    )
     parser.add_argument(
         "--input_image_path",
         type=str,
@@ -113,7 +131,7 @@ def validate_args(args):
 
 def _predict_moge_depth(current_image_path: str | np.ndarray,
                         target_h: int, target_w: int,
-                        device: torch.device, moge_model: MoGeModel):
+                        device: torch.device, moge_model: Any):
     """Handles MoGe depth prediction for a single image.
 
     If the image is directly provided as a NumPy array, it should have shape [H, W, C],
@@ -201,7 +219,7 @@ def _predict_moge_depth(current_image_path: str | np.ndarray,
 
 def _predict_moge_depth_from_tensor(
     image_tensor_chw_0_1: torch.Tensor, # Shape (C, H_input, W_input), range [0,1]
-    moge_model: MoGeModel
+    moge_model: Any
 ):
     """Handles MoGe depth prediction from an image tensor."""
     moge_output_full = moge_model.infer(image_tensor_chw_0_1)
@@ -280,7 +298,13 @@ def demo(args):
     frame_buffer_max = pipeline.model.frame_buffer_max
     generator = torch.Generator(device=device).manual_seed(args.seed)
     sample_n_frames = pipeline.model.chunk_size
-    moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl").to(device)
+    # MoGe v1/v2 都实现了 `.infer(...)`,这里通过 checkpoint 结构自动选版本,避免 v1/v2 混用.
+    moge_model, _moge_version = load_moge_model(
+        moge_model_id=args.moge_model_id,
+        moge_checkpoint_path=args.moge_checkpoint_path,
+        hf_local_files_only=args.hf_local_files_only,
+        device=device,
+    )
 
     if args.num_gpus > 1:
         pipeline.model.net.enable_context_parallel(process_group)

@@ -15,11 +15,10 @@
 
 from typing import List, Tuple, Union
 
+import os
 import torch
 import transformers
 from transformers import T5EncoderModel, T5TokenizerFast
-
-from cosmos_predict1.utils import log
 
 transformers.logging.set_verbosity_error()
 
@@ -27,21 +26,37 @@ transformers.logging.set_verbosity_error()
 class CosmosT5TextEncoder(torch.nn.Module):
     """Handles T5 text encoding operations."""
 
-    def __init__(self, model_name: str = "google-t5/t5-11b", device: str = "cuda", cache_dir: str = "~/.cache"):
+    def __init__(
+        self,
+        model_name: str = "google-t5/t5-11b",
+        device: str = "cuda",
+        cache_dir: str = "~/.cache",
+    ):
         """Initializes the T5 tokenizer and encoder.
 
         Args:
             model_name: The name of the T5 model to use.
             device: The device to use for computations.
+            cache_dir: 本地模型目录路径. 这里不会自动联网下载.
         """
         super().__init__()
+        model_dir = os.path.expanduser(cache_dir)
         try:
-            self.tokenizer = T5TokenizerFast.from_pretrained(cache_dir, cache_dir=cache_dir)
-            self.text_encoder = T5EncoderModel.from_pretrained(cache_dir, cache_dir=cache_dir).to(device)
+            # 只从本地目录加载,避免误触发在线下载.
+            # 如果目录不存在,直接给出明确提示,避免 users 在长栈里找不到原因.
+            if not os.path.isdir(model_dir):
+                raise FileNotFoundError(model_dir)
+
+            self.tokenizer = T5TokenizerFast.from_pretrained(model_dir, local_files_only=True)
+            self.text_encoder = T5EncoderModel.from_pretrained(model_dir, local_files_only=True).to(device)
         except Exception as e:
-            log.warning(f"Failed to load T5 model using cache_dir '{cache_dir}', falling back to default location: {e}")
-            self.tokenizer = T5TokenizerFast.from_pretrained(model_name)
-            self.text_encoder = T5EncoderModel.from_pretrained(model_name).to(device)
+            raise RuntimeError(
+                f"无法从本地目录加载 T5 prompt encoder({model_name}): {model_dir}.\n"
+                "请先把 Hugging Face 模型 `google-t5/t5-11b` 下载到该目录.\n"
+                "参考页面: https://huggingface.co/google-t5/t5-11b.\n"
+                "如果你在容器里运行,请确认已把宿主机模型目录挂载到该路径.\n"
+                f"底层错误: {e}"
+            ) from e
         self.text_encoder.eval()
         self.device = device
 

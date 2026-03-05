@@ -17,16 +17,26 @@ export https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 all_pr
 
 # Install the dependencies.
 python -m pip install -r requirements_gen3c.txt
-python -m pip install -r requirements_lyra.txt
+
+# Install Lyra deps.
+# NOTE: `flash-attn==2.6.3` 在 torch 2.6 环境下通常需要从源码编译,并依赖 `cicc`.
+PATH="$CONDA_PREFIX/nvvm/bin:$PATH" CUDA_HOME="$CONDA_PREFIX/targets/x86_64-linux" python -m pip install -r requirements_lyra.txt
 
 # (Optional) Install Transformer Engine (TE).
 # - Cosmos can run without TE (it will fall back to the PyTorch attention backend).
 # - If you need TE acceleration, install prebuilt wheels to avoid long compilation time.
+# - IMPORTANT: Do not install only the TE core package.
+#   If `transformer_engine_torch` is missing, `import transformer_engine.pytorch` can fail and break `import megatron.core`.
 #   1) Core package (prebuilt on PyPI):
 #      python -m pip install "transformer-engine==1.12.0"
 #   2) PyTorch extension (install a prebuilt wheel that matches your Python/Torch/CUDA versions):
 #      python -m pip install /path/to/transformer_engine_torch-*.whl
- pip install --no-build-isolation transformer_engine[pytorch]
+
+# If you don't have a matching `transformer_engine_torch` wheel:
+# - Skip installing TE (recommended), or
+# - Install via the extra (may compile from source and take a long time):
+#   python -m pip install --no-build-isolation "transformer-engine[pytorch]==1.12.0"
+
 # Install Apex for inference.
 test -d apex || git clone https://github.com/NVIDIA/apex
 CUDA_HOME="$CONDA_PREFIX" python -m pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./apex
@@ -96,6 +106,10 @@ Download the GEN3C model weights:
    ```bash
    CUDA_HOME="$CONDA_PREFIX" PYTHONPATH="$(pwd)" python scripts/download_gen3c_checkpoints.py --checkpoint_dir checkpoints
    ```
+
+Note: GEN3C 推理还依赖 T5 prompt encoder(`google-t5/t5-11b`).
+请提前从 Hugging Face 下载,并放到本地目录 `/model/HuggingFace/google-t5/t5-11b`.
+参考: https://huggingface.co/google-t5/t5-11b.
 
 ### Download Lyra checkpoints
 

@@ -43,6 +43,6 @@ save_rgb_decoding: false
 # Output 3D gaussians as simple ply file
 save_gaussians: false
 # Output 3D gaussians using the original 3DGS export script
-save_gaussians_orig: 
+save_gaussians_orig: true
 # Skip existing generated file
 skip_existing: false

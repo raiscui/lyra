@@ -17,7 +17,6 @@ import argparse
 import os
 from pathlib import Path
 import cv2
-from moge.model.v1 import MoGeModel
 import torch
 import random
 import numpy as np
@@ -25,6 +24,7 @@ from typing import Dict, Any
 from cosmos_predict1.diffusion.inference.inference_utils import (
     add_common_arguments,
     check_input_frames,
+    load_moge_model,
     validate_args,
 )
 from cosmos_predict1.diffusion.inference.gen3c_pipeline import Gen3cPipeline
@@ -46,6 +46,23 @@ def create_parser() -> argparse.ArgumentParser:
         default="Pixtral-12B",
         help="Prompt upsampler weights directory relative to checkpoint_dir",
     ) # TODO: do we need this?
+    parser.add_argument(
+        "--moge_model_id",
+        type=str,
+        default="Ruicheng/moge-2-vitl",
+        help="MoGe model HF repo_id (e.g., Ruicheng/moge-2-vitl or Ruicheng/moge-vitl). Can also be a local model.pt path.",
+    )
+    parser.add_argument(
+        "--moge_checkpoint_path",
+        type=str,
+        default=None,
+        help="Optional local path to MoGe checkpoint (model.pt). If provided, it takes precedence over --moge_model_id.",
+    )
+    parser.add_argument(
+        "--hf_local_files_only",
+        action="store_true",
+        help="Pass local_files_only=True to hf_hub_download for MoGe weights (offline mode requires cached files).",
+    )
     parser.add_argument(
         "--input_image_path",
         type=str,
@@ -119,6 +136,11 @@ def create_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Multiply multi trajectory setup with movement distance factor (larger means more movement but potentially more artifacts)",
     )
+    parser.add_argument(
+        "--overwrite_existing",
+        action="store_true",
+        help="如果输出文件已存在,仍然强制重新生成并覆盖. 默认会按进度跳过已完成的环节.",
+    )
     return parser
 
 def parse_arguments() -> argparse.Namespace:
@@ -130,9 +152,122 @@ def validate_args(args):
     assert args.num_video_frames is not None, "num_video_frames must be provided"
     assert (args.num_video_frames - 1) % 120 == 0, "num_video_frames must be 121, 241, 361, ... (N*120+1)"
 
+def _build_clip_name(args: argparse.Namespace, current_image_path: str, prompt: str | None, index: int) -> str:
+    """构造输出文件名的 key.
+
+    这里刻意保持与历史脚本一致,避免改动后导致"找不到旧产物"或输出路径变化.
+    - 优先使用 args.input_image_path(老逻辑).
+    - 当 batch 模式未提供 args.input_image_path 时,回退到 current_image_path.
+    """
+
+    base_path = args.input_image_path or current_image_path
+    clip_name = Path(base_path).stem
+
+    # 注意: 原脚本会把 prompt 直接拼进文件名,这里也保持一致.
+    if prompt is not None and prompt != "":
+        clip_name = f"{clip_name}_{prompt}"
+
+    # batch 模式下为了避免重名,追加 index.
+    if args.batch_input_path is not None:
+        clip_name = f"{clip_name}_{index}"
+
+    return clip_name
+
+
+def _build_output_paths(args: argparse.Namespace, clip_name: str) -> dict[str, str]:
+    """把本次生成涉及的产物路径集中管理,方便做进度检查/断点续跑."""
+
+    return {
+        "pose": os.path.join(args.video_save_folder, "pose", f"{clip_name}.npz"),
+        "intrinsics": os.path.join(args.video_save_folder, "intrinsics", f"{clip_name}.npz"),
+        "latent": os.path.join(args.video_save_folder, "latent", f"{clip_name}.pkl"),
+        "rgb": os.path.join(args.video_save_folder, "rgb", f"{clip_name}.mp4"),
+    }
+
+
+def _is_valid_npz(path: str, expected_num_frames: int | None) -> bool:
+    """对 npz 做最基本的可读性与 shape 校验,避免"文件存在但内容损坏"导致误跳过."""
+
+    if not os.path.exists(path):
+        return False
+
+    try:
+        with np.load(path) as data:
+            if "data" not in data or "inds" not in data:
+                return False
+            if expected_num_frames is not None:
+                if int(data["inds"].shape[0]) != int(expected_num_frames):
+                    return False
+                if int(data["data"].shape[0]) != int(expected_num_frames):
+                    return False
+    except Exception:
+        return False
+
+    return True
+
+
+def _torch_load_compat(path: str):
+    """兼容不同 torch 版本的 torch.load 参数差异."""
+
+    try:
+        # 新版 torch 支持 weights_only,并且对非权重对象需显式关闭.
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        # 旧版 torch 没有 weights_only 参数.
+        return torch.load(path, map_location="cpu")
+
+
+def _is_valid_latent_pkl(path: str) -> bool:
+    """对 latent 做轻量校验: 能否加载 + 维度是否符合[B,C,T,H,W]."""
+
+    if not os.path.exists(path):
+        return False
+
+    try:
+        latents = _torch_load_compat(path)
+        if isinstance(latents, np.ndarray):
+            latents = torch.from_numpy(latents)
+        if not isinstance(latents, torch.Tensor):
+            return False
+        if latents.ndim != 5:
+            return False
+        # 训练侧会做 latents[0] 去 batch,因此这里要求 batch=1.
+        if latents.shape[0] != 1:
+            return False
+        if latents.numel() == 0:
+            return False
+    except Exception:
+        return False
+
+    return True
+
+
+def _is_valid_mp4(path: str) -> bool:
+    """mp4 只做存在性+文件大小校验(避免 0 字节文件)."""
+
+    if not os.path.exists(path):
+        return False
+    try:
+        return os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def _get_progress_status(args: argparse.Namespace, out_paths: dict[str, str]) -> dict[str, bool]:
+    """汇总每类产物是否已完成."""
+
+    expected = int(args.num_video_frames) if getattr(args, "num_video_frames", None) is not None else None
+    return {
+        "pose": _is_valid_npz(out_paths["pose"], expected_num_frames=expected),
+        "intrinsics": _is_valid_npz(out_paths["intrinsics"], expected_num_frames=expected),
+        "latent": _is_valid_latent_pkl(out_paths["latent"]),
+        "rgb": _is_valid_mp4(out_paths["rgb"]),
+    }
+
+
 def _predict_moge_depth(current_image_path: str | np.ndarray,
                         target_h: int, target_w: int,
-                        device: torch.device, moge_model: MoGeModel):
+                        device: torch.device, moge_model: Any):
     """Handles MoGe depth prediction for a single image.
 
     If the image is directly provided as a NumPy array, it should have shape [H, W, C],
@@ -220,7 +355,7 @@ def _predict_moge_depth(current_image_path: str | np.ndarray,
 
 def _predict_moge_depth_from_tensor(
     image_tensor_chw_0_1: torch.Tensor, # Shape (C, H_input, W_input), range [0,1]
-    moge_model: MoGeModel
+    moge_model: Any
 ):
     """Handles MoGe depth prediction from an image tensor."""
     moge_output_full = moge_model.infer(image_tensor_chw_0_1)
@@ -264,47 +399,7 @@ def demo(args):
     validate_args(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if args.num_gpus > 1:
-        from megatron.core import parallel_state
-
-        from cosmos_predict1.utils import distributed
-
-        distributed.init()
-        parallel_state.initialize_model_parallel(context_parallel_size=args.num_gpus)
-        process_group = parallel_state.get_context_parallel_group()
-
-    # Initialize video2world generation model pipeline
-    pipeline = Gen3cPipeline(
-        inference_type=inference_type,
-        checkpoint_dir=args.checkpoint_dir,
-        checkpoint_name="Gen3C-Cosmos-7B",
-        prompt_upsampler_dir=args.prompt_upsampler_dir,
-        enable_prompt_upsampler=not args.disable_prompt_upsampler,
-        offload_network=args.offload_diffusion_transformer,
-        offload_tokenizer=args.offload_tokenizer,
-        offload_text_encoder_model=args.offload_text_encoder_model,
-        offload_prompt_upsampler=args.offload_prompt_upsampler,
-        offload_guardrail_models=args.offload_guardrail_models,
-        disable_guardrail=args.disable_guardrail,
-        disable_prompt_encoder=args.disable_prompt_encoder,
-        guidance=args.guidance,
-        num_steps=args.num_steps,
-        height=args.height,
-        width=args.width,
-        fps=args.fps,
-        num_video_frames=121,
-        seed=args.seed,
-    )
-
-    frame_buffer_max = pipeline.model.frame_buffer_max
-    generator = torch.Generator(device=device).manual_seed(args.seed)
-    sample_n_frames = pipeline.model.chunk_size
-    moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl").to(device)
-
-    if args.num_gpus > 1:
-        pipeline.model.net.enable_context_parallel(process_group)
-
-    # Handle multiple prompts if prompt file is provided
+    # 先解析输入列表,用于做"断点续跑"的进度扫描.
     if args.batch_input_path:
         log.info(f"Reading batch inputs from path: {args.batch_input_path}")
         prompts = read_prompts_from_file(args.batch_input_path)
@@ -313,20 +408,305 @@ def demo(args):
         prompts = [{"prompt": args.prompt, "visual_input": args.input_image_path}]
 
     os.makedirs(os.path.dirname(args.video_save_folder), exist_ok=True)
+
+    # -----------------------------
+    # 断点续跑: 预扫描进度,尽量避免无意义地重复跑 diffusion.
+    # -----------------------------
+    work_items: list[dict[str, Any]] = []
+    any_need_latent = False
+    any_need_video_decode = False
+    any_need_pose_or_intrinsics = False
+
     for i, input_dict in enumerate(prompts):
         current_prompt = input_dict.get("prompt", None)
-        if current_prompt is None and args.disable_prompt_upsampler:
-            log.critical("Prompt is missing, skipping world generation.")
-            continue
         current_image_path = input_dict.get("visual_input", None)
-        if current_image_path is None:
-            log.critical("Visual input is missing, skipping world generation.")
+
+        # 保持原行为: prompt/visual 缺失则跳过.
+        if current_prompt is None and args.disable_prompt_upsampler:
+            work_items.append({"index": i, "skip_reason": "Prompt is missing."})
             continue
+        if current_image_path is None:
+            work_items.append({"index": i, "skip_reason": "Visual input is missing."})
+            continue
+
+        clip_name = _build_clip_name(args, current_image_path, current_prompt, i)
+        out_paths = _build_output_paths(args, clip_name)
+        status = _get_progress_status(args, out_paths)
+
+        if args.overwrite_existing:
+            # 覆盖模式: 强制从头生成,并覆盖所有产物.
+            need_pose = True
+            need_intrinsics = True
+            need_latent = True
+            need_rgb = True
+        else:
+            # 默认模式: 以产物是否已存在来决定是否跳过.
+            need_pose = not status["pose"]
+            need_intrinsics = not status["intrinsics"]
+            need_latent = not status["latent"]
+            need_rgb = not status["rgb"]
+
+            # save_buffer 会改变最终 mp4 内容(拼接 warp buffer).
+            # 为了保证输出一致性,当 mp4 缺失时强制走完整生成流程.
+            if getattr(args, "save_buffer", False) and need_rgb:
+                need_latent = True
+
+        # 仅当 "latent 已有但 rgb 缺失" 且不需要 save_buffer 时,才允许走解码补齐.
+        can_decode_from_latent = (not need_latent) and need_rgb and status["latent"] and (not getattr(args, "save_buffer", False))
+
+        any_need_latent = any_need_latent or need_latent
+        any_need_video_decode = any_need_video_decode or can_decode_from_latent
+        any_need_pose_or_intrinsics = any_need_pose_or_intrinsics or need_pose or need_intrinsics
+
+        work_items.append(
+            {
+                "index": i,
+                "prompt": current_prompt,
+                "image_path": current_image_path,
+                "clip_name": clip_name,
+                "out_paths": out_paths,
+                "status": status,
+                "need_pose": need_pose,
+                "need_intrinsics": need_intrinsics,
+                "need_latent": need_latent,
+                "need_rgb": need_rgb,
+                "can_decode_from_latent": can_decode_from_latent,
+            }
+        )
+
+    # 如果没有任何需要补齐的产物,直接退出(避免重复加载大模型).
+    any_need_work = any(
+        (
+            (item.get("need_pose") or item.get("need_intrinsics") or item.get("need_latent") or item.get("need_rgb"))
+            for item in work_items
+            if "skip_reason" not in item
+        )
+    )
+    if not args.overwrite_existing and not any_need_work:
+        log.info("[RESUME] All outputs already exist. Nothing to do, exiting.")
+        return
+
+    # -----------------------------
+    # 仅在确实需要生成 latent(跑 diffusion)时才初始化分布式.
+    # -----------------------------
+    did_init_distributed = False
+    process_group = None
+    if any_need_latent and args.num_gpus > 1:
+        from megatron.core import parallel_state
+
+        from cosmos_predict1.utils import distributed
+
+        distributed.init()
+        parallel_state.initialize_model_parallel(context_parallel_size=args.num_gpus)
+        process_group = parallel_state.get_context_parallel_group()
+        did_init_distributed = True
+
+    # -----------------------------
+    # 仅在需要生成/解码视频时才初始化 pipeline.
+    # - 如果只是 decode(不跑 diffusion),强制 offload_network,避免加载巨大 DiT.
+    # -----------------------------
+    pipeline: Gen3cPipeline | None = None
+    if any_need_latent or any_need_video_decode:
+        pipeline_offload_network = args.offload_diffusion_transformer if any_need_latent else True
+        pipeline = Gen3cPipeline(
+            inference_type=inference_type,
+            checkpoint_dir=args.checkpoint_dir,
+            checkpoint_name="Gen3C-Cosmos-7B",
+            prompt_upsampler_dir=args.prompt_upsampler_dir,
+            enable_prompt_upsampler=not args.disable_prompt_upsampler,
+            offload_network=pipeline_offload_network,
+            offload_tokenizer=args.offload_tokenizer,
+            offload_text_encoder_model=args.offload_text_encoder_model,
+            offload_prompt_upsampler=args.offload_prompt_upsampler,
+            offload_guardrail_models=args.offload_guardrail_models,
+            disable_guardrail=args.disable_guardrail,
+            disable_prompt_encoder=args.disable_prompt_encoder,
+            guidance=args.guidance,
+            num_steps=args.num_steps,
+            height=args.height,
+            width=args.width,
+            fps=args.fps,
+            num_video_frames=121,
+            seed=args.seed,
+        )
+
+        if any_need_latent and args.num_gpus > 1:
+            pipeline.model.net.enable_context_parallel(process_group)
+
+    # 只有需要跑 diffusion 时才需要 MoGe + cache 相关常量.
+    frame_buffer_max = pipeline.model.frame_buffer_max if (pipeline is not None and any_need_latent) else None
+    sample_n_frames = pipeline.model.chunk_size if (pipeline is not None and any_need_latent) else None
+    generator = torch.Generator(device=device).manual_seed(args.seed) if any_need_latent else None
+    # MoGe v1/v2 都实现了 `.infer(...)`,这里用 Any 作为最小接口,避免脚本固定绑死某个版本.
+    moge_model: Any | None = None
+
+    for item in work_items:
+        # 预扫描阶段已判断为必跳过的输入,这里保持原行为: 打 log 后 continue.
+        if "skip_reason" in item:
+            log.critical(f"{item['skip_reason']} skipping world generation.")
+            continue
+
+        i = int(item["index"])
+        current_prompt = item.get("prompt", None)
+        current_image_path = item.get("image_path", None)
+        clip_name = item["clip_name"]
+        out_paths = item["out_paths"]
+        status = item["status"]
+
+        # 覆盖模式下必重跑,否则只有当四类产物都齐全才跳过.
+        if not args.overwrite_existing and all(status.values()):
+            log.info(f"[RESUME] Outputs already exist, skipping: {out_paths['rgb']}")
+            continue
+
+        # 按需决定本轮要补齐哪些产物.
+        need_pose = bool(item["need_pose"])
+        need_intrinsics = bool(item["need_intrinsics"])
+        need_latent = bool(item["need_latent"])
+        need_rgb = bool(item["need_rgb"])
+        can_decode_from_latent = bool(item["can_decode_from_latent"])
 
         # Check input frames
         if not check_input_frames(current_image_path, 1):
             print(f"Input image {current_image_path} is not valid, skipping.")
             continue
+
+        # -----------------------------
+        # 断点续跑: 本轮不需要跑 diffusion(latent 已有)时,只补齐缺失产物.
+        # -----------------------------
+        if not need_latent:
+            # 1) pose / intrinsics 缺失: 仅重建相机轨迹并补齐,不跑 diffusion.
+            if need_pose or need_intrinsics:
+                if moge_model is None:
+                    # MoGe 只在需要"从图像估计深度/内参"时才加载,避免无意义的显存占用.
+                    moge_model, _moge_version = load_moge_model(
+                        moge_model_id=args.moge_model_id,
+                        moge_checkpoint_path=args.moge_checkpoint_path,
+                        hf_local_files_only=args.hf_local_files_only,
+                        device=device,
+                    )
+
+                (
+                    _moge_image_b1chw_float,
+                    _moge_depth_b11hw,
+                    _moge_mask_b11hw,
+                    moge_initial_w2c_b144,
+                    moge_intrinsics_b133,
+                ) = _predict_moge_depth(
+                    current_image_path, args.height, args.width, device, moge_model
+                )
+
+                initial_cam_w2c_for_traj = moge_initial_w2c_b144[0, 0]
+                initial_cam_intrinsics_for_traj = moge_intrinsics_b133[0, 0]
+
+                try:
+                    generated_w2cs, generated_intrinsics = generate_camera_trajectory(
+                        trajectory_type=args.trajectory,
+                        initial_w2c=initial_cam_w2c_for_traj,
+                        initial_intrinsics=initial_cam_intrinsics_for_traj,
+                        num_frames=args.num_video_frames,
+                        movement_distance=args.movement_distance,
+                        camera_rotation=args.camera_rotation,
+                        center_depth=1.0,
+                        device=device.type,
+                        **args.camera_gen_kwargs,
+                    )
+                except (ValueError, NotImplementedError) as e:
+                    log.critical(f"Failed to generate trajectory: {e}")
+                    continue
+
+                generated_c2ws = generated_w2cs.inverse()
+
+                if need_pose:
+                    pose_save_path = out_paths["pose"]
+                    os.makedirs(os.path.dirname(pose_save_path), exist_ok=True)
+                    pose_list = []
+                    for f_idx in range(generated_c2ws.shape[1]):
+                        pose = generated_c2ws[0, f_idx].cpu().numpy().reshape(4, 4)
+                        pose_list.append((f_idx, pose))
+                    pose_data = np.stack([pose for _, pose in pose_list], axis=0)
+                    pose_inds = np.array([frame_idx for frame_idx, _ in pose_list])
+                    np.savez(pose_save_path, data=pose_data, inds=pose_inds)
+                    log.info(f"[RESUME] Saved pose to {pose_save_path}")
+
+                if need_intrinsics:
+                    intrinsics_save_path = out_paths["intrinsics"]
+                    os.makedirs(os.path.dirname(intrinsics_save_path), exist_ok=True)
+                    intrinsics_list = []
+                    for f_idx in range(generated_intrinsics.shape[1]):
+                        intrinsics = generated_intrinsics[0, f_idx].cpu().numpy()
+                        intrinsics_fxfycxcy = (
+                            intrinsics[0, 0],
+                            intrinsics[1, 1],
+                            intrinsics[0, 2],
+                            intrinsics[1, 2],
+                        )
+                        intrinsics_list.append((f_idx, intrinsics_fxfycxcy))
+                    intrinsics_data = np.stack([intrinsics for _, intrinsics in intrinsics_list], axis=0)
+                    intrinsics_inds = np.array([frame_idx for frame_idx, _ in intrinsics_list])
+                    np.savez(intrinsics_save_path, data=intrinsics_data, inds=intrinsics_inds)
+                    log.info(f"[RESUME] Saved intrinsics to {intrinsics_save_path}")
+
+            # 2) rgb 缺失,且 latent 已有: 直接解码补齐,避免重新跑 diffusion.
+            if need_rgb:
+                if not can_decode_from_latent:
+                    log.critical(
+                        "[RESUME] rgb is missing but cannot decode from latent in current settings; "
+                        "please rerun with --overwrite_existing."
+                    )
+                    continue
+
+                if pipeline is None:
+                    log.critical("[RESUME] Internal error: pipeline is not initialized for latent decoding.")
+                    continue
+
+                # 如果 tokenizer 被 offload 了,这里按需加载回来.
+                if getattr(pipeline.model, "tokenizer", None) is None:
+                    pipeline._load_tokenizer()
+
+                latents_obj = _torch_load_compat(out_paths["latent"])
+                if isinstance(latents_obj, np.ndarray):
+                    latents_tensor = torch.from_numpy(latents_obj)
+                else:
+                    latents_tensor = latents_obj
+
+                if not isinstance(latents_tensor, torch.Tensor):
+                    log.critical(f"[RESUME] Failed to load latent tensor: {out_paths['latent']}")
+                    continue
+
+                # tokenizer decode 需要 latent 在 GPU 上(与 pipeline.model 的 device 对齐).
+                latents_tensor = latents_tensor.to(device=device, dtype=torch.bfloat16)
+                video = pipeline._run_tokenizer_decoding(latents_tensor)
+
+                rgb_save_path = out_paths["rgb"]
+                os.makedirs(os.path.dirname(rgb_save_path), exist_ok=True)
+                save_video(
+                    video=video,
+                    fps=args.fps,
+                    H=int(video.shape[1]),
+                    W=int(video.shape[2]),
+                    video_save_quality=8,
+                    video_save_path=rgb_save_path,
+                )
+                log.info(f"[RESUME] Decoded video from latent and saved to {rgb_save_path}")
+
+            # 本轮不需要跑 diffusion,处理完缺失产物后直接进入下一个输入.
+            continue
+
+        # -----------------------------
+        # 需要生成 latent: 走完整 diffusion 生成流程.
+        # -----------------------------
+        if pipeline is None or frame_buffer_max is None or generator is None or sample_n_frames is None:
+            log.critical("[RESUME] Internal error: pipeline/cache constants are not initialized for diffusion.")
+            continue
+
+        if moge_model is None:
+            # MoGe 仅在需要跑 diffusion 或补齐相机轨迹时才加载.
+            moge_model, _moge_version = load_moge_model(
+                moge_model_id=args.moge_model_id,
+                moge_checkpoint_path=args.moge_checkpoint_path,
+                hf_local_files_only=args.hf_local_files_only,
+                device=device,
+            )
 
         # load image, predict depth and initialize 3D cache
         (
@@ -480,85 +860,74 @@ def demo(args):
             else:
                 log.info("No warp buffers to save.")
 
-        # Output file name
-        clip_name = Path(args.input_image_path).stem
-        if prompt is not None and prompt != "":
-            clip_name = f"{clip_name}_{prompt}"
-        if args.batch_input_path is not None:
-            clip_name = f"{clip_name}_{i}"
-
         # Save pose
         generated_c2ws = generated_w2cs.inverse()
-        pose_save_path = os.path.join(
-            args.video_save_folder,
-            "pose",
-            f"{clip_name}.npz",
-        )
-        os.makedirs(os.path.dirname(pose_save_path), exist_ok=True)
-        pose_list = []
-        for i in range(generated_c2ws.shape[1]):
-            pose = generated_c2ws[0, i].cpu().numpy()
-            pose = pose.reshape(4, 4)
-            pose_list.append((i, pose))
-        pose_data = np.stack([pose for _, pose in pose_list], axis=0)
-        pose_inds = np.array([frame_idx for frame_idx, _ in pose_list])
-        np.savez(
-            pose_save_path,
-            data=pose_data,
-            inds=pose_inds,
-        )
+        if need_pose:
+            pose_save_path = out_paths["pose"]
+            os.makedirs(os.path.dirname(pose_save_path), exist_ok=True)
+            pose_list = []
+            for f_idx in range(generated_c2ws.shape[1]):
+                pose = generated_c2ws[0, f_idx].cpu().numpy().reshape(4, 4)
+                pose_list.append((f_idx, pose))
+            pose_data = np.stack([pose for _, pose in pose_list], axis=0)
+            pose_inds = np.array([frame_idx for frame_idx, _ in pose_list])
+            np.savez(pose_save_path, data=pose_data, inds=pose_inds)
+            log.info(f"[RESUME] Saved pose to {pose_save_path}")
+        else:
+            log.info(f"[RESUME] Pose already exists, skipping: {out_paths['pose']}")
 
         # Save intrinsics
-        intrinsics_save_path = os.path.join(
-            args.video_save_folder,
-            "intrinsics",
-            f"{clip_name}.npz",
-        )
-        os.makedirs(os.path.dirname(intrinsics_save_path), exist_ok=True)
-        intrinsics_list = []
-        for i in range(generated_intrinsics.shape[1]):
-            intrinsics = generated_intrinsics[0, i].cpu().numpy()
-            intrinsics_fxfycxcy = intrinsics[0, 0], intrinsics[1, 1], intrinsics[0, 2], intrinsics[1, 2]
-            intrinsics_list.append((i, intrinsics_fxfycxcy))
-        intrinsics_data = np.stack(
-            [intrinsics for _, intrinsics in intrinsics_list], axis=0
-        )
-        intrinsics_inds = np.array([frame_idx for frame_idx, _ in intrinsics_list])
-        np.savez(
-            intrinsics_save_path,
-            data=intrinsics_data,
-            inds=intrinsics_inds,
-        )
+        if need_intrinsics:
+            intrinsics_save_path = out_paths["intrinsics"]
+            os.makedirs(os.path.dirname(intrinsics_save_path), exist_ok=True)
+            intrinsics_list = []
+            for f_idx in range(generated_intrinsics.shape[1]):
+                intrinsics = generated_intrinsics[0, f_idx].cpu().numpy()
+                intrinsics_fxfycxcy = (
+                    intrinsics[0, 0],
+                    intrinsics[1, 1],
+                    intrinsics[0, 2],
+                    intrinsics[1, 2],
+                )
+                intrinsics_list.append((f_idx, intrinsics_fxfycxcy))
+            intrinsics_data = np.stack([intrinsics for _, intrinsics in intrinsics_list], axis=0)
+            intrinsics_inds = np.array([frame_idx for frame_idx, _ in intrinsics_list])
+            np.savez(intrinsics_save_path, data=intrinsics_data, inds=intrinsics_inds)
+            log.info(f"[RESUME] Saved intrinsics to {intrinsics_save_path}")
+        else:
+            log.info(f"[RESUME] Intrinsics already exists, skipping: {out_paths['intrinsics']}")
 
         # Save latent
-        latent_save_path = os.path.join(
-            args.video_save_folder,
-            "latent",
-            f"{clip_name}.pkl",
-        )
-        os.makedirs(os.path.dirname(latent_save_path), exist_ok=True)
-        video_latent = latents.detach().float().cpu().numpy()
-        torch.save(video_latent, latent_save_path)
+        if need_latent:
+            latent_save_path = out_paths["latent"]
+            os.makedirs(os.path.dirname(latent_save_path), exist_ok=True)
+            video_latent = latents.detach().float().cpu().numpy()
+            torch.save(video_latent, latent_save_path)
+            log.info(f"[RESUME] Saved latent to {latent_save_path}")
+        else:
+            log.info(f"[RESUME] Latent already exists, skipping: {out_paths['latent']}")
 
         # Save rgb video
-        video_save_path = os.path.join(
-            args.video_save_folder,
-            "rgb",
-            f"{clip_name}.mp4",
-        )
-        os.makedirs(os.path.dirname(video_save_path), exist_ok=True)
-        save_video(
-            video=final_video_to_save,
-            fps=args.fps,
-            H=args.height,
-            W=final_width,
-            video_save_quality=8,
-            video_save_path=video_save_path,
-        )
-        log.info(f"Saved video to {video_save_path}")
+        if need_rgb:
+            video_save_path = out_paths["rgb"]
+            os.makedirs(os.path.dirname(video_save_path), exist_ok=True)
+            save_video(
+                video=final_video_to_save,
+                fps=args.fps,
+                H=int(final_video_to_save.shape[1]),
+                W=int(final_video_to_save.shape[2]),
+                video_save_quality=8,
+                video_save_path=video_save_path,
+            )
+            log.info(f"[RESUME] Saved video to {video_save_path}")
+        else:
+            log.info(f"[RESUME] Video already exists, skipping: {out_paths['rgb']}")
 
     # clean up properly
-    if args.num_gpus > 1:
+    if did_init_distributed:
+        # 只有当本次确实 init 了分布式,才执行 destroy,避免误报错.
+        from megatron.core import parallel_state
+
         parallel_state.destroy_model_parallel()
         import torch.distributed as dist
 

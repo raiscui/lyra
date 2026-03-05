@@ -16,8 +16,6 @@
 import os
 from typing import List
 
-from huggingface_hub import snapshot_download
-
 from scripts.modelscope_utils import modelscope_download
 
 
@@ -46,6 +44,15 @@ def download_models(models: List[str], destination_root: str):
                 )
             else:
                 # 其余 guardrail 组件(例如 Llama-Guard)仍从 Hugging Face Hub 下载.
+                # 为了不让下载脚本在 import 阶段就硬依赖 huggingface_hub,这里使用惰性导入.
+                try:
+                    from huggingface_hub import snapshot_download  # type: ignore
+                except ModuleNotFoundError as e:
+                    raise RuntimeError(
+                        "缺少依赖 `huggingface_hub`,无法下载部分 guardrail 权重(例如 Llama-Guard). "
+                        "请先安装: `python -m pip install huggingface_hub`."
+                    ) from e
+
                 snapshot_download(
                     repo_id=model_id,
                     local_dir=model_path,

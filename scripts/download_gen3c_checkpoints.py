@@ -22,10 +22,8 @@ from glob import glob
 from pathlib import Path
 
 import torch
-from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
-from scripts.download_guardrail_checkpoints import download_guardrail_checkpoints
 from scripts.modelscope_utils import modelscope_download
 
 
@@ -71,6 +69,18 @@ def convert_pixtral_checkpoint(checkpoint_dir: str, checkpoint_name: str, vit_ty
     os.makedirs(pixtral_ckpt_dir, exist_ok=True)
     repo_id = "mistralai/Pixtral-12B-2409"
     print(f"Downloading {repo_id} to {pixtral_ckpt_dir}...")
+    try:
+        # 说明:
+        # - Pixtral 权重当前仍需要从 Hugging Face 下载.
+        # - 为了不让主下载流程硬依赖 huggingface_hub,这里使用惰性导入.
+        from huggingface_hub import snapshot_download  # type: ignore
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "缺少依赖 `huggingface_hub`,无法下载 Pixtral 权重. "
+            "如果你不需要 Pixtral 转换,可以忽略该功能. "
+            "如果需要,请先安装: `python -m pip install huggingface_hub`."
+        ) from e
+
     snapshot_download(
         repo_id=repo_id,
         allow_patterns=["params.json", "consolidated.safetensors"],
@@ -217,8 +227,6 @@ MD5_CHECKSUM_LOOKUP = {
     "Cosmos-Predict1-7B-Text2World-Sample-AV-Multiview/model.pt": "e3a6ef070deaae0678acd529dc749ea4",
     "Cosmos-Predict1-7B-Video2World-Sample-AV-Multiview/model.pt": "1653f87dce3d558ee01416593552a91c",
     "Gen3C-Cosmos-7B/model.pt": "38644bf823aa5272acef60cfad8bc0f7",
-    "google-t5/t5-11b/pytorch_model.bin": "f890878d8a162e0045a25196e27089a3",
-    "google-t5/t5-11b/tf_model.h5": "e081fc8bd5de5a6a9540568241ab8973",
 }
 
 
@@ -229,12 +237,13 @@ def get_md5_checksum(checkpoints_dir, model_name):
     if not expected_files:
         # No expected files in MD5_CHECKSUM_LOOKUP, check if the directory exists and has content
         model_dir = checkpoints_dir / model_name
+
         if not model_dir.exists() or not any(model_dir.iterdir()):
             print(f"Directory for {model_name} does not exist or is empty. Download required.")
             return False
-        else:
-            print(f"Directory for {model_name} exists and contains files. Assuming download is complete.")
-            return True
+
+        print(f"Directory for {model_name} exists and contains files. Assuming download is complete.")
+        return True
     # Proceed with checksum verification for models with expected files
     for key, value in MD5_CHECKSUM_LOOKUP.items():
         if key.startswith(model_name + "/"):
@@ -261,7 +270,6 @@ def main(args):
     # Additional models that are always downloaded
     extra_models = [
         "Cosmos-Tokenize1-CV8x8x8-720p",
-        "google-t5/t5-11b",
     ]
 
     # Create local checkpoints folder
@@ -290,24 +298,14 @@ def main(args):
 
     # Download the always-included models
     for model_name in extra_models:
-        if model_name == "google-t5/t5-11b":
-            repo_id = model_name
-        else:
-            repo_id = f"{MODELSCOPE_ORG_NAME}/{model_name}"
+        # ModelScope 上的 NVIDIA 权重通常在 nv-community/<name>.
+        repo_id = model_name if "/" in model_name else f"{MODELSCOPE_ORG_NAME}/{model_name}"
         local_dir = checkpoints_dir.joinpath(model_name)
 
         if not get_md5_checksum(checkpoints_dir, model_name):
             local_dir.mkdir(parents=True, exist_ok=True)
             print(f"Downloading {repo_id} to {local_dir}...")
-            if model_name == "google-t5/t5-11b":
-                # 该模型体积较大且可能存在权限限制, 目前保持与上游一致: 仍使用 Hugging Face Hub 下载.
-                snapshot_download(
-                    repo_id=repo_id,
-                    local_dir=str(local_dir),
-                    local_dir_use_symlinks=False,
-                )
-            else:
-                modelscope_download(repo_id, local_dir)
+            modelscope_download(repo_id, local_dir)
 
 
 if __name__ == "__main__":

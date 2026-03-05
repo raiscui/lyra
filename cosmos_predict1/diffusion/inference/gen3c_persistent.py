@@ -2,10 +2,10 @@ import argparse
 import os
 import time
 
-from moge.model.v1 import MoGeModel
 import torch
 import numpy as np
 from cosmos_predict1.diffusion.inference.gen3c_pipeline import Gen3cPipeline
+from cosmos_predict1.diffusion.inference.inference_utils import load_moge_model
 from cosmos_predict1.diffusion.inference.gen3c_single_image import (
     create_parser as create_parser_base,
     validate_args as validate_args_base,
@@ -122,7 +122,13 @@ class Gen3cPersistentModel():
         self.frame_buffer_max = pipeline.model.frame_buffer_max
         self.generator = torch.Generator(device=device).manual_seed(args.seed)
         self.sample_n_frames = pipeline.model.chunk_size
-        self.moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl").to(device)
+        # MoGe v1/v2 都实现了 `.infer(...)`,这里根据 checkpoint 结构自动选版本,避免 v1/v2 混用.
+        self.moge_model, _moge_version = load_moge_model(
+            moge_model_id=args.moge_model_id,
+            moge_checkpoint_path=args.moge_checkpoint_path,
+            hf_local_files_only=args.hf_local_files_only,
+            device=device,
+        )
         self.pipeline = pipeline
         self.device = device
         self.device_with_rank = device_with_rank(self.device)

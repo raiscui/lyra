@@ -201,6 +201,81 @@ def validate_args(args: argparse.Namespace, inference_type: str) -> None:
         ), "--input_image_or_video_path must be provided for single video generation."
 
 
+def load_moge_model(
+    *,
+    moge_model_id: str,
+    moge_checkpoint_path: Optional[str],
+    hf_local_files_only: bool,
+    device: torch.device,
+) -> Tuple[torch.nn.Module, str]:
+    """加载 MoGe 模型(v1 或 v2),并自动根据 checkpoint 结构选择正确的实现.
+
+    关键点:
+    - `Ruicheng/moge-vitl` 属于 v1 checkpoint: `model_config["encoder"]` 是 string.
+    - `Ruicheng/moge-2-vitl` 属于 v2 checkpoint: `model_config["encoder"]` 是 dict.
+
+    返回:
+    - `(moge_model, moge_version)`,其中 `moge_version` 为 "v1" 或 "v2".
+    """
+
+    # NOTE: 这里使用惰性 import,避免把 MoGe/HF 依赖扩大到不需要它的推理路径.
+    from pathlib import Path
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "缺少依赖 huggingface_hub,无法从 Hugging Face 下载 MoGe 权重. "
+            "请安装 huggingface_hub,或改用 --moge_checkpoint_path 指向本地 model.pt."
+        ) from exc
+
+    # 约定: 若显式给了本地路径,就完全绕过 Hugging Face 下载逻辑,方便离线运行.
+    if moge_checkpoint_path:
+        checkpoint_path = Path(moge_checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"MoGe checkpoint 不存在: {moge_checkpoint_path}")
+        resolved_checkpoint_path = str(checkpoint_path)
+    else:
+        # 兼容: 允许用户把 `moge_model_id` 直接写成一个本地文件路径.
+        maybe_local_path = Path(moge_model_id)
+        if maybe_local_path.exists():
+            resolved_checkpoint_path = str(maybe_local_path)
+        else:
+            resolved_checkpoint_path = hf_hub_download(
+                repo_id=moge_model_id,
+                repo_type="model",
+                filename="model.pt",
+                local_files_only=hf_local_files_only,
+            )
+
+    # 权重文件较大,但我们只需要先读出 `model_config` 来判断 v1/v2.
+    checkpoint = torch.load(resolved_checkpoint_path, map_location="cpu", weights_only=True)
+    model_config = checkpoint.get("model_config", None)
+    if not isinstance(model_config, dict):
+        raise ValueError(f"MoGe checkpoint 缺少有效的 model_config: {resolved_checkpoint_path}")
+
+    # 通过 encoder 字段类型判断 checkpoint 版本,从根上避免 v1/v2 混用.
+    if isinstance(model_config.get("encoder", None), dict):
+        from moge.model.v2 import MoGeModel as MoGeModelV2
+
+        moge_model: torch.nn.Module = MoGeModelV2(**model_config)
+        moge_model.load_state_dict(checkpoint["model"], strict=False)
+        moge_version = "v2"
+    else:
+        from moge.model.v1 import MoGeModel as MoGeModelV1
+
+        moge_model = MoGeModelV1(**model_config)
+        moge_model.load_state_dict(checkpoint["model"])
+        moge_version = "v1"
+
+    moge_model = moge_model.to(device)
+    moge_model.eval()
+
+    log.info(f"Loaded MoGe checkpoint ({moge_version}) from: {resolved_checkpoint_path}")
+
+    return moge_model, moge_version
+
+
 class _IncompatibleKeys(
     NamedTuple(
         "IncompatibleKeys",

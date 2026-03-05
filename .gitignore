@@ -7,6 +7,7 @@ __pycache__/
 *.py[cod]
 
 # 下载/生成的大文件目录(避免误提交)
+apex/
 checkpoints/
 assets/demo/
 lyra_dataset/
@@ -20,3 +21,4 @@ notes*.md
 WORKLOG*.md
 LATER_PLANS*.md
 ERRORFIX*.md
+outputs/

@@ -41,7 +41,7 @@ modelscope download --dataset nv-community/Lyra-Testing-Example --local_dir asse
 
 ### Example 1: Single Image to 3D Gaussians Generation
 
-1) Generate multi-view video latents from the input image using scripts/bash/static_sdg.sh. 
+1) Generate multi-view video latents from the input image using scripts/bash/static_sdg.sh.
 
 ```bash
 CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) torchrun --nproc_per_node=1 cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py \
@@ -59,7 +59,7 @@ Increase total_movement_distance_factor to 2.0 for more camera motion, though it
 2) Reconstruct multi-view video latents with the 3DGS decoder (change dataset_name in the .yaml to generated path if 1. was done)
 
 ```bash
-accelerate launch sample.py --config configs/demo/lyra_static.yaml
+accelerate launch sample.py --config configs/demo/lyra_static.yaml save_gaussians_orig=true save_gaussians=true
 ```
 
 ### Example 2: Single Video to Dynamic 3D Gaussians Generation
@@ -147,8 +147,8 @@ We are also grateful to several other open-source repositories that we drew insp
 ```
 @inproceedings{bahmani2025lyra,
    title={Lyra: Generative 3D Scene Reconstruction via Video Diffusion Model Self-Distillation},
-   author={Bahmani, Sherwin and Shen, Tianchang and Ren, Jiawei and Huang, Jiahui and Jiang, Yifeng and 
-            Turki, Haithem and Tagliasacchi, Andrea and Lindell, David B. and Gojcic, Zan and Fidler, Sanja and 
+   author={Bahmani, Sherwin and Shen, Tianchang and Ren, Jiawei and Huang, Jiahui and Jiang, Yifeng and
+            Turki, Haithem and Tagliasacchi, Andrea and Lindell, David B. and Gojcic, Zan and Fidler, Sanja and
             Ling, Huan and Gao, Jun and Ren, Xuanchi},
    booktitle={arXiv preprint arXiv:2509.19296},
    year={2025}
