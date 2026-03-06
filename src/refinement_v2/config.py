@@ -24,8 +24,11 @@ class RefinementRunConfig:
     view_id: str | None = None
     reference_mode: str = "native"
     sr_scale: float = 1.0
+    reference_path: Path | None = None
+    reference_intrinsics_path: Path | None = None
     frame_indices: list[int] | None = None
     target_subsample: int = 1
+    start_stage: str = "stage2a"
     enable_stage2b: bool = False
     enable_pruning: bool = False
     enable_pose_diagnostic: bool = False
@@ -62,6 +65,8 @@ class StageHyperParams:
     patch_size: int = 0
     lambda_patch_rgb: float = 0.0
     lambda_patch_perceptual: float = 0.0
+    lambda_means_anchor: float = 0.01
+    lambda_rotation_reg: float = 0.01
     means_delta_cap: float = 0.02
     scale_tail_threshold: float = 0.25
     opacity_low_threshold: float = 0.10
@@ -125,10 +130,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reference scale used when reference_mode=super_resolved.",
     )
     parser.add_argument(
+        "--reference-path",
+        type=str,
+        default=None,
+        help="Optional external reference source. Supports a frame directory or a local video file.",
+    )
+    parser.add_argument(
+        "--reference-intrinsics-path",
+        type=str,
+        default=None,
+        help="Optional npz path that provides intrinsics for the external reference frames.",
+    )
+    parser.add_argument(
         "--target-subsample",
         type=int,
         default=1,
         help="Fallback frame stride when frame_indices is not provided.",
+    )
+    parser.add_argument(
+        "--start-stage",
+        type=str,
+        default="stage2a",
+        choices=["stage2a", "stage2b"],
+        help="Optimization entry stage after Phase 0 / Phase 1 preparation.",
     )
     parser.add_argument("--enable-stage2b", action="store_true", help="Enable limited geometry refinement.")
     parser.add_argument(
@@ -175,6 +199,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patch-size", type=int, default=0)
     parser.add_argument("--lambda-patch-rgb", type=float, default=0.0)
     parser.add_argument("--lambda-patch-perceptual", type=float, default=0.0)
+    parser.add_argument("--lambda-means-anchor", type=float, default=0.01)
+    parser.add_argument("--lambda-rotation-reg", type=float, default=0.01)
     parser.add_argument("--opacity-prune-threshold", type=float, default=0.05)
     parser.add_argument("--prune-every", type=int, default=2)
     parser.add_argument("--prune-warmup-iters", type=int, default=2)
@@ -201,8 +227,11 @@ def load_effective_config_from_cli(
         view_id=args.view_id,
         reference_mode=args.reference_mode,
         sr_scale=args.sr_scale,
+        reference_path=Path(args.reference_path) if args.reference_path else None,
+        reference_intrinsics_path=Path(args.reference_intrinsics_path) if args.reference_intrinsics_path else None,
         frame_indices=_parse_frame_indices(args.frame_indices),
         target_subsample=args.target_subsample,
+        start_stage=args.start_stage,
         enable_stage2b=args.enable_stage2b,
         enable_pruning=args.enable_pruning,
         enable_pose_diagnostic=args.enable_pose_diagnostic,
@@ -232,6 +261,8 @@ def load_effective_config_from_cli(
         patch_size=args.patch_size,
         lambda_patch_rgb=args.lambda_patch_rgb,
         lambda_patch_perceptual=args.lambda_patch_perceptual,
+        lambda_means_anchor=args.lambda_means_anchor,
+        lambda_rotation_reg=args.lambda_rotation_reg,
         opacity_prune_threshold=args.opacity_prune_threshold,
         prune_every=args.prune_every,
         prune_warmup_iters=args.prune_warmup_iters,

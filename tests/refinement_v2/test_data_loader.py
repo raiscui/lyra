@@ -1,6 +1,10 @@
 """数据标准化测试."""
 
+from pathlib import Path
+
+import numpy as np
 import torch
+from PIL import Image
 
 from src.refinement_v2.config import RefinementRunConfig
 from src.refinement_v2.data_loader import (
@@ -121,3 +125,87 @@ def test_standardize_batch_builds_super_resolved_reference_bundle() -> None:
     assert scene.reference_hw == (12, 12)
     assert scene.reference_images.shape == (1, 2, 3, 12, 12)
     assert torch.allclose(scene.intrinsics_ref, scene.intrinsics * 2.0)
+
+
+def _write_reference_frames(frame_dir: Path, frame_values: list[int], size: tuple[int, int]) -> None:
+    """写一个简单的 RGB 帧目录,便于测试外部 reference 输入."""
+
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    height, width = size
+    for frame_index, frame_value in enumerate(frame_values):
+        frame = np.full((height, width, 3), frame_value, dtype=np.uint8)
+        Image.fromarray(frame, mode="RGB").save(frame_dir / f"{frame_index:04d}.png")
+
+
+def test_standardize_batch_loads_external_reference_directory_and_aligns_indices(tmp_path) -> None:
+    """外部 reference 目录如果提供完整时序,应按 selected_frame_indices 对齐."""
+
+    frame_dir = tmp_path / "reference_rgb"
+    _write_reference_frames(frame_dir, frame_values=[10, 40, 90, 140], size=(12, 12))
+
+    batch = {
+        "images_output": torch.zeros(1, 4, 3, 6, 6, dtype=torch.float32),
+        "cam_view": torch.randn(1, 4, 4, 4),
+        "intrinsics": torch.tensor([[[2.0, 3.0, 1.5, 2.5]]], dtype=torch.float32).repeat(1, 4, 1),
+    }
+
+    scene = standardize_batch(
+        batch=batch,
+        scene_index=0,
+        view_id="5",
+        frame_indices=[1, 3],
+        reference_mode="super_resolved",
+        sr_scale=2.0,
+        reference_path=frame_dir,
+    )
+
+    assert scene.reference_mode == "super_resolved"
+    assert scene.reference_images.shape == (1, 2, 3, 12, 12)
+    assert scene.reference_hw == (12, 12)
+    assert scene.sr_scale == 2.0
+    assert torch.allclose(scene.intrinsics_ref, scene.intrinsics * 2.0)
+
+    selected_values = scene.reference_images[:, :, 0, 0, 0].mul(255.0).round().to(dtype=torch.int64)
+    assert selected_values.tolist() == [[40, 140]]
+
+
+def test_standardize_batch_uses_external_reference_intrinsics_override(tmp_path) -> None:
+    """如果提供 external reference intrinsics,应优先使用该覆盖值."""
+
+    frame_dir = tmp_path / "reference_rgb"
+    _write_reference_frames(frame_dir, frame_values=[20, 60, 100, 180], size=(12, 12))
+
+    intrinsics_np = np.array(
+        [
+            [10.0, 11.0, 12.0, 13.0],
+            [20.0, 21.0, 22.0, 23.0],
+            [30.0, 31.0, 32.0, 33.0],
+            [40.0, 41.0, 42.0, 43.0],
+        ],
+        dtype=np.float32,
+    )
+    intrinsics_path = tmp_path / "reference_intrinsics.npz"
+    np.savez(intrinsics_path, intrinsics=intrinsics_np)
+
+    batch = {
+        "images_output": torch.zeros(1, 4, 3, 6, 6, dtype=torch.float32),
+        "cam_view": torch.randn(1, 4, 4, 4),
+        "intrinsics": torch.tensor([[[2.0, 3.0, 1.5, 2.5]]], dtype=torch.float32).repeat(1, 4, 1),
+    }
+
+    scene = standardize_batch(
+        batch=batch,
+        scene_index=0,
+        view_id="5",
+        frame_indices=[0, 2],
+        reference_mode="super_resolved",
+        sr_scale=2.0,
+        reference_path=frame_dir,
+        reference_intrinsics_path=intrinsics_path,
+    )
+
+    expected_intrinsics = torch.tensor(
+        [[[10.0, 11.0, 12.0, 13.0], [30.0, 31.0, 32.0, 33.0]]],
+        dtype=torch.float32,
+    )
+    assert torch.allclose(scene.intrinsics_ref, expected_intrinsics)

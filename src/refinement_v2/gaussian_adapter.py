@@ -43,6 +43,7 @@ class GaussianAdapter(nn.Module):
         self.colors = nn.Parameter(gaussians[:, 11:14])
 
         self.register_buffer("initial_means", gaussians[:, 0:3].detach().clone())
+        self.register_buffer("initial_rotations", gaussians[:, 7:11].detach().clone())
         self.scale_tail_threshold = scale_tail_threshold
         self.opacity_low_threshold = opacity_low_threshold
 
@@ -203,9 +204,10 @@ class GaussianAdapter(nn.Module):
             new_parameter.requires_grad_(old_parameter.requires_grad)
             setattr(self, parameter_name, new_parameter)
 
-        # `initial_means` 也必须同步裁掉.
-        # 否则后续 `means_delta_cap` 会和当前参数数量错位.
+        # 这些初始参考 buffer 也必须同步裁掉.
+        # 否则后续位置/旋转正则就会和当前参数数量错位.
         self.initial_means = self.initial_means.detach()[keep_mask].clone()
+        self.initial_rotations = self.initial_rotations.detach()[keep_mask].clone()
 
     def prune_low_opacity(
         self,

@@ -10,8 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 from .config import RefinementRunConfig
 
@@ -34,6 +36,190 @@ class SceneBundle:
     reference_hw: tuple[int, int] | None = None
     reference_mode: str = "native"
     sr_scale: float = 1.0
+
+
+def _load_image_tensor(path: Path) -> torch.Tensor:
+    """读取单张 RGB 图片并转成 `[3, H, W]` tensor."""
+
+    image = Image.open(path).convert("RGB")
+    image_np = np.asarray(image, dtype=np.float32) / 255.0
+    return torch.from_numpy(image_np).permute(2, 0, 1).contiguous()
+
+
+def _load_reference_frames_from_directory(reference_path: Path) -> torch.Tensor:
+    """从帧目录读取 `[T, 3, H, W]` 的 reference 序列."""
+
+    supported_suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+    frame_paths = sorted(
+        path for path in reference_path.iterdir() if path.is_file() and path.suffix.lower() in supported_suffixes
+    )
+    if not frame_paths:
+        raise FileNotFoundError(f"No image frames were found under reference directory: {reference_path}")
+
+    frames = [_load_image_tensor(frame_path) for frame_path in frame_paths]
+    return torch.stack(frames, dim=0)
+
+
+def _load_reference_frames_from_video(reference_path: Path) -> torch.Tensor:
+    """从本地视频读取 `[T, 3, H, W]` 的 reference 序列.
+
+    这里保持惰性导入 `imageio`.
+    这样测试环境在只走目录输入时,不会被额外视频依赖拖住.
+    """
+
+    try:
+        import imageio.v3 as iio
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Reading a video reference requires `imageio`. "
+            "Please use the pixi environment, or install `imageio` in the current python environment."
+        ) from exc
+
+    frames = [torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0 for frame in iio.imiter(reference_path)]
+    if not frames:
+        raise FileNotFoundError(f"No frames could be read from reference video: {reference_path}")
+    return torch.stack(frames, dim=0)
+
+
+def _load_reference_frames(reference_path: Path) -> torch.Tensor:
+    """读取外部 reference 图像序列.
+
+    支持两类输入:
+    1. 帧目录.
+    2. 本地视频文件.
+    """
+
+    if reference_path.is_dir():
+        return _load_reference_frames_from_directory(reference_path)
+    if reference_path.is_file():
+        return _load_reference_frames_from_video(reference_path)
+    raise FileNotFoundError(f"reference_path does not exist: {reference_path}")
+
+
+def _select_external_sequence(sequence: torch.Tensor, selected_frame_indices: list[int], sequence_name: str) -> torch.Tensor:
+    """把外部序列对齐到 refinement 当前使用的帧列表.
+
+    允许两种输入形态:
+    1. 外部序列已经只包含当前选中的帧.
+    2. 外部序列包含完整时序,此时按 `selected_frame_indices` 再裁一遍.
+    """
+
+    num_frames = int(sequence.shape[0])
+    if num_frames == len(selected_frame_indices):
+        return sequence
+
+    max_index = max(selected_frame_indices) if selected_frame_indices else -1
+    if num_frames > max_index:
+        index_tensor = torch.tensor(selected_frame_indices, dtype=torch.long)
+        return torch.index_select(sequence, dim=0, index=index_tensor)
+
+    raise ValueError(
+        f"{sequence_name} contains {num_frames} frames, which cannot satisfy requested indices {selected_frame_indices}."
+    )
+
+
+def _load_reference_intrinsics(reference_intrinsics_path: Path, selected_frame_indices: list[int]) -> torch.Tensor:
+    """读取 reference intrinsics,并对齐到当前帧序列."""
+
+    with np.load(reference_intrinsics_path) as payload:
+        if "intrinsics" in payload:
+            intrinsics_np = payload["intrinsics"]
+        else:
+            first_key = payload.files[0]
+            intrinsics_np = payload[first_key]
+
+    intrinsics = torch.from_numpy(np.asarray(intrinsics_np)).float()
+    if intrinsics.ndim == 3 and intrinsics.shape[0] == 1:
+        intrinsics = intrinsics[0]
+    if intrinsics.ndim != 2 or intrinsics.shape[-1] != 4:
+        raise ValueError(
+            f"reference intrinsics must resolve to shape [T, 4] or [1, T, 4], got {tuple(intrinsics.shape)}."
+        )
+
+    intrinsics = _select_external_sequence(intrinsics, selected_frame_indices, "reference intrinsics")
+    return intrinsics.unsqueeze(0)
+
+
+def _resolve_external_reference_scale(
+    native_hw: tuple[int, int],
+    reference_hw: tuple[int, int],
+    reference_mode: str,
+    requested_sr_scale: float,
+) -> float:
+    """根据外部 reference 分辨率解析实际缩放倍率."""
+
+    native_height, native_width = native_hw
+    reference_height, reference_width = reference_hw
+
+    if reference_mode == "native":
+        if reference_hw != native_hw:
+            raise ValueError(
+                f"reference_mode=native requires reference size {native_hw}, got {reference_hw}."
+            )
+        return 1.0
+
+    if reference_height % native_height != 0 or reference_width % native_width != 0:
+        raise ValueError(
+            f"External super_resolved reference must be an integer multiple of native size {native_hw}, got {reference_hw}."
+        )
+
+    scale_height = reference_height // native_height
+    scale_width = reference_width // native_width
+    if scale_height != scale_width:
+        raise ValueError(
+            f"External super_resolved reference must keep aspect ratio. Native={native_hw}, reference={reference_hw}."
+        )
+
+    actual_scale = float(scale_height)
+    if actual_scale <= 1.0:
+        raise ValueError(
+            f"reference_mode=super_resolved requires scale > 1, got reference size {reference_hw} for native {native_hw}."
+        )
+
+    # `sr_scale=1.0` 视为“让系统自动从外部分辨率推断”.
+    # 如果用户显式给了非 1 的值,就要求与真实尺寸一致.
+    if abs(float(requested_sr_scale) - 1.0) > 1e-6 and abs(actual_scale - float(requested_sr_scale)) > 1e-6:
+        raise ValueError(
+            f"External reference scale mismatch: requested sr_scale={requested_sr_scale}, actual={actual_scale}."
+        )
+    return actual_scale
+
+
+def _build_external_reference_supervision(
+    gt_images: torch.Tensor,
+    intrinsics: torch.Tensor,
+    reference_path: Path,
+    reference_mode: str,
+    sr_scale: float,
+    selected_frame_indices: list[int],
+    reference_intrinsics_path: Path | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int], tuple[int, int], float]:
+    """从外部 reference 数据源构造监督图像与 intrinsics."""
+
+    normalized_mode = _normalize_reference_mode(reference_mode)
+    native_hw = (int(gt_images.shape[-2]), int(gt_images.shape[-1]))
+
+    reference_images = _load_reference_frames(reference_path)
+    reference_images = _select_external_sequence(reference_images, selected_frame_indices, "reference images")
+    reference_images = reference_images.unsqueeze(0).to(dtype=gt_images.dtype)
+
+    reference_hw = (int(reference_images.shape[-2]), int(reference_images.shape[-1]))
+    normalized_sr_scale = _resolve_external_reference_scale(
+        native_hw=native_hw,
+        reference_hw=reference_hw,
+        reference_mode=normalized_mode,
+        requested_sr_scale=sr_scale,
+    )
+
+    if reference_intrinsics_path is not None:
+        intrinsics_ref = _load_reference_intrinsics(reference_intrinsics_path, selected_frame_indices)
+        intrinsics_ref = intrinsics_ref.to(dtype=intrinsics.dtype)
+    elif normalized_mode == "native":
+        intrinsics_ref = intrinsics.clone()
+    else:
+        intrinsics_ref = intrinsics * float(normalized_sr_scale)
+
+    return reference_images, intrinsics_ref, native_hw, reference_hw, float(normalized_sr_scale)
 
 
 def _ensure_expected_ndim(tensor: torch.Tensor, expected_ndim: int) -> torch.Tensor:
@@ -107,11 +293,26 @@ def _build_reference_supervision(
     intrinsics: torch.Tensor,
     reference_mode: str,
     sr_scale: float,
+    selected_frame_indices: list[int],
+    reference_path: Path | None = None,
+    reference_intrinsics_path: Path | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int], tuple[int, int], float]:
     """构造参考监督图像与对应 intrinsics."""
 
     normalized_mode = _normalize_reference_mode(reference_mode)
     native_hw = (int(gt_images.shape[-2]), int(gt_images.shape[-1]))
+
+    if reference_path is not None:
+        return _build_external_reference_supervision(
+            gt_images=gt_images,
+            intrinsics=intrinsics,
+            reference_path=reference_path,
+            reference_mode=normalized_mode,
+            sr_scale=sr_scale,
+            selected_frame_indices=selected_frame_indices,
+            reference_intrinsics_path=reference_intrinsics_path,
+        )
+
     scale_int = _normalize_sr_scale(normalized_mode, sr_scale)
 
     if normalized_mode == "native":
@@ -220,6 +421,8 @@ def standardize_batch(
     target_subsample: int = 1,
     reference_mode: str = "native",
     sr_scale: float = 1.0,
+    reference_path: Path | None = None,
+    reference_intrinsics_path: Path | None = None,
 ) -> SceneBundle:
     """把 provider batch 变成 refinement 使用的 `SceneBundle`."""
 
@@ -243,6 +446,9 @@ def standardize_batch(
         intrinsics=intrinsics,
         reference_mode=reference_mode,
         sr_scale=sr_scale,
+        selected_frame_indices=selected_frame_indices,
+        reference_path=reference_path,
+        reference_intrinsics_path=reference_intrinsics_path,
     )
 
     target_index = batch.get("target_index")
@@ -318,6 +524,8 @@ def build_scene_bundle(
             target_subsample=run_config.target_subsample,
             reference_mode=run_config.reference_mode,
             sr_scale=run_config.sr_scale,
+            reference_path=run_config.reference_path,
+            reference_intrinsics_path=run_config.reference_intrinsics_path,
         )
 
     if test_dataloader is None:
@@ -346,6 +554,8 @@ def build_scene_bundle(
             target_subsample=run_config.target_subsample,
             reference_mode=run_config.reference_mode,
             sr_scale=run_config.sr_scale,
+            reference_path=run_config.reference_path,
+            reference_intrinsics_path=run_config.reference_intrinsics_path,
         )
 
     raise IndexError(f"Could not find scene index {run_config.scene_index} in the test dataloader.")

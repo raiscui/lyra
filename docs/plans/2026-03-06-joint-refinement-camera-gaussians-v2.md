@@ -1,16 +1,112 @@
-# Joint Refinement Camera Gaussians V2 Implementation Plan
+# Joint Refinement Camera Gaussians V2 Implementation Plan (Final Completed Version)
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task.
 
-**Goal:** 实现 `joint_refinement_camera_gaussians_v2` 的第一版可运行工程,支持 `Phase 0 + Phase 1 + Stage 2A` 为主线,并为 `Stage 2B / Phase 3 / Phase 4` 预留清晰扩展点.
+> **Status Update (2026-03-06):** 这份文档对应的原始 `Task 1 ~ Task 13` 已全部完成。本文档已从“施工计划”升级为“最终完成版”,同时保留原始任务清单作为历史执行记录。
 
-**Architecture:** 以 `scripts/refine_robust_v2.py` 为唯一入口,把配置解析、数据对齐、权重构造、高斯适配、阶段控制、诊断落盘拆到 `src/refinement_v2/` 下的独立模块. 第一版先做 `gaussian-only refinement`,不默认动 pose,不默认做 joint fallback,优先证明 `residual weighting + appearance-first refinement` 能有效减轻 ghosting.
+**Goal:** 实现 `joint_refinement_camera_gaussians_v2` 的第一版可运行工程,支持 `Phase 0 + Phase 1 + Stage 2A` 为主线,并为 `Stage 2B / Phase 3 / Phase 4` 预留清晰扩展点。该目标现已完成,且代码状态已超过最初 MVP 范围。
+
+**Architecture:** 以 `scripts/refine_robust_v2.py` 为唯一入口,把配置解析、数据对齐、权重构造、高斯适配、阶段控制、诊断落盘拆到 `src/refinement_v2/` 下的独立模块. 当前已完成:
+
+- `Phase 0`
+- `Phase 1`
+- `Stage 2A`
+- `Stage 2B`
+- `Phase 3`
+- `Phase 4`
+- `state_io`
+- before/after 可视化导出
+- pruning
+- patch supervision
+- `--start-stage stage2b` warm-start workflow
+- external reference contract(`--reference-path` / `--reference-intrinsics-path`)
 
 **Tech Stack:** Python 3.10, PyTorch, existing Lyra provider/renderer, OmegaConf/YAML config loading, pytest, pathlib/json.
 
 ---
 
-### Task 1: 搭好入口脚手架和包结构
+## Final Status
+
+- **原始任务状态:** `Task 1 ~ Task 13` 全部完成
+- **当前测试状态:** `PYTHONPATH="$(pwd)" pytest -q tests/refinement_v2` 已到 `51 passed`
+- **当前主线能力:**
+  - `Phase 0 + Phase 1 + Stage 2A`
+  - `Stage 2B limited geometry`
+  - `Phase 3` tiny pose-only
+  - `Phase 4` joint fallback
+  - `state_io` 最小恢复
+  - pruning
+  - patch supervision
+  - before/after 视频导出
+- **已完成真实验证的关键产物:**
+  - `outputs/refine_v2/view3_stage2a_full`
+  - `outputs/refine_v2/view5_stage2a_full`
+  - `outputs/refine_v2/view5_stage2a_prune_patch_full_l025`
+  - `outputs/refine_v2/view5_stage2b_from_stage2a_patch_l025`
+  - `outputs/refine_v2/view5_stage2b_startstage_cli_l025`
+  - `outputs/refine_v2/view5_external_reference_2x_subset`
+
+## Completion Summary
+
+| Scope | Status | Key Result |
+| --- | --- | --- |
+| Task 1 ~ Task 10 | Completed | `refinement_v2` 主线与 `Stage 2A` 可运行 |
+| Task 11 | Completed | `Stage 2B` 已真实落地,并在 `view 5` 上有正收益 |
+| Task 12 | Completed | `Phase 3 / Phase 4 / state_io` 已闭环并纳入测试 |
+| Task 13 | Completed | 真实验证、工作记录、规格同步已完成 |
+
+## Later Increments After Original Plan Closure
+
+这些内容超出了原始 Task 1 ~ Task 13 的最小范围,但已经在当前代码中完成:
+
+### 1. `--start-stage stage2b` warm-start workflow
+
+- 已新增显式 CLI:
+  - `--start-stage {stage2a,stage2b}`
+- 作用:
+  - 保留 `Phase 0 + Phase 1`
+  - 把当前输入高斯当成 `Stage 2A` 完成态
+  - 直接进入 `Stage 2B`
+- 真实验证产物:
+  - `outputs/refine_v2/view5_stage2b_startstage_cli_l025`
+
+### 2. external reference contract
+
+- 已新增:
+  - `--reference-path`
+  - `--reference-intrinsics-path`
+- 当前支持:
+  - 外部帧目录
+  - 本地视频文件(`mp4` 等)
+- 作用:
+  - `reference_images` 不再只来自 native GT 内部上采样
+  - patch supervision 已能真实消费外部 reference
+- 真实验证产物:
+  - `outputs/refine_v2/view5_external_reference_2x_subset`
+
+### 3. 当前仍不在这份“已完成范围”里的后续方向
+
+这些不属于本计划的“未完成项”,而是下一阶段新工作:
+
+- full direct file inputs
+  - `--pose-path`
+  - `--intrinsics-path`
+  - `--rgb-path`
+- selective SR 主线补全
+  - `gaussian_fidelity_score`
+  - `W_sr_select`
+  - `W_final_sr`
+  - `L_sampling_smooth`
+  - `Phase 3S / Stage 3SR`
+
+## Historical Task List
+
+下面的 `Task 1 ~ Task 13` 保留为历史执行记录。
+截至 `2026-03-06`,这些任务都已完成。
+
+---
+
+### Task 1 [Completed]: 搭好入口脚手架和包结构
 
 **Files:**
 - Create: `scripts/refine_robust_v2.py`
@@ -61,7 +157,7 @@ Expected:
 
 ---
 
-### Task 2: 实现配置层和 CLI 映射
+### Task 2 [Completed]: 实现配置层和 CLI 映射
 
 **Files:**
 - Modify: `scripts/refine_robust_v2.py`
@@ -122,7 +218,7 @@ Expected:
 
 ---
 
-### Task 3: 实现 `SceneBundle` 和数据读取标准化
+### Task 3 [Completed]: 实现 `SceneBundle` 和数据读取标准化
 
 **Files:**
 - Modify: `src/refinement_v2/config.py`
@@ -180,7 +276,7 @@ Expected:
 
 ---
 
-### Task 4: 实现 `GaussianAdapter` 的最小可用版本
+### Task 4 [Completed]: 实现 `GaussianAdapter` 的最小可用版本
 
 **Files:**
 - Modify: `src/refinement_v2/gaussian_adapter.py`
@@ -226,7 +322,7 @@ Expected:
 
 ---
 
-### Task 5: 实现 `WeightBuilder`
+### Task 5 [Completed]: 实现 `WeightBuilder`
 
 **Files:**
 - Modify: `src/refinement_v2/weight_builder.py`
@@ -270,7 +366,7 @@ Expected:
 
 ---
 
-### Task 6: 实现损失函数层
+### Task 6 [Completed]: 实现损失函数层
 
 **Files:**
 - Modify: `src/refinement_v2/losses.py`
@@ -313,7 +409,7 @@ Expected:
 
 ---
 
-### Task 7: 实现 `DiagnosticsWriter`
+### Task 7 [Completed]: 实现 `DiagnosticsWriter`
 
 **Files:**
 - Modify: `src/refinement_v2/diagnostics.py`
@@ -354,7 +450,7 @@ Expected:
 
 ---
 
-### Task 8: 实现 `StageController`
+### Task 8 [Completed]: 实现 `StageController`
 
 **Files:**
 - Modify: `src/refinement_v2/stage_controller.py`
@@ -400,7 +496,7 @@ Expected:
 
 ---
 
-### Task 9: 实现 `Phase 0` 和 `--dry-run`
+### Task 9 [Completed]: 实现 `Phase 0` 和 `--dry-run`
 
 **Files:**
 - Modify: `src/refinement_v2/runner.py`
@@ -445,7 +541,7 @@ Expected:
 
 ---
 
-### Task 10: 实现 `Phase 1 + Stage 2A`
+### Task 10 [Completed]: 实现 `Phase 1 + Stage 2A`
 
 **Files:**
 - Modify: `src/refinement_v2/runner.py`
@@ -501,7 +597,7 @@ Expected:
 
 ---
 
-### Task 11: 实现 `Stage 2B` 受限几何优化
+### Task 11 [Completed]: 实现 `Stage 2B` 受限几何优化
 
 **Files:**
 - Modify: `src/refinement_v2/runner.py`
@@ -542,7 +638,7 @@ Expected:
 
 ---
 
-### Task 12: 实现 `Phase 3`、`Phase 4` 和最小 `state_io`
+### Task 12 [Completed]: 实现 `Phase 3`、`Phase 4` 和最小 `state_io`
 
 **Files:**
 - Modify: `src/refinement_v2/runner.py`
@@ -595,7 +691,7 @@ Expected:
 
 ---
 
-### Task 13: 跑最小验证矩阵并同步文档
+### Task 13 [Completed]: 跑最小验证矩阵并同步文档
 
 **Files:**
 - Modify: `specs/joint_refinement_camera_gaussians_v2.md`
@@ -665,7 +761,7 @@ Expected:
 
 ---
 
-## 执行优先级
+## Historical Execution Priority
 
 如果要压缩实现范围,严格按下面优先级:
 
@@ -685,7 +781,7 @@ Expected:
 
 `Stage 2B / Phase 3 / Phase 4 / resume` 都可以后置.
 
-## 交付标准
+## Historical Delivery Criteria
 
 完成第一版 MVP 时,必须满足:
 
@@ -698,7 +794,7 @@ Expected:
 
 ---
 
-## Implementation Notes After Real Validation
+## Implementation Notes After Real Validation and Later Increments
 
 - 真实验证表明, refinement 不能直接把 demo 顶层 YAML 当成完整训练配置使用.
   - 必须先解析并合并 `config_path` 指向的训练配置链.
@@ -723,3 +819,26 @@ Expected:
   - `outputs/refine_v2/view3_stage2a_full`
   - `outputs/refine_v2/view5_stage2a_full`
   - `Stage 2A` 5 iter 在两组全序列上依然稳定降低 `residual_mean`,并提升 `PSNR`.
+- 后续真实验证又补充了 `Stage 2B` 正式落地:
+  - `outputs/refine_v2/view5_stage2b_from_stage2a_patch_l025`
+  - 该 run 在 `view 5` 上带来:
+    - `PSNR 21.9213 -> 22.5822`
+    - `residual_mean 0.04648 -> 0.04165`
+    - `sharpness 0.001587 -> 0.001634`
+- `Stage 2B` 进入门控也已按真实结果收紧后再校正:
+  - `local_overlap_persistent` 阈值从 `0.05` 调整到 `0.045`
+  - 原因是 `view 5` 在 `0.047 ~ 0.048` 区间仍然存在明显局部重影
+- 后续还新增了 `Stage 2B` 的正式 warm-start workflow:
+  - `--start-stage stage2b`
+  - 真实产物:
+    - `outputs/refine_v2/view5_stage2b_startstage_cli_l025`
+- external reference contract 也已完成:
+  - CLI 新增:
+    - `--reference-path`
+    - `--reference-intrinsics-path`
+  - 当前支持:
+    - 外部帧目录
+    - 本地视频文件
+  - 真实产物:
+    - `outputs/refine_v2/view5_external_reference_2x_subset`
+  - 这说明 patch supervision 现在已经能真实消费 external reference,而不只是消费内部上采样的 native GT.

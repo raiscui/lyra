@@ -35,7 +35,19 @@ class StageController:
     def should_enter_stage2b(self, diagnostics: dict) -> bool:
         """判断是否进入 limited geometry."""
 
-        return self.run_config.enable_stage2b and diagnostics.get("need_geometry", False)
+        if not self.run_config.enable_stage2b:
+            return False
+        if diagnostics.get("ghosting_acceptable", False):
+            return False
+        if diagnostics.get("global_shift_detected", False):
+            return False
+        if diagnostics.get("weight_map_unstable", False):
+            return False
+        if diagnostics.get("geometry_overfit_risk", False):
+            return False
+        if not diagnostics.get("need_geometry", False):
+            return False
+        return diagnostics.get("local_overlap_persistent", False)
 
     def should_prune_now(self, iteration: int) -> bool:
         """判断当前 iteration 是否该触发 pruning.

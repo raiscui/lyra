@@ -28,6 +28,53 @@ def test_pose_diagnostic_requires_explicit_flag() -> None:
     assert enabled.should_enter_pose_diagnostic(diagnostics) is True
 
 
+def test_stage2b_requires_explicit_enable_flag() -> None:
+    """Stage 2B 默认不能偷偷进入,必须显式开启."""
+
+    disabled = StageController(_build_run_config(enable_stage2b=False), StageHyperParams())
+    diagnostics = {
+        "need_geometry": True,
+        "local_overlap_persistent": True,
+    }
+
+    assert disabled.should_enter_stage2b(diagnostics) is False
+
+
+def test_stage2b_requires_local_overlap_and_blocks_global_shift() -> None:
+    """Stage 2B 应该更像局部结构重叠,而不是整体错位."""
+
+    enabled = StageController(_build_run_config(enable_stage2b=True), StageHyperParams())
+
+    assert enabled.should_enter_stage2b({"need_geometry": True}) is False
+    assert enabled.should_enter_stage2b(
+        {
+            "need_geometry": True,
+            "local_overlap_persistent": True,
+            "global_shift_detected": True,
+        }
+    ) is False
+    assert enabled.should_enter_stage2b(
+        {
+            "need_geometry": True,
+            "local_overlap_persistent": True,
+            "global_shift_detected": False,
+        }
+    ) is True
+
+
+def test_stage2b_stays_closed_when_ghosting_is_already_acceptable() -> None:
+    """既然已经可接受,就不要再放开 geometry."""
+
+    enabled = StageController(_build_run_config(enable_stage2b=True), StageHyperParams())
+    diagnostics = {
+        "need_geometry": True,
+        "local_overlap_persistent": True,
+        "ghosting_acceptable": True,
+    }
+
+    assert enabled.should_enter_stage2b(diagnostics) is False
+
+
 def test_joint_fallback_requires_flag_and_evidence() -> None:
     disabled = StageController(_build_run_config(), StageHyperParams())
     enabled = StageController(_build_run_config(enable_joint_fallback=True), StageHyperParams())

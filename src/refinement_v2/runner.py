@@ -14,9 +14,11 @@ from .data_loader import SceneBundle
 from .diagnostics import DiagnosticsWriter
 from .gaussian_adapter import GaussianAdapter
 from .losses import (
+    compute_means_anchor_loss,
     compute_opacity_sparse_loss,
     compute_patch_perceptual_loss,
     compute_pose_regularization,
+    compute_rotation_regularization_loss,
     compute_scale_tail_loss,
     compute_weighted_rgb_loss,
 )
@@ -288,6 +290,37 @@ class RefinementRunner:
         laplace = F.conv2d(gray_2d, kernel, padding=1)
         return float(laplace.var().item())
 
+    def _compute_patch_losses(
+        self,
+        residual_map: torch.Tensor,
+        reference_tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """统一计算可选 patch supervision 损失.
+
+        Stage 2A 和 Stage 2B 都复用这条逻辑.
+        这样 patch 监督的行为只维护一份,不会因为阶段切换而漂移.
+        """
+
+        loss_patch_rgb = torch.zeros((), dtype=reference_tensor.dtype, device=reference_tensor.device)
+        loss_patch_perceptual = torch.zeros((), dtype=reference_tensor.dtype, device=reference_tensor.device)
+        if not self._patch_supervision_enabled():
+            return loss_patch_rgb, loss_patch_perceptual
+
+        patch_windows_native = self.sample_patch_windows(residual_map)
+        pred_patch, reference_patch, _ = self.render_patch_prediction(patch_windows_native)
+        patch_weights = torch.ones(
+            pred_patch.shape[0],
+            pred_patch.shape[1],
+            1,
+            pred_patch.shape[-2],
+            pred_patch.shape[-1],
+            dtype=pred_patch.dtype,
+            device=pred_patch.device,
+        )
+        loss_patch_rgb = compute_weighted_rgb_loss(pred_patch, reference_patch, patch_weights)
+        loss_patch_perceptual = compute_patch_perceptual_loss(pred_patch, reference_patch)
+        return loss_patch_rgb, loss_patch_perceptual
+
     def _summarize_prediction(
         self,
         pred_rgb: torch.Tensor,
@@ -306,6 +339,85 @@ class RefinementRunner:
         if weight_map is not None:
             summary.update(self.weight_builder.summarize_weight_stats(weight_map))
         return summary
+
+    def _update_stage2b_diagnostics(self, final_metrics: dict[str, Any]) -> None:
+        """把 Stage 2A 的结束状态压成是否进入 Stage 2B 的证据."""
+
+        baseline = self.diagnostics_state.get("baseline", {})
+        residual_mean = float(final_metrics.get("residual_mean", 0.0))
+        baseline_psnr = float(baseline.get("psnr", final_metrics.get("psnr", 0.0)))
+        baseline_scale_tail = float(baseline.get("scale_tail_ratio", final_metrics.get("scale_tail_ratio", 0.0)))
+        baseline_opacity_lowconf = float(
+            baseline.get("opacity_lowconf_ratio", final_metrics.get("opacity_lowconf_ratio", 0.0))
+        )
+
+        scale_tail_improved = float(final_metrics.get("scale_tail_ratio", 0.0)) < baseline_scale_tail - 1e-6
+        opacity_improved = float(final_metrics.get("opacity_lowconf_ratio", 0.0)) < baseline_opacity_lowconf - 1e-6
+        psnr_healthy = float(final_metrics.get("psnr", 0.0)) >= baseline_psnr - 0.10
+        # 真实 `view 5` 里,`residual_mean` 落在 `0.046 ~ 0.048` 时,
+        # 视觉上仍然能看到明显的局部双轮廓.
+        # 因此这里不能把阈值卡得过死在 `0.05`.
+        local_overlap_persistent = residual_mean > 0.045
+
+        # 规格里建议“至少两条证据”再进入 Stage 2B.
+        # 当前实现先用已有 diagnostics 能稳定算出来的四项做代理.
+        stage2b_signal_count = sum(
+            [
+                int(scale_tail_improved),
+                int(opacity_improved),
+                int(psnr_healthy),
+                int(local_overlap_persistent),
+            ]
+        )
+
+        self.diagnostics_state["stage2b_signal_count"] = stage2b_signal_count
+        self.diagnostics_state["scale_tail_improved"] = scale_tail_improved
+        self.diagnostics_state["opacity_sparse_improved"] = opacity_improved
+        self.diagnostics_state["psnr_healthy"] = psnr_healthy
+        self.diagnostics_state["need_geometry"] = local_overlap_persistent and stage2b_signal_count >= 2
+        self.diagnostics_state["local_overlap_persistent"] = local_overlap_persistent
+
+    def bootstrap_stage2b_from_current_gaussians(self) -> dict[str, Any]:
+        """把当前输入高斯视为“已完成 Stage 2A”的 warm start.
+
+        这个入口用于显式支持:
+        - 输入已经是 `gaussians_stage2a.ply`
+        - 本轮只想继续做 `Stage 2B`
+
+        这里不会再做新的 Stage 2A optimizer step.
+        只会:
+        1. 重新渲染当前高斯
+        2. 更新权重图与统计
+        3. 生成是否进入 `Stage 2B` 的 diagnostics
+        """
+
+        self.current_stage = "stage2a"
+        render_output = self.render_current_scene()
+        pred_rgb = render_output["images_pred"]
+        residual_map = self.weight_builder.build_residual_map(pred_rgb, self.scene.gt_images)
+        self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, self.prev_weight_map)
+
+        loss_rgb = compute_weighted_rgb_loss(pred_rgb, self.scene.gt_images, self.prev_weight_map)
+        loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
+        loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
+        loss_patch_rgb, loss_patch_perceptual = self._compute_patch_losses(residual_map, loss_rgb)
+        metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map)
+        metrics.update(
+            {
+                "loss_total": float(loss_rgb.item()),
+                "loss_rgb_weighted": float(loss_rgb.item()),
+                "loss_scale_tail": float(loss_scale.item()),
+                "loss_opacity_sparse": float(loss_opacity.item()),
+                "loss_patch_rgb": float(loss_patch_rgb.item()),
+                "loss_patch_perceptual": float(loss_patch_perceptual.item()),
+            }
+        )
+
+        self.diagnostics_state["phase_reached"] = "stage2a"
+        self.diagnostics_state["warm_start_stage2b"] = True
+        self.diagnostics_state["stage2a_bootstrap"] = metrics
+        self._update_stage2b_diagnostics(metrics)
+        return metrics
 
     def _safe_export_ply(self, file_name: str) -> None:
         """尽量导出高斯,导出失败时不打断主流程."""
@@ -432,22 +544,7 @@ class RefinementRunner:
             loss_rgb = compute_weighted_rgb_loss(pred_rgb, self.scene.gt_images, self.prev_weight_map)
             loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
             loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
-            loss_patch_rgb = torch.zeros((), dtype=loss_rgb.dtype, device=loss_rgb.device)
-            loss_patch_perceptual = torch.zeros((), dtype=loss_rgb.dtype, device=loss_rgb.device)
-            if self._patch_supervision_enabled():
-                patch_windows_native = self.sample_patch_windows(residual_map)
-                pred_patch, reference_patch, _ = self.render_patch_prediction(patch_windows_native)
-                patch_weights = torch.ones(
-                    pred_patch.shape[0],
-                    pred_patch.shape[1],
-                    1,
-                    pred_patch.shape[-2],
-                    pred_patch.shape[-1],
-                    dtype=pred_patch.dtype,
-                    device=pred_patch.device,
-                )
-                loss_patch_rgb = compute_weighted_rgb_loss(pred_patch, reference_patch, patch_weights)
-                loss_patch_perceptual = compute_patch_perceptual_loss(pred_patch, reference_patch)
+            loss_patch_rgb, loss_patch_perceptual = self._compute_patch_losses(residual_map, loss_rgb)
             loss_total = loss_rgb + self.hparams.lambda_scale_tail * loss_scale + self.hparams.lambda_opacity_sparse * loss_opacity
             loss_total = (
                 loss_total
@@ -505,9 +602,8 @@ class RefinementRunner:
 
         self._safe_export_ply("gaussians_stage2a.ply")
         self.diagnostics_state["phase_reached"] = "stage2a"
-        self.diagnostics_state["need_geometry"] = final_metrics.get("residual_mean", 0.0) > 0.05
         self.diagnostics_state["global_shift_detected"] = False
-        self.diagnostics_state["local_overlap_persistent"] = final_metrics.get("residual_mean", 0.0) > 0.05
+        self._update_stage2b_diagnostics(final_metrics)
         return final_metrics
 
     def run_stage2b(self) -> dict[str, Any]:
@@ -527,7 +623,20 @@ class RefinementRunner:
             loss_rgb = compute_weighted_rgb_loss(pred_rgb, self.scene.gt_images, self.prev_weight_map)
             loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
             loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
+            loss_patch_rgb, loss_patch_perceptual = self._compute_patch_losses(residual_map, loss_rgb)
+            loss_means_anchor = compute_means_anchor_loss(self.gaussians.means, self.gaussians.initial_means)
+            loss_rotation_reg = compute_rotation_regularization_loss(
+                self.gaussians.rotations,
+                self.gaussians.initial_rotations,
+            )
             loss_total = loss_rgb + self.hparams.lambda_scale_tail * loss_scale + self.hparams.lambda_opacity_sparse * loss_opacity
+            loss_total = (
+                loss_total
+                + self.hparams.lambda_patch_rgb * loss_patch_rgb
+                + self.hparams.lambda_patch_perceptual * loss_patch_perceptual
+                + self.hparams.lambda_means_anchor * loss_means_anchor
+                + self.hparams.lambda_rotation_reg * loss_rotation_reg
+            )
 
             loss_total.backward()
             optimizer.step()
@@ -535,7 +644,18 @@ class RefinementRunner:
             self.gaussians.clamp_stage_constraints("stage2b", self.hparams)
 
             final_metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map)
-            final_metrics.update({"loss_total": float(loss_total.item())})
+            final_metrics.update(
+                {
+                    "loss_total": float(loss_total.item()),
+                    "loss_rgb_weighted": float(loss_rgb.item()),
+                    "loss_scale_tail": float(loss_scale.item()),
+                    "loss_opacity_sparse": float(loss_opacity.item()),
+                    "loss_patch_rgb": float(loss_patch_rgb.item()),
+                    "loss_patch_perceptual": float(loss_patch_perceptual.item()),
+                    "loss_means_anchor": float(loss_means_anchor.item()),
+                    "loss_rotation_reg": float(loss_rotation_reg.item()),
+                }
+            )
             self._log_and_maybe_save("stage2b", final_metrics, residual_map, self.prev_weight_map, iter_idx=iter_idx)
 
         self._safe_export_ply("gaussians_stage2b.ply")
@@ -635,10 +755,12 @@ class RefinementRunner:
         return {
             "scene_id": self.scene.scene_index,
             "view_id": self.scene.view_id,
+            "start_stage": self.run_config.start_stage,
             "phase_reached": self.diagnostics_state.get("phase_reached", self.current_stage),
             "stopped_reason": override_stop_reason or self.controller.summarize_stop_reason(self.diagnostics_state),
             "used_pose_refinement": self.diagnostics_state.get("used_pose_refinement", False),
             "used_joint_fallback": self.diagnostics_state.get("used_joint_fallback", False),
+            "warm_start_stage2b": self.diagnostics_state.get("warm_start_stage2b", False),
             "baseline": baseline,
             "final": final_metrics,
             "artifacts": dict(self.visual_artifacts),
@@ -685,7 +807,11 @@ class RefinementRunner:
         if self.run_config.stop_after == "phase1":
             return self.export_final_outputs(final_metrics)
 
-        final_metrics = self.run_stage2a()
+        if self.run_config.start_stage == "stage2b":
+            final_metrics = self.bootstrap_stage2b_from_current_gaussians()
+        else:
+            final_metrics = self.run_stage2a()
+
         if self.run_config.stop_after == "stage2a":
             return self.export_final_outputs(final_metrics)
 

@@ -10,6 +10,42 @@
 旧文件 `specs/joint_refinement_camera_gaussians.md` 保留作为历史讨论记录.
 从这一版开始,**默认主线不再把相机联合优化放在最前面**.
 
+## 当前实现状态(2026-03-06)
+
+这份规格最初是设计文档.
+到当前时间点,其中对应的第一版工程已经落地完成,而且实现范围已经超过最初 MVP.
+
+当前代码里已经完成:
+
+- `Phase 0`
+- `Phase 1`
+- `Stage 2A`
+- `Stage 2B`
+- `Phase 3`
+- `Phase 4`
+- `state_io` 最小恢复
+- before/after 视频导出
+- pruning
+- patch supervision
+- `--start-stage stage2b` warm-start workflow
+- external reference contract
+  - `--reference-path`
+  - `--reference-intrinsics-path`
+
+当前测试状态:
+
+- `PYTHONPATH="$(pwd)" pytest -q tests/refinement_v2`
+- 已到 `51 passed`
+
+当前已完成的关键真实验证产物包括:
+
+- `outputs/refine_v2/view3_stage2a_full`
+- `outputs/refine_v2/view5_stage2a_full`
+- `outputs/refine_v2/view5_stage2a_prune_patch_full_l025`
+- `outputs/refine_v2/view5_stage2b_from_stage2a_patch_l025`
+- `outputs/refine_v2/view5_stage2b_startstage_cli_l025`
+- `outputs/refine_v2/view5_external_reference_2x_subset`
+
 ## 背景
 
 在当前 Lyra demo 和代码链路下,已经有几件事可以基本确认:
@@ -113,6 +149,23 @@
   - 例如 `configs/demo/lyra_static.yaml`
 - `scene_index`
   - demo 通常是 0
+- `dataset_name`(可选)
+  - 当 demo YAML 指向的数据集名和本机真实资产不一致时,可显式覆盖
+- `view_id`(可选)
+  - 用于锁定主轨迹,例如 `3` 或 `5`
+- `start_stage`(可选)
+  - `stage2a` 或 `stage2b`
+  - `stage2b` 表示把当前输入高斯视为“已完成 Stage 2A”的 warm start
+- `reference_mode` / `sr_scale`(可选)
+  - 控制 patch supervision 使用 native reference 还是更高分辨率 reference
+- `reference_path`(可选)
+  - 外部 reference 数据源
+  - 当前实现支持:
+    - 帧目录
+    - 本地视频文件
+- `reference_intrinsics_path`(可选)
+  - 外部 reference 对应的 `intrinsics` 覆盖文件
+  - 当前实现要求 `npz` 能解出 `[T, 4]` 或 `[1, T, 4]`
 
 ### 中间诊断产物
 
@@ -127,6 +180,9 @@
 - `render_refined.mp4`
 - `metrics.json`
 - `config_effective.yaml`
+- `videos/baseline_render.mp4`
+- `videos/final_render.mp4`
+- `videos/gt_reference.mp4`
 - `poses_refined.npz`
   - 只有开启 pose 诊断或 joint fallback 时才输出
 
@@ -502,10 +558,12 @@
 {
   "scene_id": 0,
   "view_id": "3",
+  "start_stage": "stage2a",
   "phase_reached": "stage2a",
   "stopped_reason": "ghosting_acceptable",
   "used_pose_refinement": false,
   "used_joint_fallback": false,
+  "warm_start_stage2b": false,
   "baseline": {
     "psnr": 0.0,
     "lpips": 0.0,
@@ -684,6 +742,8 @@ python3 scripts/refine_robust_v2.py \
   - provider / dataset 对齐所需主配置
 - `--gaussians`
   - 初始高斯 `.ply`
+- `--dataset-name`
+  - 可选,覆盖 demo YAML 中的数据集注册名
 - `--scene-index`
   - 默认 `0`
 - `--view-id`
@@ -692,9 +752,25 @@ python3 scripts/refine_robust_v2.py \
   - 可选,显式指定参与优化的帧
 - `--target-subsample`
   - 若不传 `frame-indices`,则按步长子采样
+- `--reference-mode`
+  - `native` 或 `super_resolved`
+- `--sr-scale`
+  - 当使用更高分辨率 reference 时的倍率
+- `--reference-path`
+  - 外部 reference 输入
+  - 当前支持帧目录与本地视频文件
+- `--reference-intrinsics-path`
+  - 外部 reference 对应的 intrinsics 覆盖文件
 
 #### 阶段控制类
 
+- `--start-stage`
+  - 可选值:
+    - `stage2a`
+    - `stage2b`
+  - 含义:
+    - `stage2a`: 默认完整主线
+    - `stage2b`: 把当前输入高斯视为“已完成 Stage 2A”的 warm start,跳过新的 Stage 2A optimizer step,直接评估是否进入 `Stage 2B`
 - `--enable-stage2b`
   - 是否允许 limited geometry
 - `--enable-pose-diagnostic`
@@ -749,6 +825,7 @@ python3 scripts/refine_robust_v2.py \
 - `--scene-index`
 - `--view-id`
 - `--outdir`
+- `--start-stage`
 - `--enable-stage2b`
 - `--enable-pose-diagnostic`
 - `--enable-joint-fallback`
@@ -817,9 +894,16 @@ class RefinementRunConfig:
     gaussians_path: Path
     outdir: Path
     scene_index: int = 0
+    dataset_name: str | None = None
     view_id: str | None = None
-    target_subsample: int = 4
-    enable_stage2b: bool = True
+    reference_mode: str = "native"
+    sr_scale: float = 1.0
+    reference_path: Path | None = None
+    reference_intrinsics_path: Path | None = None
+    frame_indices: list[int] | None = None
+    target_subsample: int = 1
+    start_stage: str = "stage2a"
+    enable_stage2b: bool = False
     enable_pose_diagnostic: bool = False
     enable_joint_fallback: bool = False
     stop_after: str | None = None
@@ -827,11 +911,38 @@ class RefinementRunConfig:
     dry_run: bool = False
 ```
 
+### `Stage 2B` warm-start 用法
+
+当输入高斯已经来自上一轮 `Stage 2A` 结果,例如:
+
+- `gaussians_stage2a.ply`
+
+推荐显式使用:
+
+```bash
+PYTHONPATH="$(pwd)" pixi run python scripts/refine_robust_v2.py \
+  --config configs/demo/lyra_static.yaml \
+  --gaussians outputs/refine_v2/.../gaussians/gaussians_stage2a.ply \
+  --outdir outputs/refine_v2/... \
+  --dataset-name lyra_static_demo_generated \
+  --view-id 5 \
+  --start-stage stage2b \
+  --enable-stage2b
+```
+
+这样 `Phase 0` 和 `Phase 1` 仍会运行.
+但不会再重复做新的 `Stage 2A` optimizer step.
+更适合把 `Stage 2B` 当成“在已验证 Stage 2A 基线之上的增量优化”.
+
 ### `StageHyperParams`
 
 ```python
 @dataclass
 class StageHyperParams:
+    alpha_rgb: float = 1.0
+    alpha_perc: float = 0.0
+    q_low: float = 0.50
+    q_high: float = 0.90
     weight_floor: float = 0.20
     weight_tau: float = 0.45
     ema_decay: float = 0.90
@@ -844,6 +955,12 @@ class StageHyperParams:
     lr_scale: float = 1e-3
     lr_means: float = 1e-4
     lr_pose: float = 3e-5
+    patch_size: int = 0
+    lambda_patch_rgb: float = 0.0
+    lambda_patch_perceptual: float = 0.0
+    lambda_means_anchor: float = 0.01
+    lambda_rotation_reg: float = 0.01
+    means_delta_cap: float = 0.02
 ```
 
 ### `SceneBundle`
@@ -857,6 +974,14 @@ class SceneBundle:
     frame_indices: list[int]
     scene_index: int
     view_id: str | None
+    target_index: torch.Tensor | None = None
+    file_name: str | None = None
+    reference_images: torch.Tensor | None = None
+    intrinsics_ref: torch.Tensor | None = None
+    native_hw: tuple[int, int] | None = None
+    reference_hw: tuple[int, int] | None = None
+    reference_mode: str = "native"
+    sr_scale: float = 1.0
 ```
 
 ## 模块接口签名草案
@@ -1386,16 +1511,19 @@ sequenceDiagram
 3. 跑 V2 各阶段
 4. 保存诊断和结果
 
-## 任务清单
+## 任务清单(当前状态)
 
-- [ ] 任务1: 跑通 Phase 0,输出 baseline residual 与高斯统计
-- [ ] 任务2: 实现 V2.0 版 `weight_map` 构造器
-- [ ] 任务3: 实现 Stage 2A 的 gaussian-only refinement
-- [ ] 任务4: 实现 Stage 2B 的 limited geometry refinement
-- [ ] 任务5: 输出 `diagnostics.json` 与 residual / weight 可视化
-- [ ] 任务6: 实现 tiny pose-only diagnostic 模式
-- [ ] 任务7: 保留 joint fallback,但不默认开启
-- [ ] 任务8: 在 `view "3"` 与最差轨迹上验证,给出默认参数
+原始这 8 项任务都已经完成.
+保留在这里,是为了让规格仍能清楚映射回最初的实现目标.
+
+- [x] 任务1: 跑通 Phase 0,输出 baseline residual 与高斯统计
+- [x] 任务2: 实现 V2.0 版 `weight_map` 构造器
+- [x] 任务3: 实现 Stage 2A 的 gaussian-only refinement
+- [x] 任务4: 实现 Stage 2B 的 limited geometry refinement
+- [x] 任务5: 输出 `diagnostics.json` 与 residual / weight 可视化
+- [x] 任务6: 实现 tiny pose-only diagnostic 模式
+- [x] 任务7: 保留 joint fallback,但不默认开启
+- [x] 任务8: 在 `view "3"` 与最差轨迹上验证,给出默认参数
 
 ## 成功判据
 
@@ -1406,6 +1534,51 @@ sequenceDiagram
 3. PSNR 不发生明显崩塌
 4. residual heatmap 从“大块高残差”变成“少量边缘残差”
 5. 如果启用了 pose-only,其 delta 必须很小且可解释
+
+## 已完成验证摘要(2026-03-06)
+
+当前规格对应实现已经满足上面的成功判据,并额外拿到了下面这些真实结论:
+
+### Stage 2A 全序列
+
+- `outputs/refine_v2/view3_stage2a_full`
+- `outputs/refine_v2/view5_stage2a_full`
+- 结果:
+  - `view 3`: `PSNR 19.6426 -> 22.9245`
+  - `view 5`: `PSNR 18.7739 -> 21.7612`
+
+### pruning + patch supervision
+
+- `outputs/refine_v2/view5_stage2a_prune_patch_full_l025`
+- 结果:
+  - `view 5`: `PSNR 21.8330 -> 21.8907`
+  - `residual_mean 0.047021 -> 0.046883`
+
+### Stage 2B limited geometry
+
+- `outputs/refine_v2/view5_stage2b_from_stage2a_patch_l025`
+- 结果:
+  - `PSNR 21.9213 -> 22.5822`
+  - `residual_mean 0.04648 -> 0.04165`
+  - `sharpness 0.001587 -> 0.001634`
+- 这也反过来说明:
+  - `Stage 2B` 已经不是预留接口
+  - 它在困难轨迹上已经能提供真实正收益
+
+### Stage 2B warm-start workflow
+
+- `outputs/refine_v2/view5_stage2b_startstage_cli_l025`
+- 说明:
+  - `--start-stage stage2b` 已经成为正式 workflow
+  - 不再需要手工绕一轮额外 `Stage 2A`
+
+### external reference contract
+
+- `outputs/refine_v2/view5_external_reference_2x_subset`
+- 说明:
+  - external reference 已经能真实进入 `reference_images`
+  - patch supervision 已能消费外部 mp4 / 帧目录
+  - 这一步已完成,但 full direct file inputs 仍是后续新工作
 
 ## 最终建议
 
