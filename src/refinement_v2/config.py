@@ -19,6 +19,9 @@ class RefinementRunConfig:
     config_path: Path
     gaussians_path: Path
     outdir: Path
+    pose_path: Path | None = None
+    intrinsics_path: Path | None = None
+    rgb_path: Path | None = None
     scene_index: int = 0
     dataset_name: str | None = None
     view_id: str | None = None
@@ -65,10 +68,12 @@ class StageHyperParams:
     patch_size: int = 0
     lambda_patch_rgb: float = 0.0
     lambda_patch_perceptual: float = 0.0
+    lambda_sampling_smooth: float = 5e-4
     lambda_means_anchor: float = 0.01
     lambda_rotation_reg: float = 0.01
     means_delta_cap: float = 0.02
     scale_tail_threshold: float = 0.25
+    sampling_radius_threshold: float = 1.5
     opacity_low_threshold: float = 0.10
     opacity_prune_threshold: float = 0.05
     lambda_scale_tail: float = 1e-2
@@ -102,6 +107,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True, help="Path to the scene config YAML.")
     parser.add_argument("--gaussians", required=True, help="Path to the initial gaussian PLY.")
     parser.add_argument("--outdir", required=True, help="Output directory for diagnostics and results.")
+    parser.add_argument(
+        "--pose-path",
+        type=str,
+        default=None,
+        help="Optional direct pose npz input. When set together with --intrinsics-path and --rgb-path, the loader skips provider mode.",
+    )
+    parser.add_argument(
+        "--intrinsics-path",
+        type=str,
+        default=None,
+        help="Optional direct intrinsics npz input used together with --pose-path and --rgb-path.",
+    )
+    parser.add_argument(
+        "--rgb-path",
+        type=str,
+        default=None,
+        help="Optional direct RGB input path. Supports a frame directory or a local video file.",
+    )
     parser.add_argument("--scene-index", type=int, default=0, help="Scene index inside the test dataloader.")
     parser.add_argument(
         "--dataset-name",
@@ -199,8 +222,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patch-size", type=int, default=0)
     parser.add_argument("--lambda-patch-rgb", type=float, default=0.0)
     parser.add_argument("--lambda-patch-perceptual", type=float, default=0.0)
+    parser.add_argument("--lambda-sampling-smooth", type=float, default=5e-4)
     parser.add_argument("--lambda-means-anchor", type=float, default=0.01)
     parser.add_argument("--lambda-rotation-reg", type=float, default=0.01)
+    parser.add_argument("--sampling-radius-threshold", type=float, default=1.5)
     parser.add_argument("--opacity-prune-threshold", type=float, default=0.05)
     parser.add_argument("--prune-every", type=int, default=2)
     parser.add_argument("--prune-warmup-iters", type=int, default=2)
@@ -222,6 +247,9 @@ def load_effective_config_from_cli(
         config_path=Path(args.config),
         gaussians_path=Path(args.gaussians),
         outdir=Path(args.outdir),
+        pose_path=Path(args.pose_path) if args.pose_path else None,
+        intrinsics_path=Path(args.intrinsics_path) if args.intrinsics_path else None,
+        rgb_path=Path(args.rgb_path) if args.rgb_path else None,
         scene_index=args.scene_index,
         dataset_name=args.dataset_name,
         view_id=args.view_id,
@@ -261,8 +289,10 @@ def load_effective_config_from_cli(
         patch_size=args.patch_size,
         lambda_patch_rgb=args.lambda_patch_rgb,
         lambda_patch_perceptual=args.lambda_patch_perceptual,
+        lambda_sampling_smooth=args.lambda_sampling_smooth,
         lambda_means_anchor=args.lambda_means_anchor,
         lambda_rotation_reg=args.lambda_rotation_reg,
+        sampling_radius_threshold=args.sampling_radius_threshold,
         opacity_prune_threshold=args.opacity_prune_threshold,
         prune_every=args.prune_every,
         prune_warmup_iters=args.prune_warmup_iters,

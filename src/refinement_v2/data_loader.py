@@ -96,6 +96,120 @@ def _load_reference_frames(reference_path: Path) -> torch.Tensor:
     raise FileNotFoundError(f"reference_path does not exist: {reference_path}")
 
 
+def _load_npz_array(npz_path: Path, preferred_keys: tuple[str, ...], tensor_name: str) -> np.ndarray:
+    """从 `npz` 里按常见 key 顺序取出主数组.
+
+    当前项目真实数据通常是:
+    - `data`
+    - `inds`
+
+    这里优先取语义 key.
+    如果没有,再回退到第一个数组.
+    """
+
+    with np.load(npz_path, allow_pickle=False) as payload:
+        for key in preferred_keys:
+            if key in payload:
+                return np.asarray(payload[key], dtype=np.float32)
+
+        if not payload.files:
+            raise ValueError(f"{tensor_name} npz is empty: {npz_path}")
+        return np.asarray(payload[payload.files[0]], dtype=np.float32)
+
+
+def _load_direct_pose_sequence(pose_path: Path) -> torch.Tensor:
+    """读取 direct input 模式下的相机位姿序列."""
+
+    pose_np = _load_npz_array(
+        pose_path,
+        preferred_keys=("data", "pose", "cam_view", "c2w", "c2ws"),
+        tensor_name="pose",
+    )
+    pose = torch.from_numpy(pose_np).float()
+    if pose.ndim == 4 and pose.shape[0] == 1:
+        pose = pose[0]
+    if pose.ndim != 3 or tuple(pose.shape[-2:]) != (4, 4):
+        raise ValueError(f"pose_path must resolve to shape [T, 4, 4], got {tuple(pose.shape)}.")
+    return pose
+
+
+def _load_direct_intrinsics_sequence(intrinsics_path: Path) -> torch.Tensor:
+    """读取 direct input 模式下的内参序列."""
+
+    intrinsics_np = _load_npz_array(
+        intrinsics_path,
+        preferred_keys=("data", "intrinsics", "K"),
+        tensor_name="intrinsics",
+    )
+    intrinsics = torch.from_numpy(intrinsics_np).float()
+    if intrinsics.ndim == 3 and intrinsics.shape[0] == 1:
+        intrinsics = intrinsics[0]
+    if intrinsics.ndim == 1 and intrinsics.shape[0] == 4:
+        intrinsics = intrinsics.unsqueeze(0)
+    if intrinsics.ndim != 2 or intrinsics.shape[-1] != 4:
+        raise ValueError(f"intrinsics_path must resolve to shape [T, 4], got {tuple(intrinsics.shape)}.")
+    return intrinsics
+
+
+def _validate_direct_input_triplet(run_config: RefinementRunConfig) -> bool:
+    """校验 direct file inputs 是否成套提供."""
+
+    direct_inputs = {
+        "pose_path": run_config.pose_path,
+        "intrinsics_path": run_config.intrinsics_path,
+        "rgb_path": run_config.rgb_path,
+    }
+    provided = {name: path for name, path in direct_inputs.items() if path is not None}
+    if not provided:
+        return False
+
+    if len(provided) != len(direct_inputs):
+        missing_names = [name for name, path in direct_inputs.items() if path is None]
+        raise ValueError(
+            "Direct file inputs require --pose-path, --intrinsics-path and --rgb-path together. "
+            f"Missing: {', '.join(missing_names)}."
+        )
+    return True
+
+
+def _build_direct_input_batch(run_config: RefinementRunConfig) -> dict[str, Any] | None:
+    """从 direct file inputs 直接组装一个 provider-compatible batch."""
+
+    if not _validate_direct_input_triplet(run_config):
+        return None
+
+    assert run_config.pose_path is not None
+    assert run_config.intrinsics_path is not None
+    assert run_config.rgb_path is not None
+
+    rgb_frames = _load_reference_frames(run_config.rgb_path)
+    cam_view = _load_direct_pose_sequence(run_config.pose_path)
+    intrinsics = _load_direct_intrinsics_sequence(run_config.intrinsics_path)
+
+    frame_count_summary = {
+        "rgb": int(rgb_frames.shape[0]),
+        "pose": int(cam_view.shape[0]),
+        "intrinsics": int(intrinsics.shape[0]),
+    }
+    unique_lengths = set(frame_count_summary.values())
+    if len(unique_lengths) != 1:
+        raise ValueError(
+            "Direct file inputs must share the same frame count before refinement slicing. "
+            f"Got {frame_count_summary}."
+        )
+
+    file_name = run_config.rgb_path.stem
+    if run_config.rgb_path.is_dir():
+        file_name = run_config.rgb_path.name
+
+    return {
+        "images_output": rgb_frames.unsqueeze(0),
+        "cam_view": cam_view.unsqueeze(0),
+        "intrinsics": intrinsics.unsqueeze(0),
+        "file_name": [file_name],
+    }
+
+
 def _select_external_sequence(sequence: torch.Tensor, selected_frame_indices: list[int], sequence_name: str) -> torch.Tensor:
     """把外部序列对齐到 refinement 当前使用的帧列表.
 
@@ -518,6 +632,20 @@ def build_scene_bundle(
     if batch is not None:
         return standardize_batch(
             batch=batch,
+            scene_index=run_config.scene_index,
+            view_id=run_config.view_id,
+            frame_indices=run_config.frame_indices,
+            target_subsample=run_config.target_subsample,
+            reference_mode=run_config.reference_mode,
+            sr_scale=run_config.sr_scale,
+            reference_path=run_config.reference_path,
+            reference_intrinsics_path=run_config.reference_intrinsics_path,
+        )
+
+    direct_input_batch = _build_direct_input_batch(run_config)
+    if direct_input_batch is not None:
+        return standardize_batch(
+            batch=direct_input_batch,
             scene_index=run_config.scene_index,
             view_id=run_config.view_id,
             frame_indices=run_config.frame_indices,

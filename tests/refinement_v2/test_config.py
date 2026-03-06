@@ -18,6 +18,9 @@ def test_cli_mapping_uses_defaults() -> None:
     assert str(run_config.config_path) == "configs/demo/lyra_static.yaml"
     assert str(run_config.gaussians_path) == "outputs/demo/gaussians_0.ply"
     assert str(run_config.outdir) == "outputs/refine_v2/test"
+    assert run_config.pose_path is None
+    assert run_config.intrinsics_path is None
+    assert run_config.rgb_path is None
     assert run_config.scene_index == 0
     assert run_config.dataset_name is None
     assert run_config.frame_indices is None
@@ -30,6 +33,8 @@ def test_cli_mapping_uses_defaults() -> None:
     assert hparams.iters_stage2a == 600
     assert hparams.lambda_means_anchor == 0.01
     assert hparams.lambda_rotation_reg == 0.01
+    assert hparams.lambda_sampling_smooth == 5e-4
+    assert hparams.sampling_radius_threshold == 1.5
 
 
 def test_cli_mapping_reads_bool_flags_and_frame_indices() -> None:
@@ -165,6 +170,31 @@ def test_cli_mapping_reads_external_reference_flags() -> None:
     assert str(run_config.reference_intrinsics_path) == "assets/demo/static/diffusion_output_generated/5/intrinsics/demo.npz"
 
 
+def test_cli_mapping_reads_direct_file_input_flags() -> None:
+    """确认 direct file inputs 能稳定映射到配置对象."""
+
+    run_config, _ = load_effective_config_from_cli(
+        [
+            "--config",
+            "configs/demo/lyra_static.yaml",
+            "--gaussians",
+            "outputs/demo/gaussians_0.ply",
+            "--outdir",
+            "outputs/refine_v2/test",
+            "--pose-path",
+            "assets/demo/static/diffusion_output_generated/3/pose/00172.npz",
+            "--intrinsics-path",
+            "assets/demo/static/diffusion_output_generated/3/intrinsics/00172.npz",
+            "--rgb-path",
+            "assets/demo/static/diffusion_output_generated/3/rgb/00172.mp4",
+        ]
+    )
+
+    assert str(run_config.pose_path) == "assets/demo/static/diffusion_output_generated/3/pose/00172.npz"
+    assert str(run_config.intrinsics_path) == "assets/demo/static/diffusion_output_generated/3/intrinsics/00172.npz"
+    assert str(run_config.rgb_path) == "assets/demo/static/diffusion_output_generated/3/rgb/00172.mp4"
+
+
 def test_cli_mapping_reads_stage2b_regularizer_flags() -> None:
     """确认 Stage 2B 的几何正则权重能从 CLI 映射进来."""
 
@@ -185,3 +215,25 @@ def test_cli_mapping_reads_stage2b_regularizer_flags() -> None:
 
     assert hparams.lambda_means_anchor == 0.2
     assert hparams.lambda_rotation_reg == 0.05
+
+
+def test_cli_mapping_reads_sampling_smooth_flags() -> None:
+    """确认 sampling smooth 相关参数能从 CLI 映射进来."""
+
+    _, hparams = load_effective_config_from_cli(
+        [
+            "--config",
+            "configs/demo/lyra_static.yaml",
+            "--gaussians",
+            "outputs/demo/gaussians_0.ply",
+            "--outdir",
+            "outputs/refine_v2/test",
+            "--lambda-sampling-smooth",
+            "0.002",
+            "--sampling-radius-threshold",
+            "2.5",
+        ]
+    )
+
+    assert hparams.lambda_sampling_smooth == 0.002
+    assert hparams.sampling_radius_threshold == 2.5

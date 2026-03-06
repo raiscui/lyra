@@ -55,6 +55,55 @@ def compute_opacity_sparse_loss(opacity: torch.Tensor) -> torch.Tensor:
     return opacity.mean()
 
 
+def compute_sampling_smooth_loss(
+    scales: torch.Tensor,
+    fidelity_score: torch.Tensor | None,
+    render_meta: dict[str, torch.Tensor] | None,
+    radius_threshold: float = 1.5,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """约束低 fidelity 高斯不要收缩出不受支持的高频.
+
+    第一版不直接复刻 `Mip-Splatting` 的 renderer-level 3D smoothing.
+    这里只做一个更保守的训练期正则:
+    - 如果某个 Gaussian 在当前 native 渲染里投影半径偏小
+    - 且它本身 fidelity 也低
+    - 那就不要让它的 3D scale 再继续收得过小
+    """
+
+    if fidelity_score is None or render_meta is None:
+        return torch.zeros((), dtype=scales.dtype, device=scales.device)
+
+    radii = render_meta.get("radii")
+    opacities = render_meta.get("opacities")
+    if not isinstance(radii, torch.Tensor) or not isinstance(opacities, torch.Tensor):
+        return torch.zeros((), dtype=scales.dtype, device=scales.device)
+
+    radii = radii.float()
+    opacities = opacities.float()
+    if radii.ndim == 2:
+        radii = radii.unsqueeze(0)
+    if opacities.ndim == 2:
+        opacities = opacities.unsqueeze(0)
+    if fidelity_score.ndim == 1:
+        fidelity_score = fidelity_score.unsqueeze(0)
+
+    if radii.ndim != 3 or opacities.shape != radii.shape:
+        return torch.zeros((), dtype=scales.dtype, device=scales.device)
+    if fidelity_score.ndim != 2 or fidelity_score.shape[0] != radii.shape[0] or fidelity_score.shape[1] != radii.shape[2]:
+        return torch.zeros((), dtype=scales.dtype, device=scales.device)
+
+    visible = (radii > 0).to(dtype=scales.dtype)
+    radius_deficit = F.relu(radius_threshold - radii.to(dtype=scales.dtype)) / max(radius_threshold, eps)
+    opacity_gate = opacities.to(dtype=scales.dtype).clamp(0.0, 1.0)
+    unsupported_per_view = radius_deficit * visible * opacity_gate
+    unsupported_per_gaussian = unsupported_per_view.sum(dim=1) / visible.sum(dim=1).clamp_min(1.0)
+
+    low_fidelity = (1.0 - fidelity_score.to(dtype=scales.dtype)).clamp(0.0, 1.0)
+    scale_max = scales.max(dim=-1).values.clamp_min(eps)
+    return (low_fidelity * unsupported_per_gaussian / scale_max).mean()
+
+
 def compute_patch_perceptual_loss(
     pred_patch: torch.Tensor,
     reference_patch: torch.Tensor,

@@ -19,9 +19,50 @@ from gsplat.rendering import rasterization
 import kiui
 
 class GaussianRenderer:
+    _META_TENSOR_KEYS = (
+        "radii",
+        "means2d",
+        "depths",
+        "conics",
+        "opacities",
+        "tiles_per_gauss",
+    )
+
     def __init__(self, opt):
         self.opt = opt
         self.gs_view_chunk_size = self.opt.get('gs_view_chunk_size', 1)
+
+    def _merge_chunk_meta(self, batch_meta_chunks, batch_size, num_views):
+        """把按 view chunk 返回的 meta 重新拼回 `[B, V, ...]`.
+
+        这里先只回传后续 refinement 真正需要的 dense 字段.
+        像 `isect_ids` / `flatten_ids` 这类 chunk-local 编码结果,
+        现在还没有稳定的跨 chunk 语义,暂时不向上暴露.
+        """
+
+        if not batch_meta_chunks:
+            return {}
+
+        merged_meta = {}
+        for key in self._META_TENSOR_KEYS:
+            merged_batches = []
+            for meta_chunks in batch_meta_chunks:
+                tensors = [meta_chunk.get(key) for meta_chunk in meta_chunks if isinstance(meta_chunk.get(key), torch.Tensor)]
+                if not tensors:
+                    merged_batches = []
+                    break
+                merged_batches.append(torch.cat(tensors, dim=0))
+            if merged_batches:
+                merged_meta[key] = torch.stack(merged_batches, dim=0)
+
+        first_meta = batch_meta_chunks[0][0]
+        for key in ("width", "height", "tile_size", "tile_width", "tile_height"):
+            if key in first_meta:
+                merged_meta[key] = first_meta[key]
+
+        merged_meta["n_batches"] = batch_size
+        merged_meta["n_cameras"] = num_views
+        return merged_meta
         
     def render(self, gaussians, cam_view, bg_color=None, intrinsics=None):
         # gaussians: [B, N, 14]
@@ -30,7 +71,9 @@ class GaussianRenderer:
 
         # loop of loop...
         images, alphas, depths = [], [], []
+        meta_chunks_by_batch = []
         for b in range(B):
+            batch_meta_chunks = []
             for v in range(0, V, self.gs_view_chunk_size):
                 # pos, opacity, scale, rotation, shs
                 means3D = gaussians[b, :, 0:3].contiguous().float()
@@ -61,19 +104,23 @@ class GaussianRenderer:
                     backgrounds=torch.stack([bg_color for _ in range(V_sub)]) if bg_color is not None else None,
                     render_mode="RGB+ED",
                 )
+                batch_meta_chunks.append(info)
                 for rendered_image, rendered_alpha in zip(rendered_image_all, rendered_alpha_all):
                     depths.append(rendered_image[...,3:].permute(2, 0, 1))
                     rendered_image = rendered_image[...,:3].permute(2, 0, 1)
                     images.append(rendered_image)
                     alphas.append(rendered_alpha.permute(2, 0, 1))
+            meta_chunks_by_batch.append(batch_meta_chunks)
                 
         images, alphas, depths = torch.stack(images), torch.stack(alphas), torch.stack(depths)
         images, alphas, depths = images.view(B, V, *images.shape[1:]), alphas.view(B, V, *alphas.shape[1:]), depths.view(B, V, *depths.shape[1:])
+        render_meta = self._merge_chunk_meta(meta_chunks_by_batch, batch_size=B, num_views=V)
 
         return {
             "images_pred": images, # [B, V, 3, H, W]
             "alphas_pred": alphas, # [B, V, 1, H, W]
             "depths_pred": depths, # [B, V, 1, H, W]
+            "render_meta": render_meta,
         }
 
 

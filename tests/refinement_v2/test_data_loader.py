@@ -10,6 +10,7 @@ from src.refinement_v2.config import RefinementRunConfig
 from src.refinement_v2.data_loader import (
     _build_scene_loader_overrides,
     _resolve_scene_config_paths,
+    build_scene_bundle,
     standardize_batch,
 )
 
@@ -137,6 +138,29 @@ def _write_reference_frames(frame_dir: Path, frame_values: list[int], size: tupl
         Image.fromarray(frame, mode="RGB").save(frame_dir / f"{frame_index:04d}.png")
 
 
+def _write_direct_camera_inputs(
+    pose_path: Path,
+    intrinsics_path: Path,
+    num_frames: int,
+) -> None:
+    """写一组和项目当前真实格式一致的 pose / intrinsics npz."""
+
+    pose = np.repeat(np.eye(4, dtype=np.float32)[None, :, :], repeats=num_frames, axis=0)
+    pose[:, 0, 3] = np.arange(num_frames, dtype=np.float32)
+    intrinsics = np.stack(
+        [
+            np.full(num_frames, 10.0, dtype=np.float32),
+            np.full(num_frames, 11.0, dtype=np.float32),
+            np.full(num_frames, 4.0, dtype=np.float32),
+            np.full(num_frames, 5.0, dtype=np.float32),
+        ],
+        axis=-1,
+    )
+    frame_inds = np.arange(num_frames, dtype=np.int64)
+    np.savez(pose_path, data=pose, inds=frame_inds)
+    np.savez(intrinsics_path, data=intrinsics, inds=frame_inds)
+
+
 def test_standardize_batch_loads_external_reference_directory_and_aligns_indices(tmp_path) -> None:
     """外部 reference 目录如果提供完整时序,应按 selected_frame_indices 对齐."""
 
@@ -209,3 +233,59 @@ def test_standardize_batch_uses_external_reference_intrinsics_override(tmp_path)
         dtype=torch.float32,
     )
     assert torch.allclose(scene.intrinsics_ref, expected_intrinsics)
+
+
+def test_build_scene_bundle_supports_direct_file_inputs(tmp_path) -> None:
+    """direct file inputs 应该绕过 provider,直接组装出 SceneBundle."""
+
+    rgb_dir = tmp_path / "rgb"
+    pose_path = tmp_path / "pose.npz"
+    intrinsics_path = tmp_path / "intrinsics.npz"
+
+    _write_reference_frames(rgb_dir, frame_values=[10, 40, 90, 140], size=(6, 8))
+    _write_direct_camera_inputs(pose_path, intrinsics_path, num_frames=4)
+
+    run_config = RefinementRunConfig(
+        config_path=tmp_path / "demo.yaml",
+        gaussians_path=tmp_path / "gaussians.ply",
+        outdir=tmp_path / "refine_out",
+        pose_path=pose_path,
+        intrinsics_path=intrinsics_path,
+        rgb_path=rgb_dir,
+        frame_indices=[1, 3],
+        view_id="3",
+    )
+
+    scene = build_scene_bundle(run_config)
+
+    assert scene.frame_indices == [1, 3]
+    assert scene.view_id == "3"
+    assert scene.gt_images.shape == (1, 2, 3, 6, 8)
+    assert scene.cam_view.shape == (1, 2, 4, 4)
+    assert scene.intrinsics.shape == (1, 2, 4)
+    assert scene.file_name == "rgb"
+
+    selected_values = scene.gt_images[:, :, 0, 0, 0].mul(255.0).round().to(dtype=torch.int64)
+    assert selected_values.tolist() == [[40, 140]]
+    assert torch.allclose(scene.cam_view[0, :, 0, 3], torch.tensor([1.0, 3.0]))
+
+
+def test_build_scene_bundle_rejects_partial_direct_file_inputs(tmp_path) -> None:
+    """direct file inputs 必须成套提供,不能半套半套地混用."""
+
+    run_config = RefinementRunConfig(
+        config_path=tmp_path / "demo.yaml",
+        gaussians_path=tmp_path / "gaussians.ply",
+        outdir=tmp_path / "refine_out",
+        rgb_path=tmp_path / "rgb.mp4",
+    )
+
+    try:
+        build_scene_bundle(run_config)
+    except ValueError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("Expected partial direct file inputs to raise ValueError.")
+
+    assert "--pose-path" in message
+    assert "--intrinsics-path" in message

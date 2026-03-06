@@ -14,6 +14,8 @@
 因此,这份文档可以理解成:
 
 - `joint_refinement_camera_gaussians_v2` 的一个更聚焦的子规格
+- 建立在现有 `scripts/refine_robust_v2.py` / `src/refinement_v2/` 主线之上的增强规格
+- 不是第二套并行程序路径
 - 专门回答:
   - 为什么 `sample.py` 主链不该直接吃超分视频
   - 为什么应该在 `sample.py` 之后增加一个独立的 post-refinement stage
@@ -202,7 +204,7 @@
 ### 输出
 
 - `gaussians_refined.ply`
-- `render_refined.mp4`
+- `videos/final_render.mp4`
 - `metrics.json`
 - `diagnostics.json`
 - `config_effective.yaml`
@@ -210,6 +212,11 @@
 - `weight_maps/*.png`
 - `sr_selection_maps/*.png`
 - `gaussian_fidelity_histogram.json`
+- `metrics_phase3s.json`
+- `metrics_stage3sr.json`
+- `gaussians/gaussians_stage3sr.ply`
+- `videos/baseline_render.mp4`
+- `videos/gt_reference.mp4`
 - `sr_selection_stats.json`
 - `state/*.pt`
 
@@ -713,8 +720,9 @@ outdir/
   metrics.json
   gaussians_refined.ply
   videos/
-    render_baseline.mp4
-    render_refined.mp4
+    baseline_render.mp4
+    gt_reference.mp4
+    final_render.mp4
   residual_maps/
   weight_maps/
   state/

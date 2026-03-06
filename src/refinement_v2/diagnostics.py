@@ -22,6 +22,7 @@ class DiagnosticsWriter:
 
         self.residual_dir = self.outdir / "residual_maps"
         self.weight_dir = self.outdir / "weight_maps"
+        self.sr_selection_dir = self.outdir / "sr_selection_maps"
         self.render_dir = self.outdir / "renders_before_after"
         self.histogram_dir = self.outdir / "histograms"
         self.pose_dir = self.outdir / "pose"
@@ -33,6 +34,7 @@ class DiagnosticsWriter:
         for directory in [
             self.residual_dir,
             self.weight_dir,
+            self.sr_selection_dir,
             self.render_dir,
             self.histogram_dir,
             self.pose_dir,
@@ -72,6 +74,53 @@ class DiagnosticsWriter:
 
         output_path = self.residual_dir / f"{stage_name}_frame_{frame_id:04d}.png"
         self._save_tensor_map(residual_map, output_path)
+
+    def save_sr_selection_map(self, stage_name: str, frame_id: int, selection_map: torch.Tensor) -> None:
+        """保存 SR selection map PNG."""
+
+        output_path = self.sr_selection_dir / f"{stage_name}_frame_{frame_id:04d}.png"
+        self._save_tensor_map(selection_map, output_path)
+
+    def write_gaussian_fidelity_summary(self, fidelity_score: torch.Tensor) -> Path:
+        """把 fidelity score 的摘要和直方图落盘.
+
+        第一版先保存:
+        - 基础统计
+        - 固定 10 bins 直方图
+        这样后续接真正的 `W_sr_select` 时, 先有稳定诊断证据可看.
+        """
+
+        score_cpu = fidelity_score.detach().float().cpu().flatten()
+        if score_cpu.numel() == 0:
+            raise ValueError("fidelity_score must contain at least one element.")
+
+        histogram = torch.histc(score_cpu, bins=10, min=0.0, max=1.0).to(dtype=torch.int64)
+        payload = {
+            "num_gaussians": int(score_cpu.numel()),
+            "fidelity_min": float(score_cpu.min().item()),
+            "fidelity_max": float(score_cpu.max().item()),
+            "fidelity_mean": float(score_cpu.mean().item()),
+            "fidelity_std": float(score_cpu.std(unbiased=False).item()),
+            "bins": histogram.tolist(),
+        }
+
+        output_path = self.outdir / "gaussian_fidelity_histogram.json"
+        output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return output_path
+
+    def write_sr_selection_stats(self, selection_map: torch.Tensor) -> Path:
+        """把 SR selection map 的基础统计落盘."""
+
+        selection_cpu = selection_map.detach().float().cpu()
+        payload = {
+            "selection_min": float(selection_cpu.min().item()),
+            "selection_max": float(selection_cpu.max().item()),
+            "selection_mean": float(selection_cpu.mean().item()),
+            "selection_std": float(selection_cpu.std(unbiased=False).item()),
+        }
+        output_path = self.outdir / "sr_selection_stats.json"
+        output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return output_path
 
     def save_pose_summary(self, summary: dict[str, Any]) -> None:
         """保存 pose 诊断摘要."""

@@ -5,6 +5,7 @@ import torch
 from src.refinement_v2.losses import (
     compute_opacity_sparse_loss,
     compute_pose_regularization,
+    compute_sampling_smooth_loss,
     compute_scale_tail_loss,
     compute_weighted_rgb_loss,
 )
@@ -36,3 +37,21 @@ def test_pose_regularization_returns_l2_and_smooth_terms() -> None:
     pose_l2, pose_smooth = compute_pose_regularization(pose_delta)
     assert float(pose_l2.item()) > 0
     assert float(pose_smooth.item()) > 0
+
+
+def test_sampling_smooth_loss_penalizes_small_scale_low_fidelity_gaussians() -> None:
+    scales = torch.tensor([[0.1, 0.1, 0.1], [0.5, 0.4, 0.4]], dtype=torch.float32)
+    fidelity_score = torch.tensor([[0.1, 0.9]], dtype=torch.float32)
+    render_meta = {
+        "radii": torch.tensor([[[0.3, 2.2], [0.4, 2.0]]], dtype=torch.float32),
+        "opacities": torch.tensor([[[0.9, 0.9], [0.8, 0.8]]], dtype=torch.float32),
+    }
+
+    loss = compute_sampling_smooth_loss(
+        scales=scales,
+        fidelity_score=fidelity_score,
+        render_meta=render_meta,
+        radius_threshold=1.5,
+    )
+
+    assert float(loss.item()) > 0.0

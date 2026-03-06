@@ -51,6 +51,7 @@ def test_stage2b_requires_local_overlap_and_blocks_global_shift() -> None:
             "need_geometry": True,
             "local_overlap_persistent": True,
             "global_shift_detected": True,
+            "stage3a_completed": True,
         }
     ) is False
     assert enabled.should_enter_stage2b(
@@ -58,6 +59,36 @@ def test_stage2b_requires_local_overlap_and_blocks_global_shift() -> None:
             "need_geometry": True,
             "local_overlap_persistent": True,
             "global_shift_detected": False,
+            "stage3a_completed": True,
+        }
+    ) is True
+
+
+def test_stage2b_waits_for_stage3sr_when_patch_supervision_is_enabled() -> None:
+    """只要开启了 patch supervision,Stage 3B 就必须等到 Phase 3S / Stage 3SR 完成."""
+
+    enabled = StageController(_build_run_config(enable_stage2b=True), StageHyperParams())
+
+    assert enabled.should_enter_stage2b(
+        {
+            "need_geometry": True,
+            "local_overlap_persistent": True,
+            "global_shift_detected": False,
+            "stage3a_completed": True,
+            "stage3sr_enabled": True,
+            "phase3s_completed": False,
+            "stage3sr_completed": False,
+        }
+    ) is False
+    assert enabled.should_enter_stage2b(
+        {
+            "need_geometry": True,
+            "local_overlap_persistent": True,
+            "global_shift_detected": False,
+            "stage3a_completed": True,
+            "stage3sr_enabled": True,
+            "phase3s_completed": True,
+            "stage3sr_completed": True,
         }
     ) is True
 

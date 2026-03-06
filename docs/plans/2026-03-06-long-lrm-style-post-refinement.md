@@ -2,11 +2,221 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task.
 
-**Goal:** 基于 `specs/long_lrm_style_post_refinement.md`, 落地一条可运行的后置 refinement 路线: `sample.py` 继续做 feed-forward 初始化, `scripts/refine_robust_v2.py` 负责 `Long-LRM` 风格的 post-prediction optimization, 默认先做 `gaussian-only` 的 `appearance-first` 优化, 再通过 `SplatSuRe-style selective SR` 选择性吸收超分后的对等视频高频监督,并用 `Mip-inspired sampling-aware smoothing` 约束不受支持的高频细节.
+> **Status Correction (2026-03-06):** 这份文档描述的是 `joint_refinement_camera_gaussians_v2` 已完成主线上的增量增强,不是第二套并行程序路径。后续实现必须继续复用同一个入口 `scripts/refine_robust_v2.py` 与同一个包 `src/refinement_v2/`.
 
-**Architecture:** 沿用现有 `refinement_v2` 骨架, 不另开新入口. 第一版执行顺序固定为: `SceneBundle` 装配与对齐 -> baseline render / diagnostics -> `W_robust` 构造 -> Stage 3A native cleanup -> 可选 opacity / pruning -> `gaussian_fidelity_score + W_sr_select` -> selective SR patch supervision(`W_final_sr = W_robust * W_sr_select`) -> `L_sampling_smooth` 约束 -> 可选 Stage 3B limited geometry -> state / export / resume. `sample.py` 不改主链, V1 不做 pose optimization, 也不引入 Long-LRM 的长序列 token budget 控制.
+**Goal:** 基于 `specs/long_lrm_style_post_refinement.md`, 在已经完成的 `joint_refinement_camera_gaussians_v2` 主线上继续增强: `sample.py` 继续做 feed-forward 初始化, `scripts/refine_robust_v2.py` 继续作为唯一后处理入口, 在现有 `Stage 2A / Stage 2B / Phase 3 / Phase 4` 体系之上吸收 `Long-LRM` 风格的 post-prediction optimization, 并通过 `SplatSuRe-style selective SR` 选择性吸收超分后的对等视频高频监督,再用 `Mip-inspired sampling-aware smoothing` 约束不受支持的高频细节.
+
+**Architecture:** 沿用现有 `refinement_v2` 骨架, 不另开新入口, 也不再定义第二套主流程. 更准确地说:
+- 外部 CLI 仍然是 `scripts/refine_robust_v2.py`
+- 运行包仍然是 `src/refinement_v2/`
+- `Long-LRM` / `SplatSuRe` / `Mip-Splatting` 的吸收方式,是作为现有 `stage2a` 主线内部的增强子阶段与增强 loss
+
+第一版增强执行顺序固定为: `SceneBundle` 装配与对齐 -> baseline render / diagnostics -> `W_robust` 构造 -> `stage2a` 内部先做 `Stage 3A native cleanup` -> 可选 opacity / pruning -> `gaussian_fidelity_score + W_sr_select` -> `Stage 3SR selective SR patch supervision`(`W_final_sr = W_robust * W_sr_select`) -> `L_sampling_smooth` 约束 -> 再按现有 gating 进入可选 `Stage 3B limited geometry` -> state / export / resume. `sample.py` 不改主链, V1 不做 pose optimization, 也不引入 Long-LRM 的长序列 token budget 控制.
 
 **Tech Stack:** Python 3.10, PyTorch, existing Lyra provider / renderer (`src/models/data/provider.py`, `src/rendering/gs_deferred.py`, `src/rendering/gs_deferred_patch.py`), OmegaConf / YAML, pathlib / json, pytest.
+
+---
+
+## Current Status On V2 Mainline
+
+这份计划最初是按“从 0 到 1”写的.
+但按当前代码现实, 其中很大一部分已经不是未来任务了, 而是已落地状态.
+
+当前已经明确成立的事实:
+
+- 唯一入口仍是 `scripts/refine_robust_v2.py`
+- 唯一实现包仍是 `src/refinement_v2/`
+- `joint_refinement_camera_gaussians_v2` 已经完成
+- `Long-LRM style post refinement` 现在应理解为:
+  - 建立在 v2 主线上的增强子计划
+  - 不是第二套程序
+
+当前代码里已经具备:
+
+- `Phase 0`
+- `Phase 1`
+- `Stage 2A`
+- `Stage 2A` 内部的:
+  - `Stage 3A native cleanup`
+  - `Phase 3S`
+  - `Stage 3SR`
+- `Stage 2B`
+- `Phase 3`
+- `Phase 4`
+- pruning
+- patch supervision
+- selective SR
+- `L_sampling_smooth`
+- external reference contract
+- state / resume / diagnostics / before-after 导出
+
+当前验证状态:
+
+- `PYTHONPATH="$(pwd)" pytest -q tests/refinement_v2`
+- 结果是 `62 passed`
+
+当前在主线里新增并已落地的能力:
+
+- direct file inputs v1
+  - `--pose-path`
+  - `--intrinsics-path`
+  - `--rgb-path`
+- `build_scene_bundle(...)` 现在既能走 provider 模式
+- 也能直接从本地 `pose / intrinsics / rgb` 文件组装 `SceneBundle`
+
+因此, 这份文档接下来更适合承担两件事:
+
+1. 说明哪些增强已经并入 v2 主线
+2. 说明下一轮真正还值得继续的 continuation tasks 是什么
+
+## Execution Readiness / Preflight Gate
+
+继续执行这条线时, 需要先区分两类任务:
+
+1. 不依赖重新跑 `sample.py` 的任务
+2. 依赖重新生成 baseline `.ply` 的任务
+
+当前仓库代码已经允许第一类任务继续推进.
+但第二类任务在这台 `sm_61` 机器上存在明确硬阻塞:
+
+- `sample.py` 当前仍是 `Mamba + Triton` 路径
+- 本机实际 GPU 是 `Tesla P40 (sm_61)`
+- 真实最小复现已经确认:
+  - `bf16` 会触发 `ptxas ... requires sm_80+`
+  - `fp16 / fp32` 也会触发 `no kernel image is available for execution on the device`
+
+因此当前执行门槛应明确为:
+
+- 如果 continuation task 需要重新跑 `sample.py`
+  - 需要 `sm_80+` 级别 GPU
+  - 或者需要已有 baseline `.ply`
+  - 或者未来补出非 Triton 的 Mamba fallback
+- 如果 continuation task 不需要重新跑 `sample.py`
+  - 则可以继续在当前代码和当前机器上推进
+
+## Continuation Tasks
+
+下面这些才是当前还值得继续推进的增强项.
+它们都建立在现有 v2 主线之上.
+
+### Continuation Task A: 用真实外部 SR reference 做一轮系统验证
+
+**Status (2026-03-06):**
+
+- 逻辑上可继续
+- 但当前机器上受 `sample.py` baseline 生成前置条件限制
+- 因此要么复用已有 baseline `.ply`, 要么切到 `sm_80+` 环境
+
+**Why:**
+
+- 现在 selective SR 的代码闭环已经有了
+- 但目前还缺一轮系统性的真实外部超分 reference 验证
+- 需要确认它不是只在 synthetic / stub / subset 上看起来成立
+
+**Focus:**
+
+- 用真实 `--reference-path` 的超分视频跑:
+  - `view 3`
+  - 当前最差轨迹
+- 检查:
+  - `sr_selection_maps/*.png`
+  - `gaussian_fidelity_histogram.json`
+  - `metrics_stage3sr.json`
+- 输出:
+  - selective SR 对:
+    - `PSNR`
+    - `residual_mean`
+    - `sharpness`
+    - 局部双轮廓
+    的实际影响
+
+**Done when:**
+
+- 能给出至少一组“真实 SR reference 带来收益”的证据
+- 或者明确得出当前默认超参数不合适, 需要往哪里调
+
+### Continuation Task B: 打通 full direct file inputs
+
+**Status (2026-03-06):**
+
+- 第一版已完成
+- 当前同一个 `scripts/refine_robust_v2.py` 入口已经支持:
+  - `--pose-path`
+  - `--intrinsics-path`
+  - `--rgb-path`
+- 当前 `build_scene_bundle(...)` 已支持在不依赖 provider 的情况下直接构造 `SceneBundle`
+
+**Why:**
+
+- 当前 external reference contract 已经有了
+- 但仍然比较依赖现有 provider / scene config 形状
+- 如果后续要更自由地吃外部视频链路, 还需要把 direct file inputs 补齐
+
+**Focus:**
+
+- 评估并补齐:
+  - `--pose-path`
+  - `--intrinsics-path`
+  - `--rgb-path`
+- 目标不是另开新入口
+- 而是在 `scripts/refine_robust_v2.py` 这同一个 CLI 下,允许不完全依赖 provider
+
+**Done when:**
+
+- 同一条 v2 主线既能走 provider 模式
+- 也能走 direct file inputs 模式
+
+### Continuation Task C: 收敛 stage 命名与使用文档
+
+**Why:**
+
+- 代码里现在已经有:
+  - `stage2a`
+  - `stage3a`
+  - `phase3s`
+  - `stage3sr`
+- 但对外文档如果不及时收敛, 很容易又被理解成第二条程序路径
+
+**Focus:**
+
+- 统一对外解释:
+  - `stage2a` 是主线阶段名
+  - `stage3a / phase3s / stage3sr` 是 `stage2a` 内部增强子阶段
+- 同步更新:
+  - usage 文档
+  - diagnostics 说明
+  - 产物说明
+
+**Done when:**
+
+- 使用者不会再把 selective SR 误解成新的独立程序
+
+### Continuation Task D: 调 `Stage 2B` 和 selective SR 的衔接策略
+
+**Why:**
+
+- 代码上 `Stage 2B` 已经会等待 `Phase 3S / Stage 3SR`
+- 但更细的调度和推荐默认值还没有真正定住
+
+**Focus:**
+
+- 评估:
+  - 哪些 case 应该止步在 `Stage 3SR`
+  - 哪些 case 值得继续放开 `Stage 2B`
+- 给出:
+  - 推荐 gate 指标
+  - 推荐 warm-start 方式
+  - 推荐默认超参数
+
+**Done when:**
+
+- `Stage 3SR -> Stage 2B` 的切换不再靠人工直觉
+
+## Historical 0-to-1 Tasks
+
+下面的 `Task 1 ~ Task 10` 保留为这份文档最初形成时的历史任务拆解.
+它们有的已经落地, 有的已经被当前代码状态覆盖.
+保留它们是为了追溯思路, 不是为了把后续工作重新理解成“另起一条路线”.
 
 ---
 
@@ -812,8 +1022,8 @@ outdir/
   metrics.json
   gaussians_refined.ply
   videos/
-    render_baseline.mp4
-    render_refined.mp4
+    baseline_render.mp4
+    final_render.mp4
   residual_maps/
   weight_maps/
   sr_selection_maps/
@@ -940,9 +1150,26 @@ git commit -s -m "feat: add dry run validation for post refinement"
 
 ---
 
-## 实施顺序建议
+## Current Continuation Order
 
-1. 必做主线:
+如果从今天的代码现实继续往前走, 推荐顺序不再是重跑下面的 `Task 1 ~ Task 10`.
+而是:
+
+1. 先完成 `Continuation Task B` 的真实资产验证与文档收口
+   - direct file inputs 第一版代码已经落地
+   - 现在更值得把它稳定成正式使用路径
+2. 再做 `Continuation Task D`
+   - 把 `Stage 3SR -> Stage 2B` 的衔接策略调稳
+3. 然后在满足 preflight gate 后恢复 `Continuation Task A`
+   - 用真实外部 SR reference 验 selective SR 的真实收益
+4. 最后完成 `Continuation Task C`
+   - 把术语、usage 和 diagnostics 文档彻底收口
+
+## Historical Execution Order
+
+如果只是想追溯这份文档最初的 0-to-1 拆解顺序, 可以按下面理解:
+
+1. 基础骨架:
    - Task 1
    - Task 2
    - Task 3
@@ -950,7 +1177,7 @@ git commit -s -m "feat: add dry run validation for post refinement"
    - Task 5
 2. 第二优先级:
    - Task 6
-3. 接选择性高分辨率监督:
+3. 选择性高分辨率监督:
    - Task 7
 4. 可选受限几何:
    - Task 8
@@ -968,6 +1195,70 @@ git commit -s -m "feat: add dry run validation for post refinement"
 - `EDGS-style` local reinitialization
 - `tttLRM` 的 fast-weight memory / LaCT / streaming reconstruction
 
-## 一句话落地顺序
+## 一句话继续顺序
 
-先把 `Long-LRM` 风格的 post-prediction optimization 主线跑通, 再把 opacity / pruning 变成硬逻辑, 然后接 `SplatSuRe-style` selective SR patch supervision 与 `Mip-inspired` smoothing, 最后才给有限 geometry 一个保守入口.
+先在现有 v2 主线上用真实外部 SR reference 验 selective SR 的真实收益, 再收紧 `Stage 3SR -> Stage 2B` 的切换策略, 然后补 direct file inputs, 最后把所有术语和 usage 文档彻底收口.
+
+---
+
+## 2026-03-06 历史代码现实对齐注记
+
+这一节记录的是当时把文档从“方案讨论”切到“开始落代码”时的代码现实.
+其中提到的很多动作现在已经完成, 所以它更适合作为历史上下文, 不应再被理解成当前未完成清单.
+
+- 这份计划最初按“从 0 到 1”写任务.
+- 但按当前代码现实,真正的第一刀不再是从空白实现 `Stage 3A`.
+- 当前 `src/refinement_v2/runner.py` 已经有:
+  - `run_stage2a()`
+  - `run_stage2b()`
+  - patch sampling / patch render / patch loss helper
+- 问题在于:
+  - `run_stage2a()` 把 native cleanup 和 patch supervision 混在了一起
+  - 所以后续实现应先做一次“无行为变化拆边界”,再继续叠 selective SR
+
+- 推荐先按下面的代码边界重排:
+  1. `run_stage3a_native_cleanup()`
+     - 对应当前 `run_stage2a()` 中不含 patch supervision 的 native loop
+  2. `run_phase3s_build_sr_selection()`
+     - 不做 optimizer
+     - 只负责:
+       - 拿 renderer `meta`
+       - 计算 `gaussian_fidelity_score`
+       - 生成 `W_sr_select`
+  3. `run_stage3sr_selective_patch()`
+     - 复用现有 patch 采样 / patch render 路径
+     - 显式引入 `W_final_sr = W_robust * W_sr_select`
+     - 在这里挂 `L_sampling_smooth`
+
+- 还需要补一个关键现实:
+  - `src/rendering/gs.py` 当前已经拿到 `rasterization(...).info`
+  - 但没有往上返回
+  - `Phase 3S` 的首个前置动作应是先把 `render_meta` 抬到 runner 层
+
+- `gaussian_fidelity_score` 第一版也不建议上来就做 appearance fidelity.
+- 当前 `.pixi` 环境里,`gsplat` 在 `packed=False` 时会返回 dense `meta`,其中稳定可用的字段至少包括:
+  - `radii`
+  - `means2d`
+  - `opacities`
+  - `tiles_per_gauss`
+- 因此第一版口径建议先做:
+  - `native support sufficiency`
+  - 即:
+    - `visible_mask`
+    - `tiles_per_gauss` 归一化
+    - `opacity_gate`
+    - 再按 `max_view` 聚合成 per-Gaussian score
+
+- `L_sampling_smooth` 的放置位置也在这里明确:
+  - 放在 `src/refinement_v2/losses.py` 的 geometry regularizer 一侧
+  - 不塞进 `_compute_patch_losses()`
+  - Stage 3SR 默认启用
+  - Stage 3B 可选延续
+
+- 因此,如果现在开始实现,最顺手的顺序应改成:
+  1. `src/rendering/gs.py` 返回 `render_meta`
+  2. `src/refinement_v2/runner.py` 抽出 `Stage 3A / Phase 3S / Stage 3SR`
+  3. `src/refinement_v2/weight_builder.py` 落第一版 `gaussian_fidelity_score / W_sr_select`
+  4. `src/refinement_v2/losses.py` 再补 `L_sampling_smooth`
+
+这些 1 ~ 4 项现在都已经落地.

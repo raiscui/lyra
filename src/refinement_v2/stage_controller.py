@@ -37,6 +37,13 @@ class StageController:
 
         if not self.run_config.enable_stage2b:
             return False
+        if not diagnostics.get("stage3a_completed", False):
+            return False
+        if diagnostics.get("stage3sr_enabled", False):
+            if not diagnostics.get("phase3s_completed", False):
+                return False
+            if not diagnostics.get("stage3sr_completed", False):
+                return False
         if diagnostics.get("ghosting_acceptable", False):
             return False
         if diagnostics.get("global_shift_detected", False):

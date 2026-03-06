@@ -62,6 +62,16 @@ Increase total_movement_distance_factor to 2.0 for more camera motion, though it
 accelerate launch sample.py --config configs/demo/lyra_static.yaml save_gaussians_orig=true save_gaussians=true
 ```
 
+3) Optional: run post-refinement on the exported baseline gaussians.
+
+This repository now keeps refinement as a separate third step.
+So the two commands above only produce the baseline 3DGS result.
+If you want the `joint_refinement_camera_gaussians_v2` enhanced result, run `scripts/refine_robust_v2.py` on the exported `gaussians_orig/gaussians_0.ply`.
+
+For the current recommended command lines and stage explanation, see:
+
+- [docs/joint_refinement_camera_gaussians_v2_usage.md](docs/joint_refinement_camera_gaussians_v2_usage.md)
+
 ### Example 2: Single Video to Dynamic 3D Gaussians Generation
 
 1) Generate multi-view video latents from the input video and ViPE estimated depth using scripts/bash/dynamic_sdg.sh.

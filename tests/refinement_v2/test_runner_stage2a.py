@@ -55,3 +55,28 @@ def test_runner_run_exports_final_render_artifacts_at_stage2a_stop(tmp_path) -> 
     assert diagnostics["phase_reached"] == "stage2a"
     assert (run_config.outdir / "videos" / "final_render.mp4").exists()
     assert (run_config.outdir / "renders_before_after" / "final_render_frame_0000.png").exists()
+
+
+def test_stage2a_splits_native_cleanup_and_stage3sr_metrics(tmp_path) -> None:
+    """开启 patch supervision 后, native cleanup 和 Stage 3SR 应分开留痕."""
+
+    run_config = build_run_config(tmp_path)
+    hparams = build_stage_hparams(iters_stage2a=2, patch_size=4, lambda_patch_rgb=0.5)
+    runner = RefinementRunner(
+        scene=build_scene_bundle(),
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=FakeRenderer(),
+    )
+
+    runner.run_phase0()
+    runner.run_phase1_prepare_weights()
+    runner.run_stage2a()
+
+    stage2a_metrics = json.loads((run_config.outdir / "metrics_stage2a.json").read_text(encoding="utf-8"))
+    stage3sr_metrics = json.loads((run_config.outdir / "metrics_stage3sr.json").read_text(encoding="utf-8"))
+
+    assert "loss_patch_rgb" not in stage2a_metrics[-1]
+    assert "loss_patch_rgb" in stage3sr_metrics[-1]

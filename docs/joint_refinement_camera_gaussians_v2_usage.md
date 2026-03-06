@@ -27,7 +27,7 @@
   -> sample.py 重建初始 3DGS
   -> 导出 gaussians_orig/gaussians_0.ply
   -> refine_robust_v2.py 做联合细化
-  -> 输出更干净的 gaussians_stage2a / stage2b / refined
+  -> 输出更干净的 gaussians_stage2a / gaussians_stage3sr / gaussians_stage2b / gaussians_refined
 ```
 
 这里面第 3 步 `refine_robust_v2.py` 才是 `joint_refinement_camera_gaussians_v2` 的实际入口。
@@ -41,15 +41,25 @@
 - `Phase 0` baseline 诊断
 - `Phase 1` 视图/帧/参考图对齐
 - `Stage 2A` 颜色与透明度主清理
+- `Stage 2A` 内部增强子阶段
+  - `Stage 3A` native cleanup
+  - `Phase 3S` Gaussian fidelity / SR selection
+  - `Stage 3SR` selective SR patch supervision
 - `Stage 2B` limited geometry refinement
 - `Phase 3` tiny pose-only diagnostic
 - `Phase 4` joint fallback
 - pruning
 - patch supervision
+- selective SR
+- `L_sampling_smooth`
 - `--start-stage stage2b`
 - external reference contract
   - `--reference-path`
   - `--reference-intrinsics-path`
+- direct file inputs v1
+  - `--pose-path`
+  - `--intrinsics-path`
+  - `--rgb-path`
 
 这些能力都从同一个脚本进入:
 
@@ -90,6 +100,29 @@ refinement 的输入核心是:
 
 也就是说,只要 baseline 产物还在,你可以反复调 refinement 参数,不需要每次都重新跑 diffusion。
 
+### 误区 4: `stage3a / phase3s / stage3sr` 是另一套独立程序
+
+不是。
+
+这几个名字现在更准确的理解是:
+
+- `stage2a` 是对外主线阶段名
+- `stage3a / phase3s / stage3sr` 是 `stage2a` 内部的增强子阶段
+
+也就是说:
+
+- 你仍然只运行同一个脚本:
+  - `scripts/refine_robust_v2.py`
+- 不是先跑一套 `stage2a`,再切去另一套 `Long-LRM` 程序
+- 而是当前代码把 `stage2a` 内部拆得更细了, 这样 selective SR 和 diagnostics 才能单独落盘
+
+默认理解可以记成:
+
+- `stage2a`
+  - 先做 native cleanup
+  - 再算 `gaussian_fidelity_score`
+  - 再做 selective SR patch supervision
+
 ---
 
 ## 5. 你至少要跑哪几步
@@ -125,6 +158,13 @@ accelerate launch sample.py --config configs/demo/lyra_static.yaml \
   save_gaussians_orig=true save_gaussians=true
 ```
 
+如果你当前机器是较老的 GPU,这里要多注意一件事:
+
+- `sample.py` 仍然依赖 `Mamba + Triton`
+- 在 `sm_61` 这类旧卡上,可能在 baseline 生成时就被 Triton kernel 卡住
+- 这不是 `refine_robust_v2.py` 本身的问题
+- 如果你已经有 baseline `.ply`,后面的 v2 refinement 仍然可以继续跑
+
 ### 第 3 步: 用 `refine_robust_v2.py` 做增强细化
 
 ```bash
@@ -142,6 +182,33 @@ PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
 
 这 3 步都跑完,才算真正用到了 `joint_refinement_camera_gaussians_v2`。
 
+### 5.2 不想依赖 provider 时,可以直接走 file inputs
+
+如果你已经手里有成套文件:
+
+- `pose/*.npz`
+- `intrinsics/*.npz`
+- `rgb/*.mp4` 或帧目录
+
+那么现在同一个入口也支持 direct file inputs:
+
+```bash
+PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
+  --config configs/demo/lyra_static.yaml \
+  --gaussians outputs/demo/lyra_static/static_view_indices_fixed_3/lyra_static_demo_generated/gaussians_orig/gaussians_0.ply \
+  --pose-path assets/demo/static/diffusion_output_generated/3/pose/00172.npz \
+  --intrinsics-path assets/demo/static/diffusion_output_generated/3/intrinsics/00172.npz \
+  --rgb-path assets/demo/static/diffusion_output_generated/3/rgb/00172.mp4 \
+  --view-id 3 \
+  --outdir outputs/refine_v2/view3_direct_inputs
+```
+
+这条模式的意义是:
+
+- 仍然是同一个 `scripts/refine_robust_v2.py`
+- 不是新程序
+- 只是 `build_scene_bundle(...)` 不再强依赖 provider / dataloader
+
 ---
 
 ## 6. 为什么第 3 步必须单独跑
@@ -157,6 +224,25 @@ PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
 - `refine_robust_v2.py` 也不会替代 `sample.py` 直接从 latent 端做重建
 
 它们是前后串联的两个阶段,不是一个脚本里的两个开关。
+
+## 6.1 现在怎么理解 `Stage 2A`
+
+如果你只看对外流程, 仍然可以把它理解成一个阶段:
+
+- `Stage 2A`
+
+但如果你开始看输出目录和 metrics, 现在最好按下面这个映射理解:
+
+| 对外主线阶段 | 内部子阶段 | 作用 | 常见产物 |
+| --- | --- | --- | --- |
+| `Stage 2A` | `Stage 3A` | native cleanup | `metrics_stage2a.json`, `gaussians_stage2a.ply` |
+| `Stage 2A` | `Phase 3S` | fidelity / SR selection 诊断 | `metrics_phase3s.json`, `gaussian_fidelity_histogram.json`, `sr_selection_maps/` |
+| `Stage 2A` | `Stage 3SR` | selective SR patch supervision | `metrics_stage3sr.json`, `gaussians_stage3sr.ply` |
+
+最重要的一点是:
+
+- 这 3 个内部名字不是新的程序入口
+- 它们只是当前 `stage2a` 主线被拆开的可观测子阶段
 
 ---
 
@@ -383,6 +469,18 @@ PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
 - 第一次跑: 从 baseline `.ply` 开始
 - 第二次增量跑: 从 `gaussians_stage2a.ply` 开始
 
+这里也顺手说明一下:
+
+- `--start-stage` 目前仍然只有:
+  - `stage2a`
+  - `stage2b`
+- 不需要也不能把它理解成:
+  - `--start-stage stage3a`
+  - `--start-stage phase3s`
+  - `--start-stage stage3sr`
+
+因为这些是 `stage2a` 内部子阶段,不是对外 CLI 的独立入口
+
 ---
 
 ## 11. refinement 跑完后你会看到什么
@@ -392,25 +490,42 @@ PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
 ```text
 outdir/
   diagnostics.json
+  metrics_phase0.json
+  metrics_phase1.json
   metrics_stage2a.json
+  metrics_phase3s.json
+  metrics_stage3sr.json
   metrics_stage2b.json
   state/
   gaussians/
     gaussians_stage2a.ply
+    gaussians_stage3sr.ply
     gaussians_stage2b.ply
     gaussians_refined.ply
   videos/
-    render_before.mp4
-    render_after.mp4
+    baseline_render.mp4
+    gt_reference.mp4
+    final_render.mp4
 ```
+
+注意:
+
+- 这里列的是“常见全量产物”
+- 实际某次运行会不会全部出现,取决于:
+  - 你有没有开 patch supervision
+  - 有没有真的进入 `Stage 2B`
+  - 有没有继续进入 `Phase 3 / Phase 4`
 
 你最常会关心的是:
 
 - `gaussians/gaussians_stage2a.ply`
+- `gaussians/gaussians_stage3sr.ply`
 - `gaussians/gaussians_stage2b.ply`
 - `gaussians/gaussians_refined.ply`
-- `videos/render_before.mp4`
-- `videos/render_after.mp4`
+- `videos/baseline_render.mp4`
+- `videos/final_render.mp4`
+- `metrics_phase3s.json`
+- `metrics_stage3sr.json`
 
 ---
 
@@ -423,7 +538,7 @@ outdir/
 1. 跑自己的 `diffusion_output_generated`
 2. 跑 `sample.py`
 3. 跑一次完整 refinement
-4. 看 `render_before.mp4` 和 `render_after.mp4`
+4. 看 `baseline_render.mp4` 和 `final_render.mp4`
 
 ### 路线 2: 外部 SR 接入
 
@@ -437,6 +552,13 @@ outdir/
 1. 先拿到 `gaussians_stage2a.ply`
 2. 用 `--start-stage stage2b` 续跑
 3. 再观察 `Stage 2B` 是否有真实收益
+
+如果你当前就在调 selective SR, 还可以加一条更细的观察顺序:
+
+1. 先看 `metrics_stage2a.json`
+2. 再看 `metrics_phase3s.json`
+3. 再看 `metrics_stage3sr.json`
+4. 最后再决定要不要继续观察 `Stage 2B`
 
 ---
 

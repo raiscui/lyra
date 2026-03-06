@@ -6,7 +6,7 @@
 
 **Goal:** 实现 `joint_refinement_camera_gaussians_v2` 的第一版可运行工程,支持 `Phase 0 + Phase 1 + Stage 2A` 为主线,并为 `Stage 2B / Phase 3 / Phase 4` 预留清晰扩展点。该目标现已完成,且代码状态已超过最初 MVP 范围。
 
-**Architecture:** 以 `scripts/refine_robust_v2.py` 为唯一入口,把配置解析、数据对齐、权重构造、高斯适配、阶段控制、诊断落盘拆到 `src/refinement_v2/` 下的独立模块. 当前已完成:
+**Architecture:** 以 `scripts/refine_robust_v2.py` 为唯一入口,把配置解析、数据对齐、权重构造、高斯适配、阶段控制、诊断落盘拆到 `src/refinement_v2/` 下的独立模块. 后续吸收 `Long-LRM` / `SplatSuRe` / `Mip-Splatting` 的增强时,也继续建立在这同一条主线之上,而不是另开第二套程序路径. 当前已完成:
 
 - `Phase 0`
 - `Phase 1`
@@ -28,15 +28,18 @@
 ## Final Status
 
 - **原始任务状态:** `Task 1 ~ Task 13` 全部完成
-- **当前测试状态:** `PYTHONPATH="$(pwd)" pytest -q tests/refinement_v2` 已到 `51 passed`
+- **当前测试状态:** `PYTHONPATH="$(pwd)" pytest -q tests/refinement_v2` 已到 `62 passed`
 - **当前主线能力:**
   - `Phase 0 + Phase 1 + Stage 2A`
+  - `Stage 2A` 内部的 `Stage 3A / Phase 3S / Stage 3SR` 增强子阶段
   - `Stage 2B limited geometry`
   - `Phase 3` tiny pose-only
   - `Phase 4` joint fallback
   - `state_io` 最小恢复
   - pruning
   - patch supervision
+  - selective SR
+  - `L_sampling_smooth`
   - before/after 视频导出
 - **已完成真实验证的关键产物:**
   - `outputs/refine_v2/view3_stage2a_full`
@@ -92,12 +95,10 @@
   - `--pose-path`
   - `--intrinsics-path`
   - `--rgb-path`
-- selective SR 主线补全
-  - `gaussian_fidelity_score`
-  - `W_sr_select`
-  - `W_final_sr`
-  - `L_sampling_smooth`
-  - `Phase 3S / Stage 3SR`
+- 更深一层的真实数据验证与参数固化
+  - selective SR 在真实外部超分 reference 上的收益区间
+  - `Stage 3B` 与 selective SR 的调度关系
+  - diagnostics 默认阈值与建议超参数
 
 ## Historical Task List
 

@@ -19,6 +19,7 @@ from .losses import (
     compute_patch_perceptual_loss,
     compute_pose_regularization,
     compute_rotation_regularization_loss,
+    compute_sampling_smooth_loss,
     compute_scale_tail_loss,
     compute_weighted_rgb_loss,
 )
@@ -84,11 +85,15 @@ class RefinementRunner:
         self.current_stage = "init"
         self.prev_weight_map: torch.Tensor | None = None
         self.pose_delta: torch.Tensor | None = None
+        self.latest_render_meta: dict[str, Any] | None = None
+        self.gaussian_fidelity_score: torch.Tensor | None = None
+        self.sr_selection_map: torch.Tensor | None = None
         self.renderer_cache: dict[tuple[int, int], GaussianSceneRenderer] = {}
         self.diagnostics_state: dict[str, Any] = {
             "phase_reached": "init",
             "used_pose_refinement": False,
             "used_joint_fallback": False,
+            "stage3sr_enabled": self._patch_supervision_enabled(),
         }
         self.visual_artifacts: dict[str, str] = {}
 
@@ -149,12 +154,64 @@ class RefinementRunner:
 
         return self.render_scene(self.scene)
 
+    def _extract_render_meta(self, render_output: dict[str, torch.Tensor]) -> dict[str, Any] | None:
+        """从 renderer 输出中提取可选的 dense meta."""
+
+        render_meta = render_output.get("render_meta")
+        if isinstance(render_meta, dict):
+            return render_meta
+        return None
+
+    def _build_default_fidelity_score(self) -> torch.Tensor:
+        """在 renderer 不提供 meta 时回退到全 1 fidelity."""
+
+        return torch.ones(
+            self.scene.gt_images.shape[0],
+            self.gaussians.means.shape[0],
+            dtype=self.gaussians.means.dtype,
+            device=self.gaussians.means.device,
+        )
+
+    def _build_default_sr_selection_map(self, residual_map: torch.Tensor) -> torch.Tensor:
+        """在缺少 meta 时回退到 reference 尺度的全 1 selection map."""
+
+        reference_images = self._get_reference_images()
+        return torch.ones(
+            reference_images.shape[0],
+            reference_images.shape[1],
+            1,
+            reference_images.shape[-2],
+            reference_images.shape[-1],
+            dtype=residual_map.dtype,
+            device=residual_map.device,
+        ).detach()
+
+    def _write_phase3s_artifacts(
+        self,
+        stage_name: str,
+        fidelity_score: torch.Tensor,
+        sr_selection_map: torch.Tensor,
+    ) -> None:
+        """把 Phase 3S 的诊断产物落盘."""
+
+        self.diagnostics.write_gaussian_fidelity_summary(fidelity_score)
+        self.diagnostics.write_sr_selection_stats(sr_selection_map)
+        for frame_id in range(sr_selection_map.shape[1]):
+            self.diagnostics.save_sr_selection_map(stage_name, frame_id, sr_selection_map[:, frame_id])
+
     def _patch_supervision_enabled(self) -> bool:
         """判断当前是否启用 patch supervision."""
 
         return self.hparams.patch_size > 0 and (
             self.hparams.lambda_patch_rgb > 0.0 or self.hparams.lambda_patch_perceptual > 0.0
         )
+
+    def _get_reference_images(self) -> torch.Tensor:
+        """统一解析当前 reference 图像张量."""
+
+        if isinstance(self.scene.reference_images, torch.Tensor):
+            return self.scene.reference_images
+        return self.scene.gt_images
 
     def _resolve_patch_sizes(self) -> tuple[int, int, int]:
         """解析 native/reference patch 尺寸和缩放倍率."""
@@ -174,7 +231,7 @@ class RefinementRunner:
 
         native_patch_size = reference_patch_size // scale_int
         native_height, native_width = self.scene.gt_images.shape[-2:]
-        reference_images = self.scene.reference_images if isinstance(self.scene.reference_images, torch.Tensor) else self.scene.gt_images
+        reference_images = self._get_reference_images()
         reference_height, reference_width = reference_images.shape[-2:]
         if native_patch_size > native_height or native_patch_size > native_width:
             raise ValueError(
@@ -220,17 +277,40 @@ class RefinementRunner:
     def gather_reference_patch(self, patch_windows_ref: torch.Tensor) -> torch.Tensor:
         """从 reference 图像中提取 patch."""
 
-        reference_images = self.scene.reference_images if isinstance(self.scene.reference_images, torch.Tensor) else self.scene.gt_images
+        reference_images = self._get_reference_images()
+        return self._gather_tensor_patch(reference_images, patch_windows_ref)
+
+    def _gather_tensor_patch(self, source_tensor: torch.Tensor, patch_windows: torch.Tensor) -> torch.Tensor:
+        """从任意 `[B, V, C, H, W]` 张量中抽取 patch."""
+
+        if source_tensor.ndim != 5:
+            raise ValueError("Expected source_tensor with shape [B, V, C, H, W].")
+
         patches: list[torch.Tensor] = []
-        for batch_index in range(reference_images.shape[0]):
+        for batch_index in range(source_tensor.shape[0]):
             view_patches: list[torch.Tensor] = []
-            for view_index in range(reference_images.shape[1]):
-                top, left, patch_height, patch_width = patch_windows_ref[batch_index, view_index].tolist()
+            for view_index in range(source_tensor.shape[1]):
+                top, left, patch_height, patch_width = patch_windows[batch_index, view_index].tolist()
                 view_patches.append(
-                    reference_images[batch_index, view_index, :, top : top + patch_height, left : left + patch_width]
+                    source_tensor[batch_index, view_index, :, top : top + patch_height, left : left + patch_width]
                 )
             patches.append(torch.stack(view_patches, dim=0))
         return torch.stack(patches, dim=0)
+
+    def _resize_patch_tensor(self, patch_tensor: torch.Tensor, output_hw: tuple[int, int]) -> torch.Tensor:
+        """把 patch 张量调整到目标空间分辨率."""
+
+        if patch_tensor.shape[-2:] == output_hw:
+            return patch_tensor
+
+        batch_size, num_views, channels, _, _ = patch_tensor.shape
+        resized = F.interpolate(
+            patch_tensor.reshape(batch_size * num_views, channels, *patch_tensor.shape[-2:]),
+            size=output_hw,
+            mode="bilinear",
+            align_corners=False,
+        )
+        return resized.view(batch_size, num_views, channels, *output_hw)
 
     def build_patch_intrinsics(self, patch_windows_ref: torch.Tensor) -> torch.Tensor:
         """基于 reference intrinsics 构造 patch camera intrinsics."""
@@ -308,15 +388,20 @@ class RefinementRunner:
 
         patch_windows_native = self.sample_patch_windows(residual_map)
         pred_patch, reference_patch, _ = self.render_patch_prediction(patch_windows_native)
-        patch_weights = torch.ones(
-            pred_patch.shape[0],
-            pred_patch.shape[1],
-            1,
-            pred_patch.shape[-2],
-            pred_patch.shape[-1],
-            dtype=pred_patch.dtype,
-            device=pred_patch.device,
-        )
+        patch_windows_ref = self.map_patch_windows_to_reference(patch_windows_native)
+
+        native_weight_map = self.prev_weight_map
+        if native_weight_map is None:
+            native_weight_map = torch.ones_like(residual_map)
+        robust_patch_native = self._gather_tensor_patch(native_weight_map, patch_windows_native)
+        robust_patch = self._resize_patch_tensor(robust_patch_native, pred_patch.shape[-2:])
+
+        if self.sr_selection_map is None:
+            sr_selection_patch = torch.ones_like(robust_patch)
+        else:
+            sr_selection_patch = self._gather_tensor_patch(self.sr_selection_map, patch_windows_ref).to(dtype=pred_patch.dtype)
+
+        patch_weights = self.weight_builder.combine_sr_weights(robust_patch.to(dtype=pred_patch.dtype), sr_selection_patch)
         loss_patch_rgb = compute_weighted_rgb_loss(pred_patch, reference_patch, patch_weights)
         loss_patch_perceptual = compute_patch_perceptual_loss(pred_patch, reference_patch)
         return loss_patch_rgb, loss_patch_perceptual
@@ -377,6 +462,192 @@ class RefinementRunner:
         self.diagnostics_state["need_geometry"] = local_overlap_persistent and stage2b_signal_count >= 2
         self.diagnostics_state["local_overlap_persistent"] = local_overlap_persistent
 
+    def _run_appearance_stage(
+        self,
+        *,
+        stage_name: str,
+        freeze_stage_name: str,
+        include_patch_supervision: bool,
+        allow_pruning: bool,
+    ) -> dict[str, Any]:
+        """运行一段 appearance-first 优化循环.
+
+        这里把 Stage 3A 和 Stage 3SR 共有的主体 loop 抽到一起.
+        两者的主要差别只剩:
+        - 是否启用 patch supervision
+        - 是否允许 pruning
+        """
+
+        self.current_stage = stage_name
+        self.gaussians.freeze_for_stage(freeze_stage_name)
+        optimizer = self.gaussians.build_optimizer(freeze_stage_name, self.hparams)
+
+        final_metrics: dict[str, Any] = {}
+        for iter_idx in range(self.hparams.iters_stage2a):
+            render_output = self.render_current_scene()
+            pred_rgb = render_output["images_pred"]
+            render_meta = self._extract_render_meta(render_output)
+            self.latest_render_meta = render_meta
+            residual_map = self.weight_builder.build_residual_map(pred_rgb, self.scene.gt_images)
+            self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, self.prev_weight_map)
+
+            loss_rgb = compute_weighted_rgb_loss(pred_rgb, self.scene.gt_images, self.prev_weight_map)
+            loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
+            loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
+            if include_patch_supervision:
+                loss_patch_rgb, loss_patch_perceptual = self._compute_patch_losses(residual_map, loss_rgb)
+                loss_sampling_smooth = compute_sampling_smooth_loss(
+                    scales=self.gaussians.scales,
+                    fidelity_score=self.gaussian_fidelity_score,
+                    render_meta=render_meta,
+                    radius_threshold=self.hparams.sampling_radius_threshold,
+                )
+            else:
+                loss_patch_rgb = torch.zeros((), dtype=loss_rgb.dtype, device=loss_rgb.device)
+                loss_patch_perceptual = torch.zeros((), dtype=loss_rgb.dtype, device=loss_rgb.device)
+                loss_sampling_smooth = torch.zeros((), dtype=loss_rgb.dtype, device=loss_rgb.device)
+
+            loss_total = loss_rgb + self.hparams.lambda_scale_tail * loss_scale + self.hparams.lambda_opacity_sparse * loss_opacity
+            if include_patch_supervision:
+                loss_total = (
+                    loss_total
+                    + self.hparams.lambda_patch_rgb * loss_patch_rgb
+                    + self.hparams.lambda_patch_perceptual * loss_patch_perceptual
+                    + self.hparams.lambda_sampling_smooth * loss_sampling_smooth
+                )
+
+            loss_total.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            self.gaussians.clamp_stage_constraints(freeze_stage_name, self.hparams)
+
+            final_metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map)
+            final_metrics.update(
+                {
+                    "loss_total": float(loss_total.item()),
+                    "loss_rgb_weighted": float(loss_rgb.item()),
+                    "loss_scale_tail": float(loss_scale.item()),
+                    "loss_opacity_sparse": float(loss_opacity.item()),
+                }
+            )
+            if include_patch_supervision:
+                final_metrics.update(
+                    {
+                        "loss_patch_rgb": float(loss_patch_rgb.item()),
+                        "loss_patch_perceptual": float(loss_patch_perceptual.item()),
+                        "loss_sampling_smooth": float(loss_sampling_smooth.item()),
+                    }
+                )
+
+            iteration = iter_idx + 1
+            if allow_pruning and self.controller.should_prune_now(iteration):
+                prune_summary = self.gaussians.prune_low_opacity(
+                    threshold=self.hparams.opacity_prune_threshold,
+                    max_fraction=self.hparams.prune_max_fraction,
+                    min_gaussians_to_keep=self.hparams.min_gaussians_to_keep,
+                )
+                self.diagnostics.write_prune_summary(iteration=iteration, summary=prune_summary)
+
+                # 当前轮的 render/residual 仍来自 prune 前.
+                # 但结构性统计已经变化,这里先把统计写回当轮 metrics.
+                final_metrics.update(self.gaussians.summarize_gaussian_stats())
+                self.diagnostics_state.setdefault("prune_history", []).append(prune_summary)
+                self.diagnostics_state["last_prune"] = prune_summary
+
+                if prune_summary["pruned_count"] > 0:
+                    optimizer = self.gaussians.build_optimizer(freeze_stage_name, self.hparams)
+
+            self._log_and_maybe_save(stage_name, final_metrics, residual_map, self.prev_weight_map, iter_idx=iter_idx)
+
+            stage_history = self.diagnostics.stage_history.get(stage_name, [])
+            if self.controller.should_stop_stage(stage_name, stage_history):
+                break
+
+        return final_metrics
+
+    def run_stage3a_native_cleanup(
+        self,
+        *,
+        stage_name: str = "stage3a",
+        export_file_name: str = "gaussians_stage3a.ply",
+    ) -> dict[str, Any]:
+        """运行不含 SR patch 的 native cleanup."""
+
+        final_metrics = self._run_appearance_stage(
+            stage_name=stage_name,
+            freeze_stage_name="stage3a",
+            include_patch_supervision=False,
+            allow_pruning=True,
+        )
+        self._safe_export_ply(export_file_name)
+        self.diagnostics_state["stage3a_completed"] = True
+        self.diagnostics_state["phase_reached"] = stage_name
+        self.diagnostics_state["global_shift_detected"] = False
+        return final_metrics
+
+    def run_phase3s_build_sr_selection(self) -> dict[str, Any]:
+        """基于 renderer meta 构造第一版 fidelity 与 selection 诊断."""
+
+        self.current_stage = "phase3s"
+        render_output = self.render_current_scene()
+        pred_rgb = render_output["images_pred"]
+        residual_map = self.weight_builder.build_residual_map(pred_rgb, self.scene.gt_images)
+        render_meta = self._extract_render_meta(render_output)
+
+        fidelity_score = self.weight_builder.compute_gaussian_fidelity_score(render_meta)
+        if fidelity_score is None:
+            fidelity_score = self._build_default_fidelity_score()
+            self.diagnostics_state.setdefault("warnings", []).append("phase3s_missing_render_meta")
+
+        sr_selection_map = self.weight_builder.build_sr_selection_weight(
+            render_meta=render_meta,
+            fidelity_score=fidelity_score,
+            native_hw=self.scene.gt_images.shape[-2:],
+            output_hw=self._get_reference_images().shape[-2:],
+        )
+        if sr_selection_map is None:
+            sr_selection_map = self._build_default_sr_selection_map(residual_map)
+            self.diagnostics_state.setdefault("warnings", []).append("phase3s_missing_sr_selection_meta")
+        self.latest_render_meta = render_meta
+        self.gaussian_fidelity_score = fidelity_score.detach()
+        self.sr_selection_map = sr_selection_map.detach()
+
+        metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map)
+        metrics.update(self.weight_builder.summarize_fidelity_stats(fidelity_score))
+        metrics["sr_selection_mean"] = float(sr_selection_map.mean().item())
+        self._log_and_maybe_save("phase3s", metrics, residual_map, self.prev_weight_map, iter_idx=0)
+        self._write_phase3s_artifacts("phase3s", fidelity_score, sr_selection_map)
+
+        self.diagnostics_state["phase3s_completed"] = True
+        self.diagnostics_state["phase_reached"] = "phase3s"
+        return metrics
+
+    def run_stage3sr_selective_patch(
+        self,
+        *,
+        stage_name: str = "stage3sr",
+        export_file_name: str = "gaussians_stage3sr.ply",
+    ) -> dict[str, Any]:
+        """运行 selective SR patch supervision 的最小闭环."""
+
+        if not self._patch_supervision_enabled():
+            raise RuntimeError("Stage 3SR requires patch supervision to be enabled.")
+        if not self.diagnostics_state.get("phase3s_completed", False):
+            self.run_phase3s_build_sr_selection()
+
+        final_metrics = self._run_appearance_stage(
+            stage_name=stage_name,
+            freeze_stage_name="stage3sr",
+            include_patch_supervision=True,
+            allow_pruning=False,
+        )
+        self._safe_export_ply(export_file_name)
+        self.diagnostics_state["stage3sr_completed"] = True
+        self.diagnostics_state["phase_reached"] = stage_name
+        self.diagnostics_state["global_shift_detected"] = False
+        self._update_stage2b_diagnostics(final_metrics)
+        return final_metrics
+
     def bootstrap_stage2b_from_current_gaussians(self) -> dict[str, Any]:
         """把当前输入高斯视为“已完成 Stage 2A”的 warm start.
 
@@ -414,6 +685,7 @@ class RefinementRunner:
         )
 
         self.diagnostics_state["phase_reached"] = "stage2a"
+        self.diagnostics_state["stage3a_completed"] = True
         self.diagnostics_state["warm_start_stage2b"] = True
         self.diagnostics_state["stage2a_bootstrap"] = metrics
         self._update_stage2b_diagnostics(metrics)
@@ -528,83 +800,25 @@ class RefinementRunner:
         return metrics
 
     def run_stage2a(self) -> dict[str, Any]:
-        """运行 appearance-first 的高斯优化."""
+        """兼容旧入口的 Stage 2A.
 
-        self.current_stage = "stage2a"
-        self.gaussians.freeze_for_stage("stage2a")
-        optimizer = self.gaussians.build_optimizer("stage2a", self.hparams)
+        现在它内部会按新的边界拆成:
+        1. native cleanup
+        2. Phase 3S
+        3. selective SR patch
+        如果当前没有启用 patch supervision,则只执行 native cleanup.
+        """
 
-        final_metrics: dict[str, Any] = {}
-        for iter_idx in range(self.hparams.iters_stage2a):
-            render_output = self.render_current_scene()
-            pred_rgb = render_output["images_pred"]
-            residual_map = self.weight_builder.build_residual_map(pred_rgb, self.scene.gt_images)
-            self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, self.prev_weight_map)
+        final_metrics = self.run_stage3a_native_cleanup(
+            stage_name="stage2a",
+            export_file_name="gaussians_stage2a.ply",
+        )
+        if not self._patch_supervision_enabled():
+            self._update_stage2b_diagnostics(final_metrics)
+            return final_metrics
 
-            loss_rgb = compute_weighted_rgb_loss(pred_rgb, self.scene.gt_images, self.prev_weight_map)
-            loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
-            loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
-            loss_patch_rgb, loss_patch_perceptual = self._compute_patch_losses(residual_map, loss_rgb)
-            loss_total = loss_rgb + self.hparams.lambda_scale_tail * loss_scale + self.hparams.lambda_opacity_sparse * loss_opacity
-            loss_total = (
-                loss_total
-                + self.hparams.lambda_patch_rgb * loss_patch_rgb
-                + self.hparams.lambda_patch_perceptual * loss_patch_perceptual
-            )
-
-            loss_total.backward()
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            self.gaussians.clamp_stage_constraints("stage2a", self.hparams)
-
-            final_metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map)
-            final_metrics.update(
-                {
-                    "loss_total": float(loss_total.item()),
-                    "loss_rgb_weighted": float(loss_rgb.item()),
-                    "loss_scale_tail": float(loss_scale.item()),
-                    "loss_opacity_sparse": float(loss_opacity.item()),
-                }
-            )
-            if self._patch_supervision_enabled():
-                final_metrics.update(
-                    {
-                        "loss_patch_rgb": float(loss_patch_rgb.item()),
-                        "loss_patch_perceptual": float(loss_patch_perceptual.item()),
-                    }
-                )
-
-            # pruning 放在 step 之后.
-            # 这样本轮梯度先完整落到参数上,再做结构裁剪和 optimizer 重建.
-            iteration = iter_idx + 1
-            if self.controller.should_prune_now(iteration):
-                prune_summary = self.gaussians.prune_low_opacity(
-                    threshold=self.hparams.opacity_prune_threshold,
-                    max_fraction=self.hparams.prune_max_fraction,
-                    min_gaussians_to_keep=self.hparams.min_gaussians_to_keep,
-                )
-                self.diagnostics.write_prune_summary(iteration=iteration, summary=prune_summary)
-
-                # 当前轮的 render/residual 仍来自 prune 前.
-                # 但高斯统计已经发生变化,这里先把结构性统计更新到当轮 metrics.
-                final_metrics.update(self.gaussians.summarize_gaussian_stats())
-                self.diagnostics_state.setdefault("prune_history", []).append(prune_summary)
-                self.diagnostics_state["last_prune"] = prune_summary
-
-                if prune_summary["pruned_count"] > 0:
-                    optimizer = self.gaussians.build_optimizer("stage2a", self.hparams)
-
-            self._log_and_maybe_save("stage2a", final_metrics, residual_map, self.prev_weight_map, iter_idx=iter_idx)
-
-            stage_history = self.diagnostics.stage_history.get("stage2a", [])
-            if self.controller.should_stop_stage("stage2a", stage_history):
-                break
-
-        self._safe_export_ply("gaussians_stage2a.ply")
-        self.diagnostics_state["phase_reached"] = "stage2a"
-        self.diagnostics_state["global_shift_detected"] = False
-        self._update_stage2b_diagnostics(final_metrics)
-        return final_metrics
+        self.run_phase3s_build_sr_selection()
+        return self.run_stage3sr_selective_patch()
 
     def run_stage2b(self) -> dict[str, Any]:
         """运行 limited geometry refinement."""

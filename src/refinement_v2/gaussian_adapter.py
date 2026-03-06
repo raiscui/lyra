@@ -145,7 +145,10 @@ class GaussianAdapter(nn.Module):
 
         stage_to_trainable = {
             "stage2a": {"opacity", "scales", "colors"},
+            "stage3a": {"opacity", "scales", "colors"},
+            "stage3sr": {"opacity", "scales", "colors"},
             "stage2b": {"means", "opacity", "scales", "rotations", "colors"},
+            "stage3b": {"means", "opacity", "scales", "rotations", "colors"},
             "phase3": set(),
             "phase4": {"means", "opacity", "scales", "rotations", "colors"},
         }
@@ -278,7 +281,7 @@ class GaussianAdapter(nn.Module):
             rotation_norm = self.rotations.data.norm(dim=-1, keepdim=True).clamp_min(1e-8)
             self.rotations.data = self.rotations.data / rotation_norm
 
-            if stage_name not in {"stage2b", "phase4"}:
+            if stage_name not in {"stage2b", "stage3b", "phase4"}:
                 return
             if hparams.means_delta_cap <= 0:
                 return

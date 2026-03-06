@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import torch
 
 from src.refinement_v2.diagnostics import DiagnosticsWriter
@@ -23,9 +25,54 @@ class RecordingRenderer:
                 "hw": scene.gt_images.shape[-2:],
             }
         )
-        image = torch.zeros_like(scene.gt_images)
-        depth = torch.zeros(scene.gt_images.shape[0], scene.gt_images.shape[1], 1, *scene.gt_images.shape[-2:], dtype=image.dtype)
+        batch_size, _, _ = gaussians.shape
+        num_views = scene.gt_images.shape[1]
+        height, width = scene.gt_images.shape[-2:]
+
+        # 这里保留可微性, 这样同一个 renderer 既能做 phase3s 诊断,
+        # 也能直接跑 stage3sr 的优化循环测试.
+        color_mean = gaussians[:, :, 11:].mean(dim=1)
+        image = color_mean[:, None, :, None, None].expand(batch_size, num_views, 3, height, width).clone()
+        depth = torch.zeros(
+            scene.gt_images.shape[0],
+            scene.gt_images.shape[1],
+            1,
+            *scene.gt_images.shape[-2:],
+            dtype=image.dtype,
+            device=image.device,
+        )
         return {"images_pred": image, "depths_pred": depth}
+
+
+class MetaRecordingRenderer(RecordingRenderer):
+    """额外返回 dense render meta,用于验证 Phase 3S."""
+
+    def render(self, gaussians: torch.Tensor, scene) -> dict[str, torch.Tensor]:
+        output = super().render(gaussians, scene)
+        batch_size, num_gaussians, _ = gaussians.shape
+        num_views = scene.gt_images.shape[1]
+        height, width = scene.gt_images.shape[-2:]
+        radii = (
+            torch.linspace(1.0, 2.0, steps=num_gaussians, dtype=gaussians.dtype)
+            .view(1, 1, num_gaussians)
+            .repeat(batch_size, num_views, 1)
+        )
+        tiles_per_gauss = (
+            torch.linspace(2.0, 4.0, steps=num_gaussians, dtype=gaussians.dtype)
+            .view(1, 1, num_gaussians)
+            .repeat(batch_size, num_views, 1)
+        )
+        opacities = gaussians[:, :, 3].unsqueeze(1).expand(batch_size, num_views, num_gaussians).detach().clone()
+        means_x = torch.linspace(0.5, max(width - 1.5, 0.5), steps=num_gaussians, dtype=gaussians.dtype)
+        means_y = torch.linspace(0.5, max(height - 1.5, 0.5), steps=num_gaussians, dtype=gaussians.dtype)
+        means2d = torch.stack([means_x, means_y], dim=-1).view(1, 1, num_gaussians, 2).repeat(batch_size, num_views, 1, 1)
+        output["render_meta"] = {
+            "radii": radii,
+            "means2d": means2d,
+            "opacities": opacities,
+            "tiles_per_gauss": tiles_per_gauss,
+        }
+        return output
 
 
 def _build_patch_scene(reference_mode: str = "native", sr_scale: float = 1.0):
@@ -170,3 +217,68 @@ def test_stage2a_with_patch_supervision_records_patch_losses(tmp_path) -> None:
     final_metrics = runner.run_stage2a()
 
     assert "loss_patch_rgb" in final_metrics
+    assert (run_config.outdir / "metrics_stage3sr.json").exists()
+    assert (run_config.outdir / "gaussian_fidelity_histogram.json").exists()
+    assert (run_config.outdir / "sr_selection_stats.json").exists()
+
+
+def test_phase3s_builds_fidelity_summary_from_render_meta(tmp_path) -> None:
+    """Phase 3S 应该能消费 render meta 并写出非平凡的 selection map."""
+
+    from tests.refinement_v2.helpers import build_scene_bundle
+
+    run_config = build_run_config(tmp_path)
+    hparams = build_stage_hparams()
+    runner = RefinementRunner(
+        scene=build_scene_bundle(),
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=MetaRecordingRenderer(),
+    )
+
+    runner.run_phase0()
+    runner.run_phase1_prepare_weights()
+    metrics = runner.run_phase3s_build_sr_selection()
+
+    assert metrics["fidelity_mean"] > 0.0
+    assert metrics["sr_selection_mean"] > 0.0
+    assert runner.diagnostics_state["phase3s_completed"] is True
+    assert runner.sr_selection_map is not None
+    assert not torch.allclose(runner.sr_selection_map, torch.ones_like(runner.sr_selection_map))
+    assert (run_config.outdir / "metrics_phase3s.json").exists()
+    assert (run_config.outdir / "gaussian_fidelity_histogram.json").exists()
+    assert (run_config.outdir / "sr_selection_stats.json").exists()
+
+
+def test_stage3sr_records_sampling_smooth_loss_metric(tmp_path) -> None:
+    """Stage 3SR 应把 sampling smooth loss 正式记到指标里."""
+
+    from tests.refinement_v2.helpers import build_scene_bundle
+
+    run_config = build_run_config(tmp_path)
+    hparams = build_stage_hparams(
+        iters_stage2a=2,
+        patch_size=4,
+        lambda_patch_rgb=0.5,
+        lambda_sampling_smooth=1e-2,
+    )
+    runner = RefinementRunner(
+        scene=build_scene_bundle(),
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=MetaRecordingRenderer(),
+    )
+
+    runner.run_phase0()
+    runner.run_phase1_prepare_weights()
+    runner.run_phase3s_build_sr_selection()
+    metrics = runner.run_stage3sr_selective_patch()
+    stage3sr_metrics = json.loads((run_config.outdir / "metrics_stage3sr.json").read_text(encoding="utf-8"))
+
+    assert "loss_sampling_smooth" in metrics
+    assert metrics["loss_sampling_smooth"] >= 0.0
+    assert "loss_sampling_smooth" in stage3sr_metrics[-1]

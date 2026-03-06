@@ -166,6 +166,9 @@
 - `reference_intrinsics_path`(可选)
   - 外部 reference 对应的 `intrinsics` 覆盖文件
   - 当前实现要求 `npz` 能解出 `[T, 4]` 或 `[1, T, 4]`
+- `pose_path` / `intrinsics_path` / `rgb_path`(可选, 需成套提供)
+  - direct file inputs 模式
+  - 当前实现会跳过 provider,直接从本地文件构造 `SceneBundle`
 
 ### 中间诊断产物
 
@@ -177,12 +180,15 @@
 ### 输出
 
 - `gaussians_refined.ply`
-- `render_refined.mp4`
+- `videos/final_render.mp4`
 - `metrics.json`
 - `config_effective.yaml`
 - `videos/baseline_render.mp4`
 - `videos/final_render.mp4`
 - `videos/gt_reference.mp4`
+- `metrics_phase3s.json`
+- `metrics_stage3sr.json`
+- `gaussians/gaussians_stage3sr.ply`
 - `poses_refined.npz`
   - 只有开启 pose 诊断或 joint fallback 时才输出
 
@@ -844,6 +850,10 @@ outdir/
   config_effective.yaml
   diagnostics.json
   metrics.json
+  metrics_phase0.json
+  metrics_phase1.json
+  metrics_phase3s.json
+  metrics_stage3sr.json
   state/
     latest.pt
     stage2a_last.pt
@@ -857,11 +867,13 @@ outdir/
   gaussians/
     gaussians_init_copy.ply
     gaussians_stage2a.ply
+    gaussians_stage3sr.ply
     gaussians_stage2b.ply
     gaussians_refined.ply
   videos/
-    render_before.mp4
-    render_after.mp4
+    baseline_render.mp4
+    gt_reference.mp4
+    final_render.mp4
 ```
 
 ### 为什么要有 `state/`
@@ -1578,7 +1590,10 @@ sequenceDiagram
 - 说明:
   - external reference 已经能真实进入 `reference_images`
   - patch supervision 已能消费外部 mp4 / 帧目录
-  - 这一步已完成,但 full direct file inputs 仍是后续新工作
+  - direct file inputs 第一版也已完成
+    - `--pose-path`
+    - `--intrinsics-path`
+    - `--rgb-path`
 
 ## 最终建议
 
