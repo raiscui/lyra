@@ -13,6 +13,11 @@ static_view_indices_fixed: ['3']
 # Only render each 4. frame
 target_index_subsample: 4
 
+# 经验值: 适度收紧 gaussian_scale_cap 可以明显提升锐度,同时 PSNR 损失相对可控.
+# - baseline(scale_cap=0.30): PSNR≈21.61, sharpness≈191
+# - scale_cap=0.28: PSNR≈20.92, sharpness≈236
+gaussian_scale_cap: 0.28
+
 # For static scenes, do not set target time
 set_manual_time_idx: true
 

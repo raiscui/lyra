@@ -1,0 +1,242 @@
+"""`refinement_v2` 的配置层.
+
+这一层只负责两件事:
+1. 定义运行期会反复传递的 dataclass.
+2. 把 CLI 参数稳定地映射成这些对象.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass
+class RefinementRunConfig:
+    """描述一次 refinement 运行所需的外部参数."""
+
+    config_path: Path
+    gaussians_path: Path
+    outdir: Path
+    scene_index: int = 0
+    dataset_name: str | None = None
+    view_id: str | None = None
+    reference_mode: str = "native"
+    sr_scale: float = 1.0
+    frame_indices: list[int] | None = None
+    target_subsample: int = 1
+    enable_stage2b: bool = False
+    enable_pruning: bool = False
+    enable_pose_diagnostic: bool = False
+    enable_joint_fallback: bool = False
+    stop_after: str | None = None
+    device: str = "cuda"
+    mixed_precision: bool = False
+    save_every: int = 50
+    resume: bool = False
+    dry_run: bool = False
+    overwrite: bool = False
+
+
+@dataclass
+class StageHyperParams:
+    """描述各阶段使用的默认超参数."""
+
+    alpha_rgb: float = 1.0
+    alpha_perc: float = 0.0
+    q_low: float = 0.50
+    q_high: float = 0.90
+    weight_tau: float = 0.45
+    weight_floor: float = 0.20
+    ema_decay: float = 0.90
+    iters_stage2a: int = 600
+    iters_stage2b: int = 300
+    iters_pose: int = 100
+    iters_joint: int = 200
+    lr_opacity: float = 1e-2
+    lr_color: float = 5e-3
+    lr_scale: float = 1e-3
+    lr_means: float = 1e-4
+    lr_pose: float = 3e-5
+    patch_size: int = 0
+    lambda_patch_rgb: float = 0.0
+    lambda_patch_perceptual: float = 0.0
+    means_delta_cap: float = 0.02
+    scale_tail_threshold: float = 0.25
+    opacity_low_threshold: float = 0.10
+    opacity_prune_threshold: float = 0.05
+    lambda_scale_tail: float = 1e-2
+    lambda_opacity_sparse: float = 1e-3
+    prune_every: int = 2
+    prune_warmup_iters: int = 2
+    prune_max_fraction: float = 0.02
+    min_gaussians_to_keep: int = 1
+    plateau_patience: int = 10
+    plateau_delta: float = 1e-4
+
+
+def _parse_frame_indices(raw_value: str | None) -> list[int] | None:
+    """把 `1,2,5` 这样的字符串转成整数列表."""
+
+    if raw_value is None or raw_value.strip() == "":
+        return None
+
+    items = [item.strip() for item in raw_value.split(",")]
+    frame_indices = [int(item) for item in items if item]
+    return frame_indices or None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """构建 CLI 参数解析器."""
+
+    parser = argparse.ArgumentParser(
+        description="Run robust gaussian refinement V2 on an exported gaussian scene."
+    )
+
+    parser.add_argument("--config", required=True, help="Path to the scene config YAML.")
+    parser.add_argument("--gaussians", required=True, help="Path to the initial gaussian PLY.")
+    parser.add_argument("--outdir", required=True, help="Output directory for diagnostics and results.")
+    parser.add_argument("--scene-index", type=int, default=0, help="Scene index inside the test dataloader.")
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default=None,
+        help="Optional dataset registry override, e.g. lyra_static_demo_generated.",
+    )
+    parser.add_argument("--view-id", type=str, default=None, help="Optional logical view identifier.")
+    parser.add_argument(
+        "--frame-indices",
+        type=str,
+        default=None,
+        help="Comma-separated frame indices to refine, e.g. 0,4,8.",
+    )
+    parser.add_argument(
+        "--reference-mode",
+        type=str,
+        default="native",
+        choices=["native", "super_resolved"],
+        help="Reference supervision mode. `super_resolved` uses scaled reference frames.",
+    )
+    parser.add_argument(
+        "--sr-scale",
+        type=float,
+        default=1.0,
+        help="Reference scale used when reference_mode=super_resolved.",
+    )
+    parser.add_argument(
+        "--target-subsample",
+        type=int,
+        default=1,
+        help="Fallback frame stride when frame_indices is not provided.",
+    )
+    parser.add_argument("--enable-stage2b", action="store_true", help="Enable limited geometry refinement.")
+    parser.add_argument(
+        "--enable-pose-diagnostic",
+        action="store_true",
+        help="Enable tiny pose-only diagnostic stage.",
+    )
+    parser.add_argument(
+        "--enable-pruning",
+        action="store_true",
+        help="Enable low-opacity pruning inside Stage 2A.",
+    )
+    parser.add_argument(
+        "--enable-joint-fallback",
+        action="store_true",
+        help="Enable final joint fallback stage.",
+    )
+    parser.add_argument(
+        "--stop-after",
+        type=str,
+        default=None,
+        choices=["phase0", "phase1", "stage2a", "stage2b", "phase3", "phase4"],
+        help="Stop after a specific stage for debugging.",
+    )
+    parser.add_argument("--device", type=str, default="cuda", help="Device string, e.g. cuda or cpu.")
+    parser.add_argument("--mixed-precision", action="store_true", help="Enable mixed precision for refinement.")
+    parser.add_argument("--save-every", type=int, default=50, help="Save intermediate state every N iterations.")
+    parser.add_argument("--resume", action="store_true", help="Resume from latest saved state.")
+    parser.add_argument("--dry-run", action="store_true", help="Only run Phase 0 baseline diagnostics.")
+    parser.add_argument("--overwrite", action="store_true", help="Allow overwriting an existing output directory.")
+
+    parser.add_argument("--weight-floor", type=float, default=0.20)
+    parser.add_argument("--weight-tau", type=float, default=0.45)
+    parser.add_argument("--ema-decay", type=float, default=0.90)
+    parser.add_argument("--iters-stage2a", type=int, default=600)
+    parser.add_argument("--iters-stage2b", type=int, default=300)
+    parser.add_argument("--iters-pose", type=int, default=100)
+    parser.add_argument("--iters-joint", type=int, default=200)
+    parser.add_argument("--lr-opacity", type=float, default=1e-2)
+    parser.add_argument("--lr-color", type=float, default=5e-3)
+    parser.add_argument("--lr-scale", type=float, default=1e-3)
+    parser.add_argument("--lr-means", type=float, default=1e-4)
+    parser.add_argument("--lr-pose", type=float, default=3e-5)
+    parser.add_argument("--patch-size", type=int, default=0)
+    parser.add_argument("--lambda-patch-rgb", type=float, default=0.0)
+    parser.add_argument("--lambda-patch-perceptual", type=float, default=0.0)
+    parser.add_argument("--opacity-prune-threshold", type=float, default=0.05)
+    parser.add_argument("--prune-every", type=int, default=2)
+    parser.add_argument("--prune-warmup-iters", type=int, default=2)
+    parser.add_argument("--prune-max-fraction", type=float, default=0.02)
+    parser.add_argument("--min-gaussians-to-keep", type=int, default=1)
+
+    return parser
+
+
+def load_effective_config_from_cli(
+    argv: list[str] | None = None,
+) -> tuple[RefinementRunConfig, StageHyperParams]:
+    """把 CLI 参数映射成运行配置和阶段超参数."""
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    run_config = RefinementRunConfig(
+        config_path=Path(args.config),
+        gaussians_path=Path(args.gaussians),
+        outdir=Path(args.outdir),
+        scene_index=args.scene_index,
+        dataset_name=args.dataset_name,
+        view_id=args.view_id,
+        reference_mode=args.reference_mode,
+        sr_scale=args.sr_scale,
+        frame_indices=_parse_frame_indices(args.frame_indices),
+        target_subsample=args.target_subsample,
+        enable_stage2b=args.enable_stage2b,
+        enable_pruning=args.enable_pruning,
+        enable_pose_diagnostic=args.enable_pose_diagnostic,
+        enable_joint_fallback=args.enable_joint_fallback,
+        stop_after=args.stop_after,
+        device=args.device,
+        mixed_precision=args.mixed_precision,
+        save_every=args.save_every,
+        resume=args.resume,
+        dry_run=args.dry_run,
+        overwrite=args.overwrite,
+    )
+
+    stage_hyper_params = StageHyperParams(
+        weight_floor=args.weight_floor,
+        weight_tau=args.weight_tau,
+        ema_decay=args.ema_decay,
+        iters_stage2a=args.iters_stage2a,
+        iters_stage2b=args.iters_stage2b,
+        iters_pose=args.iters_pose,
+        iters_joint=args.iters_joint,
+        lr_opacity=args.lr_opacity,
+        lr_color=args.lr_color,
+        lr_scale=args.lr_scale,
+        lr_means=args.lr_means,
+        lr_pose=args.lr_pose,
+        patch_size=args.patch_size,
+        lambda_patch_rgb=args.lambda_patch_rgb,
+        lambda_patch_perceptual=args.lambda_patch_perceptual,
+        opacity_prune_threshold=args.opacity_prune_threshold,
+        prune_every=args.prune_every,
+        prune_warmup_iters=args.prune_warmup_iters,
+        prune_max_fraction=args.prune_max_fraction,
+        min_gaussians_to_keep=args.min_gaussians_to_keep,
+    )
+
+    return run_config, stage_hyper_params
