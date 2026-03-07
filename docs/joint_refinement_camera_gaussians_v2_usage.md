@@ -62,6 +62,10 @@
   - `--pose-path`
   - `--intrinsics-path`
   - `--rgb-path`
+  - 注意:
+    - `--pose-path` 当前应提供 raw pose / `c2w` 风格的 `pose.npz`
+    - 脚本内部会自动转换成 provider 兼容的 `cam_view = inverse(c2w).T`
+    - 如果 `npz` 已显式使用 `cam_view` key,则不会再次转换
 
 这些能力都从同一个脚本进入:
 
@@ -468,6 +472,88 @@ PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
 - 非等比缩放
 - 改了视场角
 - 改了主点位置
+
+### 2026-03-07 已验证的 `Stage 3SR` 主基线 v1
+
+如果你已经确认 `FlashVSR-Pro` 输出视频本身正常, 当前更推荐直接用下面这版命令作为真实 SR reference 的主基线起点:
+
+```bash
+PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
+  --config configs/demo/lyra_static.yaml \
+  --gaussians outputs/demo/lyra_static/static_view_indices_fixed_5_0_1_2_3_4/lyra_static_demo_generated/gaussians_orig/gaussians_0.ply \
+  --pose-path assets/demo/static/diffusion_output_generated/3/pose/00172.npz \
+  --intrinsics-path assets/demo/static/diffusion_output_generated/3/intrinsics/00172.npz \
+  --rgb-path assets/demo/static/diffusion_output_generated/3/rgb/00172.mp4 \
+  --view-id 3 \
+  --frame-indices 0,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120 \
+  --reference-mode super_resolved \
+  --sr-scale 2.0 \
+  --reference-path outputs/flashvsr_reference/full_scale2x/3/rgb/00172.mp4 \
+  --start-stage stage2a \
+  --stage2a-mode enhanced \
+  --patch-size 256 \
+  --lambda-patch-rgb 0.25 \
+  --lambda-sampling-smooth 0.0005 \
+  --enable-pruning \
+  --iters-stage2a 60 \
+  --stop-after stage2a \
+  --outdir outputs/refine_v2/view3_stage3sr_real_sr_baseline_v1
+```
+
+这版命令更准确地说是 “真实 external SR reference 的 smoke test / SR 变体”。
+
+如果你的问题是“超分带来的增益到底有多少”, 正式 baseline 不该拿旧的 `legacy` 路线, 也不该把下面这个目录误当成正式 baseline。
+
+- 正式 baseline:
+  - 同一条 `enhanced + pruning + Stage 3A -> Phase 3S -> Stage 3SR` 主线
+  - 只把 reference 保持为 native
+  - 当前已验证目录:
+    - `outputs/refine_v2/view3_stage3sr_native_reference_v1_fixed_cam_view`
+- SR 变体:
+  - 使用 `--reference-mode super_resolved`
+  - 当前已验证目录:
+    - `outputs/refine_v2/view3_stage3sr_real_sr_baseline_v1_fixed_cam_view`
+- 说明:
+  - `view3_stage3sr_real_sr_baseline_v1_fixed_cam_view` 这个名字里的 `baseline`,只是历史命名残留.
+  - 语义上它应理解为 “SR variant”, 不是“正式 baseline”.
+
+这版 SR 变体命令有几个特点:
+
+- 不再依赖 provider 选 scene, 而是直接喂:
+  - `pose-path`
+  - `intrinsics-path`
+  - `rgb-path`
+  - `reference-path`
+- 它只覆盖:
+  - `Stage 3A`
+  - `Phase 3S`
+  - `Stage 3SR`
+- 它还没有把 `Stage 2B` 混进来, 因此更适合拿来做 selective SR 单变量对比
+
+这条命令的已验证结果是:
+
+- `phase_reached = stage3sr`
+- `stopped_reason = metrics_plateau`
+- `PSNR: 15.9834 -> 18.4991`
+- `residual_mean: 0.09453 -> 0.05571`
+- `sharpness: 0.002266 -> 0.004078`
+- `scale_tail_ratio: 0.01946 -> 0.00747`
+
+对应产物目录:
+
+- `outputs/refine_v2/view3_stage3sr_real_sr_baseline_v1`
+
+同口径对照时, 应与下面这个正式 baseline 一起看:
+
+- `outputs/refine_v2/view3_stage3sr_native_reference_v1_fixed_cam_view`
+
+最值得先看:
+
+- `metrics_phase3s.json`
+- `metrics_stage3sr.json`
+- `sr_selection_maps/`
+- `gaussians/gaussians_stage3sr.ply`
+- `videos/final_render.mp4`
 - 不只是简单 2x 放大
 
 如果只是严格同视角、同构图、同中心点的纯放大,当前实现可以按分辨率自动推断缩放后的 `intrinsics_ref`。
@@ -512,6 +598,69 @@ PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
 
 - 第一次跑: 从 baseline `.ply` 开始
 - 第二次增量跑: 从 `gaussians_stage2a.ply` 开始
+
+如果你当前走的是这次已经验证过的 direct-input / native baseline 主线, 当前更推荐的真实续跑方式是:
+
+1. 先复制正式 baseline 目录, 不要直接污染基线目录.
+2. 在复制后的目录里保留:
+   - `state/latest.pt`
+3. 再用 `--resume` + `--start-stage stage2b` 续跑.
+
+例如:
+
+```bash
+cp -a outputs/refine_v2/view3_stage3sr_native_reference_v1_fixed_cam_view \
+  outputs/refine_v2/view3_stage2b_from_native_reference_v1_fixed_cam_view
+
+PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
+  --config configs/demo/lyra_static.yaml \
+  --gaussians outputs/refine_v2/view3_stage2b_from_native_reference_v1_fixed_cam_view/gaussians/gaussians_stage3sr.ply \
+  --pose-path assets/demo/static/diffusion_output_generated/3/pose/00172.npz \
+  --intrinsics-path assets/demo/static/diffusion_output_generated/3/intrinsics/00172.npz \
+  --rgb-path assets/demo/static/diffusion_output_generated/3/rgb/00172.mp4 \
+  --view-id 3 \
+  --frame-indices 0,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120 \
+  --reference-mode native \
+  --start-stage stage2b \
+  --stage2a-mode enhanced \
+  --patch-size 256 \
+  --lambda-patch-rgb 0.25 \
+  --lambda-sampling-smooth 0.0005 \
+  --enable-pruning \
+  --enable-stage2b \
+  --resume \
+  --stop-after stage2b \
+  --outdir outputs/refine_v2/view3_stage2b_from_native_reference_v1_fixed_cam_view
+```
+
+这里有一个 2026-03-07 刚确认过的关键点:
+
+- `export_ply()` 会过滤掉一部分低 opacity 高斯
+- 所以:
+  - `.ply` 里的高斯数量
+  - `state/latest.pt` 里的高斯数量
+  不一定相同
+- 当前 `restore_latest_state()` 已修复为:
+  - 数量不一致时直接按 state tensor 重建 `GaussianAdapter`
+  - 因此上面的 `--resume` workflow 现在是可用的
+
+当前这条 workflow 的实测结论也已经有了:
+
+- `native baseline -> Stage 2B`
+  - `PSNR = 30.7697`
+  - `residual_mean = 0.014952`
+  - `sharpness = 0.006509`
+- `SR variant -> Stage 2B`
+  - `PSNR = 30.3745`
+  - `residual_mean = 0.015645`
+  - `sharpness = 0.006647`
+
+因此当前推荐顺序是:
+
+1. 先把 `native baseline -> Stage 2B` 作为正式主线
+2. external SR 保留为可选增强分支
+3. 如果你更看重一点点锐度, 再额外比较 `SR -> Stage 2B`
+4. 如果你更看重 `PSNR / residual_mean`, 当前优先选 native
 
 这里也顺手说明一下:
 

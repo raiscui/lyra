@@ -117,10 +117,54 @@ def _load_npz_array(npz_path: Path, preferred_keys: tuple[str, ...], tensor_name
         return np.asarray(payload[payload.files[0]], dtype=np.float32)
 
 
-def _load_direct_pose_sequence(pose_path: Path) -> torch.Tensor:
-    """读取 direct input 模式下的相机位姿序列."""
+def _load_npz_array_with_key(
+    npz_path: Path,
+    preferred_keys: tuple[str, ...],
+    tensor_name: str,
+) -> tuple[np.ndarray, str]:
+    """从 `npz` 中同时取出数组和值来源的 key.
 
-    pose_np = _load_npz_array(
+    direct input 的 pose 需要根据来源 key 判断是否还要做
+    `provider` 契约下的 `cam_view` 变换.
+    因此这里保留 key 信息,避免把已经是 `cam_view` 的输入再次变换.
+    """
+
+    with np.load(npz_path, allow_pickle=False) as payload:
+        for key in preferred_keys:
+            if key in payload:
+                return np.asarray(payload[key], dtype=np.float32), key
+
+        if not payload.files:
+            raise ValueError(f"{tensor_name} npz is empty: {npz_path}")
+
+        first_key = payload.files[0]
+        return np.asarray(payload[first_key], dtype=np.float32), first_key
+
+
+def _convert_direct_pose_to_cam_view(pose: torch.Tensor) -> torch.Tensor:
+    """把 raw pose/c2w 序列转换成 provider 期望的 `cam_view`.
+
+    `src/models/data/provider.py` 中的 dataloader 契约明确是:
+    `cam_view = torch.inverse(c2ws).transpose(1, 2)`.
+    direct input 路径也必须产出同一约定,否则 baseline render 和
+    Stage 2A 优化会与 dataloader 路径分叉.
+    """
+
+    return torch.linalg.inv(pose).transpose(-1, -2).contiguous()
+
+
+def _load_direct_pose_sequence(pose_path: Path) -> torch.Tensor:
+    """读取并规范 direct input 模式下的相机位姿序列.
+
+    外部 `pose.npz` 在项目当前资产里保存的是 raw pose / c2w.
+    refinement 内部真正消费的是 provider 风格的 `cam_view`.
+    因此默认会把 raw pose 转成 `inverse(c2w).T`.
+
+    如果输入文件显式使用 `cam_view` 这个 key,则认为它已经满足
+    renderer 契约,不再二次变换.
+    """
+
+    pose_np, source_key = _load_npz_array_with_key(
         pose_path,
         preferred_keys=("data", "pose", "cam_view", "c2w", "c2ws"),
         tensor_name="pose",
@@ -130,13 +174,16 @@ def _load_direct_pose_sequence(pose_path: Path) -> torch.Tensor:
         pose = pose[0]
     if pose.ndim != 3 or tuple(pose.shape[-2:]) != (4, 4):
         raise ValueError(f"pose_path must resolve to shape [T, 4, 4], got {tuple(pose.shape)}.")
+
+    if source_key != "cam_view":
+        pose = _convert_direct_pose_to_cam_view(pose)
     return pose
 
 
 def _load_direct_intrinsics_sequence(intrinsics_path: Path) -> torch.Tensor:
     """读取 direct input 模式下的内参序列."""
 
-    intrinsics_np = _load_npz_array(
+    intrinsics_np, _ = _load_npz_array_with_key(
         intrinsics_path,
         preferred_keys=("data", "intrinsics", "K"),
         tensor_name="intrinsics",

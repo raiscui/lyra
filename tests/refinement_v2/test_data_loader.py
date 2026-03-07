@@ -236,7 +236,7 @@ def test_standardize_batch_uses_external_reference_intrinsics_override(tmp_path)
 
 
 def test_build_scene_bundle_supports_direct_file_inputs(tmp_path) -> None:
-    """direct file inputs 应该绕过 provider,直接组装出 SceneBundle."""
+    """direct file inputs 应该绕过 provider,但仍保持 provider 的 `cam_view` 契约."""
 
     rgb_dir = tmp_path / "rgb"
     pose_path = tmp_path / "pose.npz"
@@ -267,7 +267,58 @@ def test_build_scene_bundle_supports_direct_file_inputs(tmp_path) -> None:
 
     selected_values = scene.gt_images[:, :, 0, 0, 0].mul(255.0).round().to(dtype=torch.int64)
     assert selected_values.tolist() == [[40, 140]]
-    assert torch.allclose(scene.cam_view[0, :, 0, 3], torch.tensor([1.0, 3.0]))
+
+    # provider 的契约是 `cam_view = inverse(c2w).T`.
+    # 这里用两帧纯平移矩阵验证 direct path 也走同一约定.
+    expected_cam_view = torch.tensor(
+        [
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [-1.0, 0.0, 0.0, 1.0],
+            ],
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [-3.0, 0.0, 0.0, 1.0],
+            ],
+        ],
+        dtype=torch.float32,
+    )
+    assert torch.allclose(scene.cam_view[0], expected_cam_view)
+
+
+def test_build_scene_bundle_preserves_cam_view_inputs_without_double_conversion(tmp_path) -> None:
+    """如果 pose.npz 本身已经是 `cam_view`,direct path 不应重复 inverse/transpose."""
+
+    rgb_dir = tmp_path / "rgb"
+    pose_path = tmp_path / "pose_cam_view.npz"
+    intrinsics_path = tmp_path / "intrinsics.npz"
+
+    _write_reference_frames(rgb_dir, frame_values=[10, 40, 90, 140], size=(6, 8))
+    _write_direct_camera_inputs(intrinsics_path=intrinsics_path, pose_path=tmp_path / "unused_pose.npz", num_frames=4)
+
+    cam_view = np.repeat(np.eye(4, dtype=np.float32)[None, :, :], repeats=4, axis=0)
+    cam_view[:, 3, 2] = np.arange(4, dtype=np.float32)
+    np.savez(pose_path, cam_view=cam_view)
+
+    run_config = RefinementRunConfig(
+        config_path=tmp_path / "demo.yaml",
+        gaussians_path=tmp_path / "gaussians.ply",
+        outdir=tmp_path / "refine_out",
+        pose_path=pose_path,
+        intrinsics_path=intrinsics_path,
+        rgb_path=rgb_dir,
+        frame_indices=[1, 3],
+        view_id="3",
+    )
+
+    scene = build_scene_bundle(run_config)
+
+    expected_cam_view = torch.from_numpy(cam_view[[1, 3]]).float()
+    assert torch.allclose(scene.cam_view[0], expected_cam_view)
 
 
 def test_build_scene_bundle_rejects_partial_direct_file_inputs(tmp_path) -> None:

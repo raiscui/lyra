@@ -981,7 +981,23 @@ class RefinementRunner:
         if payload is None:
             return False
 
-        self.gaussians.copy_from_tensor(payload["gaussians"].to(self.device))
+        state_gaussians = payload["gaussians"].to(self.device)
+
+        # `export_ply()` 会按 opacity 过滤一部分低置信高斯.
+        # 因此 resume workflow 下,磁盘上的 `.ply` 数量可能小于 `state/latest.pt`
+        # 里保存的全量 tensor 数量. 这时不能再强行要求 shape 完全一致,
+        # 而应该直接以 state 中的全量高斯重建 adapter.
+        expected_shape = (self.gaussians.means.shape[0], 14)
+        current_shape = tuple(state_gaussians.shape[-2:])
+        if current_shape != expected_shape:
+            self.gaussians = GaussianAdapter.from_tensor(
+                state_gaussians,
+                scale_tail_threshold=self.gaussians.scale_tail_threshold,
+                opacity_low_threshold=self.gaussians.opacity_low_threshold,
+            ).to(self.device)
+        else:
+            self.gaussians.copy_from_tensor(state_gaussians)
+
         self.diagnostics_state.update(payload.get("diagnostics_state", {}))
         pose_delta = payload.get("pose_delta")
         if isinstance(pose_delta, torch.Tensor):
@@ -1043,6 +1059,10 @@ class RefinementRunner:
     def run(self) -> dict[str, Any]:
         """运行完整 refinement 流程."""
 
+        explicit_stage2b_start = self.run_config.start_stage == "stage2b"
+        if explicit_stage2b_start and not self.run_config.enable_stage2b:
+            raise RuntimeError("start_stage=stage2b requires enable_stage2b=True.")
+
         final_metrics = self.run_phase0()
         if self.run_config.stop_after == "phase0":
             return self.export_final_outputs(final_metrics)
@@ -1051,7 +1071,7 @@ class RefinementRunner:
         if self.run_config.stop_after == "phase1":
             return self.export_final_outputs(final_metrics)
 
-        if self.run_config.start_stage == "stage2b":
+        if explicit_stage2b_start:
             final_metrics = self.bootstrap_stage2b_from_current_gaussians()
         else:
             final_metrics = self.run_stage2a()
@@ -1059,7 +1079,9 @@ class RefinementRunner:
         if self.run_config.stop_after == "stage2a":
             return self.export_final_outputs(final_metrics)
 
-        if self.controller.should_enter_stage2b(self.diagnostics_state):
+        # 显式 `start_stage=stage2b` 表示用户已经决定继续几何阶段.
+        # 这种情况下不应再被自动 gate 拦住.
+        if explicit_stage2b_start or self.controller.should_enter_stage2b(self.diagnostics_state):
             final_metrics = self.run_stage2b()
             if self.run_config.stop_after == "stage2b":
                 return self.export_final_outputs(final_metrics)

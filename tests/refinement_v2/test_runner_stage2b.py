@@ -1,6 +1,7 @@
 """Stage 2B 测试."""
 
 import json
+from pathlib import Path
 
 import torch
 
@@ -152,3 +153,118 @@ def test_run_with_start_stage_stage2b_skips_stage2a_optimizer_and_runs_stage2b(t
     assert summary["phase_reached"] == "stage2b"
     assert (run_config.outdir / "metrics_stage2b.json").exists()
     assert not (run_config.outdir / "metrics_stage2a.json").exists()
+
+
+def test_explicit_start_stage2b_bypasses_auto_gate_when_residual_is_already_low(tmp_path) -> None:
+    """显式 `start_stage=stage2b` 时,不应再被 `need_geometry` 自动 gate 挡住."""
+
+    run_config = build_run_config(
+        tmp_path,
+        start_stage="stage2b",
+        enable_stage2b=True,
+        stop_after="stage2b",
+    )
+    hparams = build_stage_hparams(
+        iters_stage2b=2,
+        lr_scale=0.1,
+        lr_means=0.05,
+        means_delta_cap=0.01,
+    )
+    scene = build_scene_bundle()
+    scene.gt_images = torch.full_like(scene.gt_images, 0.1)
+    scene.reference_images = scene.gt_images.clone()
+
+    runner = RefinementRunner(
+        scene=scene,
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=FakeRenderer(),
+    )
+
+    summary = runner.run()
+
+    assert summary["start_stage"] == "stage2b"
+    assert summary["phase_reached"] == "stage2b"
+    assert summary["warm_start_stage2b"] is True
+    assert (run_config.outdir / "metrics_stage2b.json").exists()
+
+
+def test_start_stage2b_requires_enable_stage2b(tmp_path) -> None:
+    """显式 `start_stage=stage2b` 但没打开 `enable_stage2b` 时,应直接报错."""
+
+    run_config = build_run_config(
+        tmp_path,
+        start_stage="stage2b",
+        enable_stage2b=False,
+    )
+    runner = RefinementRunner(
+        scene=build_scene_bundle(),
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, build_stage_hparams()),
+        hparams=build_stage_hparams(),
+        renderer=FakeRenderer(),
+    )
+
+    try:
+        runner.run()
+    except RuntimeError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("Expected start_stage=stage2b without enable_stage2b to raise RuntimeError.")
+
+    assert "enable_stage2b" in message
+
+
+def test_restore_latest_state_rebuilds_adapter_when_state_and_ply_counts_differ(tmp_path) -> None:
+    """resume 时若 state 比 `.ply` 保留了更多高斯,应直接按 state 重建 adapter."""
+
+    run_config = build_run_config(
+        tmp_path,
+        start_stage="stage2b",
+        enable_stage2b=True,
+        stop_after="stage2b",
+        resume=True,
+    )
+    hparams = build_stage_hparams(
+        iters_stage2b=2,
+        lr_scale=0.1,
+        lr_means=0.05,
+        means_delta_cap=0.01,
+    )
+
+    restored_tensor = build_gaussian_adapter(num_points=20).to_tensor().detach().clone()
+    state_dir = Path(run_config.outdir) / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "stage_name": "stage3sr",
+            "iter_idx": 0,
+            "gaussians": restored_tensor,
+            "diagnostics_state": {"phase_reached": "stage3sr"},
+            "pose_delta": None,
+        },
+        state_dir / "latest.pt",
+    )
+
+    runner = RefinementRunner(
+        scene=build_scene_bundle(),
+        gaussians=build_gaussian_adapter(num_points=8),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=FakeRenderer(),
+    )
+
+    restored = runner.restore_latest_state()
+    assert restored is True
+    assert tuple(runner.gaussians.to_tensor().shape) == tuple(restored_tensor.shape)
+
+    summary = runner.run()
+
+    assert summary["start_stage"] == "stage2b"
+    assert summary["phase_reached"] == "stage2b"
+    assert summary["warm_start_stage2b"] is True
+    assert (run_config.outdir / "metrics_stage2b.json").exists()

@@ -349,6 +349,107 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
 - `--enable-pruning`
   - 这条主线已经验证过值得保留
 
+#### 2026-03-07 已验证通过的 direct-input 主基线 v1
+
+在确认 `FlashVSR-Pro` 视频本身正常后, 当前更推荐先用 direct inputs 固定一版 `Stage 3SR` 基线:
+
+```bash
+PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
+  --config configs/demo/lyra_static.yaml \
+  --gaussians outputs/demo/lyra_static/static_view_indices_fixed_5_0_1_2_3_4/lyra_static_demo_generated/gaussians_orig/gaussians_0.ply \
+  --pose-path assets/demo/static/diffusion_output_generated/3/pose/00172.npz \
+  --intrinsics-path assets/demo/static/diffusion_output_generated/3/intrinsics/00172.npz \
+  --rgb-path assets/demo/static/diffusion_output_generated/3/rgb/00172.mp4 \
+  --view-id 3 \
+  --frame-indices 0,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120 \
+  --reference-mode super_resolved \
+  --sr-scale 2.0 \
+  --reference-path outputs/flashvsr_reference/full_scale2x/3/rgb/00172.mp4 \
+  --start-stage stage2a \
+  --stage2a-mode enhanced \
+  --patch-size 256 \
+  --lambda-patch-rgb 0.25 \
+  --lambda-sampling-smooth 0.0005 \
+  --enable-pruning \
+  --iters-stage2a 60 \
+  --stop-after stage2a \
+  --outdir outputs/refine_v2/view3_stage3sr_real_sr_baseline_v1
+```
+
+这版命令已经验证成功, 关键结果为:
+
+- `phase_reached = stage3sr`
+- `stopped_reason = metrics_plateau`
+- `PSNR: 15.9834 -> 18.4991`
+- `residual_mean: 0.09453 -> 0.05571`
+- `sharpness: 0.002266 -> 0.004078`
+
+2026-03-07 后续复盘又发现一处 direct-input 相机契约问题:
+
+- `--pose-path` 提供的是 raw pose / `c2w` 风格 `pose.npz`
+- direct-input 路径必须在内部转换成 provider 一致的:
+  - `cam_view = inverse(c2w).T`
+- 修复后, 同一组主线参数重新验证输出为:
+  - `outputs/refine_v2/view3_stage3sr_real_sr_baseline_v1_fixed_cam_view`
+- 修复后关键结果:
+  - `phase_reached = stage3sr`
+  - `PSNR: 18.9714 -> 28.4424`
+  - `residual_mean: 0.06698 -> 0.01910`
+  - `sharpness: 0.002229 -> 0.005211`
+- `scale_tail_ratio: 0.01946 -> 0.00747`
+
+因此当前建议是:
+
+- 先把这组参数作为 `Stage 3SR` 的 SR 变体验证命令
+- 先不要急着继续 `Stage 2B`
+- 先检查:
+  - `metrics_phase3s.json`
+  - `metrics_stage3sr.json`
+  - `videos/final_render.mp4`
+  - `sr_selection_maps/`
+
+如果你的目标是比较“native reference”和“super-resolved reference”谁更好, 当前正式 baseline 应改按下面理解:
+
+- 正式 baseline:
+  - `outputs/refine_v2/view3_stage3sr_native_reference_v1_fixed_cam_view`
+- SR 变体:
+  - `outputs/refine_v2/view3_stage3sr_real_sr_baseline_v1_fixed_cam_view`
+- 说明:
+  - 后者目录名中的 `baseline` 是历史命名残留.
+  - 语义上不再把它当“正式 baseline”.
+
+在这个口径下, 后续已经完成一轮真实 `Stage 2B` 续跑:
+
+- 起点:
+  - `outputs/refine_v2/view3_stage3sr_native_reference_v1_fixed_cam_view`
+- 续跑结果:
+  - `outputs/refine_v2/view3_stage2b_from_native_reference_v1_fixed_cam_view_20260307_1248`
+- 结束状态:
+  - `phase_reached = stage2b`
+  - `warm_start_stage2b = true`
+- 相对 native baseline 的最终增益:
+  - `PSNR: 28.5179 -> 30.7697`
+  - `residual_mean: 0.018922 -> 0.014952`
+  - `sharpness: 0.005127 -> 0.006509`
+  - `scale_tail_ratio: 0.006442 -> 0.004440`
+  - `opacity_lowconf_ratio: 0.812334 -> 0.800099`
+- 结论:
+  - 当前 48G 主机上, native baseline 往下继续开 `Stage 2B` 是值得的
+  - 而且收益明显大于当前 “native vs SR reference” 的微小差异
+
+同一轮还补跑了:
+
+- `outputs/refine_v2/view3_stage2b_from_sr_reference_v1_fixed_cam_view_20260307_1301`
+
+结果说明:
+
+- `SR -> Stage 2B` 也能继续提升
+- 但当前最终仍是:
+  - native `Stage 2B` 在 `PSNR / residual_mean` 上更优
+  - SR `Stage 2B` 在 `sharpness` 上略优
+- 因此当前 runbook 的正式推荐主线,应固定为:
+  - `native baseline -> Stage 2B`
+
 ## 8. 阶段 D: Task A 结果检查
 
 ### 8.1 关键产物
