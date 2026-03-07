@@ -161,6 +161,25 @@ def _write_direct_camera_inputs(
     np.savez(intrinsics_path, data=intrinsics, inds=frame_inds)
 
 
+def _write_full_view_root_inputs(
+    root_path: Path,
+    view_id: str,
+    scene_stem: str,
+    frame_values: list[int],
+    size: tuple[int, int],
+) -> None:
+    """写一个 full-view root 所需的单 view 输入布局."""
+
+    rgb_dir = root_path / view_id / "rgb" / scene_stem
+    pose_path = root_path / view_id / "pose" / f"{scene_stem}.npz"
+    intrinsics_path = root_path / view_id / "intrinsics" / f"{scene_stem}.npz"
+
+    pose_path.parent.mkdir(parents=True, exist_ok=True)
+    intrinsics_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_reference_frames(rgb_dir, frame_values=frame_values, size=size)
+    _write_direct_camera_inputs(pose_path=pose_path, intrinsics_path=intrinsics_path, num_frames=len(frame_values))
+
+
 def test_standardize_batch_loads_external_reference_directory_and_aligns_indices(tmp_path) -> None:
     """外部 reference 目录如果提供完整时序,应按 selected_frame_indices 对齐."""
 
@@ -319,6 +338,113 @@ def test_build_scene_bundle_preserves_cam_view_inputs_without_double_conversion(
 
     expected_cam_view = torch.from_numpy(cam_view[[1, 3]]).float()
     assert torch.allclose(scene.cam_view[0], expected_cam_view)
+
+
+def test_build_scene_loader_overrides_respects_cli_view_ids_override(tmp_path) -> None:
+    """`--view-ids` 应该覆盖配置里的固定 view 列表."""
+
+    run_config = RefinementRunConfig(
+        config_path=tmp_path / "demo.yaml",
+        gaussians_path=tmp_path / "gaussians.ply",
+        outdir=tmp_path / "refine_out",
+        scene_index=0,
+        view_ids=["5", "0"],
+    )
+
+    overrides = _build_scene_loader_overrides(
+        {
+            "dataset_name": "lyra_static_demo_generated",
+            "static_view_indices_fixed": ["3"],
+        },
+        run_config,
+    )
+
+    assert overrides["static_view_indices_fixed"] == ["5", "0"]
+    assert overrides["num_input_multi_views"] == 2
+
+
+def test_build_scene_bundle_supports_full_view_root_inputs_with_config_view_fallback(tmp_path) -> None:
+    """full-view root inputs 在未显式传 `view_ids` 时,应回退到顶层配置里的顺序."""
+
+    scene_stem = "00172"
+    demo_config_path = tmp_path / "demo.yaml"
+    demo_config_path.write_text(
+        "dataset_name: lyra_static_demo_generated\nstatic_view_indices_fixed: ['5', '0']\n",
+        encoding="utf-8",
+    )
+
+    full_view_root = tmp_path / "full_view_root"
+    _write_full_view_root_inputs(full_view_root, view_id="5", scene_stem=scene_stem, frame_values=[10, 20, 30, 40], size=(6, 8))
+    _write_full_view_root_inputs(full_view_root, view_id="0", scene_stem=scene_stem, frame_values=[110, 120, 130, 140], size=(6, 8))
+
+    run_config = RefinementRunConfig(
+        config_path=demo_config_path,
+        gaussians_path=tmp_path / "gaussians.ply",
+        outdir=tmp_path / "refine_out",
+        scene_stem=scene_stem,
+        pose_root=full_view_root,
+        intrinsics_root=full_view_root,
+        rgb_root=full_view_root,
+        target_subsample=2,
+    )
+
+    scene = build_scene_bundle(run_config)
+
+    assert scene.view_id is None
+    assert scene.view_ids == ["5", "0"]
+    assert scene.frame_indices == [0, 2, 0, 2]
+    assert scene.file_name == scene_stem
+    assert scene.gt_images.shape == (1, 4, 3, 6, 8)
+    assert scene.cam_view.shape == (1, 4, 4, 4)
+    assert scene.intrinsics.shape == (1, 4, 4)
+    assert scene.reference_images is not None
+    assert scene.reference_images.shape == (1, 4, 3, 6, 8)
+
+    selected_values = scene.gt_images[:, :, 0, 0, 0].mul(255.0).round().to(dtype=torch.int64)
+    assert selected_values.tolist() == [[10, 30, 110, 130]]
+
+
+def test_build_scene_bundle_supports_full_view_reference_root(tmp_path) -> None:
+    """full-view root 模式应能从每个 view 的 reference root 组装 SR bundle."""
+
+    scene_stem = "00172"
+    demo_config_path = tmp_path / "demo.yaml"
+    demo_config_path.write_text("dataset_name: lyra_static_demo_generated\n", encoding="utf-8")
+
+    native_root = tmp_path / "native_root"
+    reference_root = tmp_path / "reference_root"
+    _write_full_view_root_inputs(native_root, view_id="5", scene_stem=scene_stem, frame_values=[10, 20, 30, 40], size=(6, 8))
+    _write_full_view_root_inputs(native_root, view_id="0", scene_stem=scene_stem, frame_values=[110, 120, 130, 140], size=(6, 8))
+    _write_reference_frames(reference_root / "5" / "rgb" / scene_stem, frame_values=[21, 41, 61, 81], size=(12, 16))
+    _write_reference_frames(reference_root / "0" / "rgb" / scene_stem, frame_values=[121, 141, 161, 181], size=(12, 16))
+
+    run_config = RefinementRunConfig(
+        config_path=demo_config_path,
+        gaussians_path=tmp_path / "gaussians.ply",
+        outdir=tmp_path / "refine_out",
+        scene_stem=scene_stem,
+        pose_root=native_root,
+        intrinsics_root=native_root,
+        rgb_root=native_root,
+        reference_root=reference_root,
+        view_ids=["5", "0"],
+        target_subsample=2,
+        reference_mode="super_resolved",
+        sr_scale=2.0,
+    )
+
+    scene = build_scene_bundle(run_config)
+
+    assert scene.view_ids == ["5", "0"]
+    assert scene.reference_mode == "super_resolved"
+    assert scene.sr_scale == 2.0
+    assert scene.reference_hw == (12, 16)
+    assert scene.reference_images is not None
+    assert scene.reference_images.shape == (1, 4, 3, 12, 16)
+    assert torch.allclose(scene.intrinsics_ref, scene.intrinsics * 2.0)
+
+    selected_reference_values = scene.reference_images[:, :, 0, 0, 0].mul(255.0).round().to(dtype=torch.int64)
+    assert selected_reference_values.tolist() == [[21, 61, 121, 161]]
 
 
 def test_build_scene_bundle_rejects_partial_direct_file_inputs(tmp_path) -> None:

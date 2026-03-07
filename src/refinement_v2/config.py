@@ -19,15 +19,21 @@ class RefinementRunConfig:
     config_path: Path
     gaussians_path: Path
     outdir: Path
+    scene_stem: str | None = None
     pose_path: Path | None = None
     intrinsics_path: Path | None = None
     rgb_path: Path | None = None
+    pose_root: Path | None = None
+    intrinsics_root: Path | None = None
+    rgb_root: Path | None = None
     scene_index: int = 0
     dataset_name: str | None = None
     view_id: str | None = None
+    view_ids: list[str] | None = None
     reference_mode: str = "native"
     sr_scale: float = 1.0
     reference_path: Path | None = None
+    reference_root: Path | None = None
     reference_intrinsics_path: Path | None = None
     frame_indices: list[int] | None = None
     target_subsample: int = 1
@@ -98,6 +104,17 @@ def _parse_frame_indices(raw_value: str | None) -> list[int] | None:
     return frame_indices or None
 
 
+def _parse_view_ids(raw_value: str | None) -> list[str] | None:
+    """把 `5,0,1,2,3,4` 这样的字符串转成 view id 列表."""
+
+    if raw_value is None or raw_value.strip() == "":
+        return None
+
+    items = [item.strip() for item in raw_value.split(",")]
+    view_ids = [item for item in items if item]
+    return view_ids or None
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建 CLI 参数解析器."""
 
@@ -108,6 +125,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True, help="Path to the scene config YAML.")
     parser.add_argument("--gaussians", required=True, help="Path to the initial gaussian PLY.")
     parser.add_argument("--outdir", required=True, help="Output directory for diagnostics and results.")
+    parser.add_argument(
+        "--scene-stem",
+        type=str,
+        default=None,
+        help="Optional scene stem used by the explicit full-view root inputs, e.g. 00172.",
+    )
     parser.add_argument(
         "--pose-path",
         type=str,
@@ -126,6 +149,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional direct RGB input path. Supports a frame directory or a local video file.",
     )
+    parser.add_argument(
+        "--pose-root",
+        type=str,
+        default=None,
+        help="Optional multi-view pose root. Expected layout: <root>/<view_id>/pose/<scene_stem>.npz.",
+    )
+    parser.add_argument(
+        "--intrinsics-root",
+        type=str,
+        default=None,
+        help="Optional multi-view intrinsics root. Expected layout: <root>/<view_id>/intrinsics/<scene_stem>.npz.",
+    )
+    parser.add_argument(
+        "--rgb-root",
+        type=str,
+        default=None,
+        help="Optional multi-view RGB root. Expected layout: <root>/<view_id>/rgb/<scene_stem>.mp4 or frame dir.",
+    )
     parser.add_argument("--scene-index", type=int, default=0, help="Scene index inside the test dataloader.")
     parser.add_argument(
         "--dataset-name",
@@ -134,6 +175,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional dataset registry override, e.g. lyra_static_demo_generated.",
     )
     parser.add_argument("--view-id", type=str, default=None, help="Optional logical view identifier.")
+    parser.add_argument(
+        "--view-ids",
+        type=str,
+        default=None,
+        help="Optional comma-separated multi-view identifiers, e.g. 5,0,1,2,3,4.",
+    )
     parser.add_argument(
         "--frame-indices",
         type=str,
@@ -158,6 +205,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional external reference source. Supports a frame directory or a local video file.",
+    )
+    parser.add_argument(
+        "--reference-root",
+        type=str,
+        default=None,
+        help="Optional multi-view external reference root. Expected layout: <root>/<view_id>/rgb/<scene_stem>.mp4 or frame dir.",
     )
     parser.add_argument(
         "--reference-intrinsics-path",
@@ -260,15 +313,21 @@ def load_effective_config_from_cli(
         config_path=Path(args.config),
         gaussians_path=Path(args.gaussians),
         outdir=Path(args.outdir),
+        scene_stem=args.scene_stem,
         pose_path=Path(args.pose_path) if args.pose_path else None,
         intrinsics_path=Path(args.intrinsics_path) if args.intrinsics_path else None,
         rgb_path=Path(args.rgb_path) if args.rgb_path else None,
+        pose_root=Path(args.pose_root) if args.pose_root else None,
+        intrinsics_root=Path(args.intrinsics_root) if args.intrinsics_root else None,
+        rgb_root=Path(args.rgb_root) if args.rgb_root else None,
         scene_index=args.scene_index,
         dataset_name=args.dataset_name,
         view_id=args.view_id,
+        view_ids=_parse_view_ids(args.view_ids),
         reference_mode=args.reference_mode,
         sr_scale=args.sr_scale,
         reference_path=Path(args.reference_path) if args.reference_path else None,
+        reference_root=Path(args.reference_root) if args.reference_root else None,
         reference_intrinsics_path=Path(args.reference_intrinsics_path) if args.reference_intrinsics_path else None,
         frame_indices=_parse_frame_indices(args.frame_indices),
         target_subsample=args.target_subsample,

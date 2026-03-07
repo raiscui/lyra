@@ -115,6 +115,7 @@ class RefinementRunner:
             frame_indices=scene.frame_indices,
             scene_index=scene.scene_index,
             view_id=scene.view_id,
+            view_ids=scene.view_ids,
             target_index=scene.target_index.to(device) if isinstance(scene.target_index, torch.Tensor) else scene.target_index,
             file_name=scene.file_name,
             reference_images=scene.reference_images.to(device) if isinstance(scene.reference_images, torch.Tensor) else scene.reference_images,
@@ -364,6 +365,7 @@ class RefinementRunner:
             frame_indices=self.scene.frame_indices,
             scene_index=self.scene.scene_index,
             view_id=self.scene.view_id,
+            view_ids=self.scene.view_ids,
             target_index=self.scene.target_index,
             file_name=self.scene.file_name,
             reference_images=reference_patch,
@@ -1015,6 +1017,7 @@ class RefinementRunner:
         return {
             "scene_id": self.scene.scene_index,
             "view_id": self.scene.view_id,
+            "view_ids": list(self.scene.view_ids) if self.scene.view_ids is not None else None,
             "start_stage": self.run_config.start_stage,
             "phase_reached": self.diagnostics_state.get("phase_reached", self.current_stage),
             "stopped_reason": override_stop_reason or self.controller.summarize_stop_reason(self.diagnostics_state),

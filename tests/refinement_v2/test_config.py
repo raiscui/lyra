@@ -18,13 +18,19 @@ def test_cli_mapping_uses_defaults() -> None:
     assert str(run_config.config_path) == "configs/demo/lyra_static.yaml"
     assert str(run_config.gaussians_path) == "outputs/demo/gaussians_0.ply"
     assert str(run_config.outdir) == "outputs/refine_v2/test"
+    assert run_config.scene_stem is None
     assert run_config.pose_path is None
     assert run_config.intrinsics_path is None
     assert run_config.rgb_path is None
+    assert run_config.pose_root is None
+    assert run_config.intrinsics_root is None
+    assert run_config.rgb_root is None
     assert run_config.scene_index == 0
     assert run_config.dataset_name is None
+    assert run_config.view_ids is None
     assert run_config.frame_indices is None
     assert run_config.reference_path is None
+    assert run_config.reference_root is None
     assert run_config.reference_intrinsics_path is None
     assert run_config.start_stage == "stage2a"
     assert run_config.stage2a_mode == "auto"
@@ -197,6 +203,40 @@ def test_cli_mapping_reads_direct_file_input_flags() -> None:
     assert str(run_config.pose_path) == "assets/demo/static/diffusion_output_generated/3/pose/00172.npz"
     assert str(run_config.intrinsics_path) == "assets/demo/static/diffusion_output_generated/3/intrinsics/00172.npz"
     assert str(run_config.rgb_path) == "assets/demo/static/diffusion_output_generated/3/rgb/00172.mp4"
+
+
+def test_cli_mapping_reads_full_view_root_flags() -> None:
+    """确认 full-view root inputs 能稳定映射到配置对象."""
+
+    run_config, _ = load_effective_config_from_cli(
+        [
+            "--config",
+            "configs/demo/lyra_static.yaml",
+            "--gaussians",
+            "outputs/demo/gaussians_0.ply",
+            "--outdir",
+            "outputs/refine_v2/test",
+            "--scene-stem",
+            "00172",
+            "--view-ids",
+            "5,0,1,2,3,4",
+            "--pose-root",
+            "assets/demo/static/diffusion_output_generated",
+            "--intrinsics-root",
+            "assets/demo/static/diffusion_output_generated",
+            "--rgb-root",
+            "assets/demo/static/diffusion_output_generated",
+            "--reference-root",
+            "outputs/flashvsr_reference/full_scale2x",
+        ]
+    )
+
+    assert run_config.scene_stem == "00172"
+    assert run_config.view_ids == ["5", "0", "1", "2", "3", "4"]
+    assert str(run_config.pose_root) == "assets/demo/static/diffusion_output_generated"
+    assert str(run_config.intrinsics_root) == "assets/demo/static/diffusion_output_generated"
+    assert str(run_config.rgb_root) == "assets/demo/static/diffusion_output_generated"
+    assert str(run_config.reference_root) == "outputs/flashvsr_reference/full_scale2x"
 
 
 def test_cli_mapping_reads_stage2b_regularizer_flags() -> None:

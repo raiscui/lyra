@@ -28,6 +28,7 @@ class SceneBundle:
     frame_indices: list[int]
     scene_index: int
     view_id: str | None
+    view_ids: list[str] | None = None
     target_index: torch.Tensor | None = None
     file_name: str | None = None
     reference_images: torch.Tensor | None = None
@@ -94,6 +95,40 @@ def _load_reference_frames(reference_path: Path) -> torch.Tensor:
     if reference_path.is_file():
         return _load_reference_frames_from_video(reference_path)
     raise FileNotFoundError(f"reference_path does not exist: {reference_path}")
+
+
+def _resolve_scene_asset_path(
+    root_path: Path,
+    view_id: str,
+    asset_dir_name: str,
+    scene_stem: str,
+    allowed_suffixes: tuple[str, ...],
+    allow_directory: bool = False,
+) -> Path:
+    """从 multi-view root 下解析某个 view 的场景资产路径."""
+
+    asset_dir = root_path / str(view_id) / asset_dir_name
+    if not asset_dir.exists():
+        raise FileNotFoundError(
+            f"Expected asset directory `{asset_dir_name}` for view `{view_id}` under {root_path}, "
+            f"but it does not exist."
+        )
+
+    if allow_directory:
+        candidate_directory = asset_dir / scene_stem
+        if candidate_directory.is_dir():
+            return candidate_directory
+
+    for suffix in allowed_suffixes:
+        candidate_path = asset_dir / f"{scene_stem}{suffix}"
+        if candidate_path.exists():
+            return candidate_path
+
+    available_candidates = sorted(path.name for path in asset_dir.iterdir())
+    raise FileNotFoundError(
+        f"Could not resolve scene `{scene_stem}` under {asset_dir}. "
+        f"Expected one of suffixes {allowed_suffixes}. Available entries: {available_candidates[:10]}"
+    )
 
 
 def _load_npz_array(npz_path: Path, preferred_keys: tuple[str, ...], tensor_name: str) -> np.ndarray:
@@ -217,6 +252,257 @@ def _validate_direct_input_triplet(run_config: RefinementRunConfig) -> bool:
             f"Missing: {', '.join(missing_names)}."
         )
     return True
+
+
+def _validate_multi_view_root_inputs(run_config: RefinementRunConfig) -> bool:
+    """校验 full-view root inputs 是否成套提供."""
+
+    rooted_inputs = {
+        "pose_root": run_config.pose_root,
+        "intrinsics_root": run_config.intrinsics_root,
+        "rgb_root": run_config.rgb_root,
+    }
+    provided = {name: path for name, path in rooted_inputs.items() if path is not None}
+    if not provided:
+        return False
+
+    if len(provided) != len(rooted_inputs):
+        missing_names = [name for name, path in rooted_inputs.items() if path is None]
+        raise ValueError(
+            "Full-view root inputs require --pose-root, --intrinsics-root and --rgb-root together. "
+            f"Missing: {', '.join(missing_names)}."
+        )
+
+    if run_config.scene_stem is None or str(run_config.scene_stem).strip() == "":
+        raise ValueError("Full-view root inputs require --scene-stem.")
+
+    if run_config.reference_path is not None and run_config.reference_root is not None:
+        raise ValueError("Please use either --reference-path or --reference-root, not both.")
+
+    if run_config.reference_intrinsics_path is not None and run_config.reference_root is not None:
+        raise ValueError(
+            "Full-view reference root mode does not support --reference-intrinsics-path yet. "
+            "Please omit it or stay on single-reference mode."
+        )
+    return True
+
+
+def _load_root_config_dict(config_path: Path) -> dict[str, Any]:
+    """读取 refinement 入口顶层配置,用于 root 模式的默认值解析."""
+
+    from omegaconf import OmegaConf
+
+    root_config = OmegaConf.load(str(config_path))
+    root_config_dict = OmegaConf.to_container(root_config, resolve=True)
+    if not isinstance(root_config_dict, dict):
+        raise TypeError("Top-level refinement config must resolve to a mapping.")
+    return root_config_dict
+
+
+def _resolve_requested_view_ids(
+    run_config: RefinementRunConfig,
+    root_config: dict[str, Any] | None = None,
+) -> list[str]:
+    """解析本轮需要参与联合优化的 view 列表."""
+
+    if run_config.view_ids:
+        return [str(item) for item in run_config.view_ids]
+    if run_config.view_id is not None:
+        return [str(run_config.view_id)]
+    if root_config is not None and root_config.get("static_view_indices_fixed") is not None:
+        return [str(item) for item in root_config.get("static_view_indices_fixed")]
+    raise ValueError(
+        "Could not resolve view ids for full-view root inputs. "
+        "Please pass --view-ids, --view-id, or define static_view_indices_fixed in the top-level config."
+    )
+
+
+def _slice_sequence_dim0(sequence: torch.Tensor, selected_frame_indices: list[int]) -> torch.Tensor:
+    """按时间维切一段 `[T, ...]` 序列."""
+
+    if not selected_frame_indices:
+        raise ValueError("selected_frame_indices must not be empty.")
+    index_tensor = torch.tensor(selected_frame_indices, dtype=torch.long)
+    return torch.index_select(sequence, dim=0, index=index_tensor)
+
+
+def _build_multi_view_root_scene_bundle(
+    run_config: RefinementRunConfig,
+    root_config: dict[str, Any],
+) -> SceneBundle | None:
+    """从显式 multi-view roots 构造 full-view `SceneBundle`."""
+
+    if not _validate_multi_view_root_inputs(run_config):
+        return None
+
+    assert run_config.pose_root is not None
+    assert run_config.intrinsics_root is not None
+    assert run_config.rgb_root is not None
+    assert run_config.scene_stem is not None
+
+    selected_view_ids = _resolve_requested_view_ids(run_config, root_config=root_config)
+    selected_frame_indices: list[int] | None = None
+
+    gt_sequences: list[torch.Tensor] = []
+    cam_view_sequences: list[torch.Tensor] = []
+    intrinsics_sequences: list[torch.Tensor] = []
+    reference_sequences: list[torch.Tensor] = []
+    intrinsics_ref_sequences: list[torch.Tensor] = []
+    flattened_frame_indices: list[int] = []
+
+    normalized_reference_mode = _normalize_reference_mode(run_config.reference_mode)
+    normalized_sr_scale = float(run_config.sr_scale)
+    native_hw: tuple[int, int] | None = None
+    reference_hw: tuple[int, int] | None = None
+
+    for view_id in selected_view_ids:
+        pose_path = _resolve_scene_asset_path(
+            root_path=run_config.pose_root,
+            view_id=view_id,
+            asset_dir_name="pose",
+            scene_stem=run_config.scene_stem,
+            allowed_suffixes=(".npz",),
+        )
+        intrinsics_path = _resolve_scene_asset_path(
+            root_path=run_config.intrinsics_root,
+            view_id=view_id,
+            asset_dir_name="intrinsics",
+            scene_stem=run_config.scene_stem,
+            allowed_suffixes=(".npz",),
+        )
+        rgb_path = _resolve_scene_asset_path(
+            root_path=run_config.rgb_root,
+            view_id=view_id,
+            asset_dir_name="rgb",
+            scene_stem=run_config.scene_stem,
+            allowed_suffixes=(".mp4", ".mov", ".avi", ".mkv"),
+            allow_directory=True,
+        )
+
+        rgb_frames = _load_reference_frames(rgb_path)
+        cam_view = _load_direct_pose_sequence(pose_path)
+        intrinsics = _load_direct_intrinsics_sequence(intrinsics_path)
+
+        frame_count_summary = {
+            "rgb": int(rgb_frames.shape[0]),
+            "pose": int(cam_view.shape[0]),
+            "intrinsics": int(intrinsics.shape[0]),
+        }
+        unique_lengths = set(frame_count_summary.values())
+        if len(unique_lengths) != 1:
+            raise ValueError(
+                "Full-view root inputs must share the same frame count inside each view. "
+                f"View `{view_id}` got {frame_count_summary}."
+            )
+
+        if selected_frame_indices is None:
+            selected_frame_indices = _normalize_frame_indices(
+                num_frames=int(rgb_frames.shape[0]),
+                frame_indices=run_config.frame_indices,
+                target_subsample=run_config.target_subsample,
+            )
+
+        rgb_frames = _slice_sequence_dim0(rgb_frames, selected_frame_indices)
+        cam_view = _slice_sequence_dim0(cam_view, selected_frame_indices)
+        intrinsics = _slice_sequence_dim0(intrinsics, selected_frame_indices)
+
+        gt_sequences.append(rgb_frames)
+        cam_view_sequences.append(cam_view)
+        intrinsics_sequences.append(intrinsics)
+        flattened_frame_indices.extend(selected_frame_indices)
+
+        current_native_hw = (int(rgb_frames.shape[-2]), int(rgb_frames.shape[-1]))
+        if native_hw is None:
+            native_hw = current_native_hw
+        elif current_native_hw != native_hw:
+            raise ValueError(
+                f"All full-view native inputs must share the same image size. "
+                f"Expected {native_hw}, got {current_native_hw} for view `{view_id}`."
+            )
+
+        if run_config.reference_root is None:
+            continue
+
+        reference_path = _resolve_scene_asset_path(
+            root_path=run_config.reference_root,
+            view_id=view_id,
+            asset_dir_name="rgb",
+            scene_stem=run_config.scene_stem,
+            allowed_suffixes=(".mp4", ".mov", ".avi", ".mkv"),
+            allow_directory=True,
+        )
+        reference_frames = _load_reference_frames(reference_path)
+        reference_frames = _select_external_sequence(reference_frames, selected_frame_indices, "reference images")
+        reference_frames = reference_frames.to(dtype=rgb_frames.dtype)
+
+        current_reference_hw = (int(reference_frames.shape[-2]), int(reference_frames.shape[-1]))
+        resolved_scale = _resolve_external_reference_scale(
+            native_hw=current_native_hw,
+            reference_hw=current_reference_hw,
+            reference_mode=normalized_reference_mode,
+            requested_sr_scale=run_config.sr_scale,
+        )
+
+        if reference_hw is None:
+            reference_hw = current_reference_hw
+            normalized_sr_scale = float(resolved_scale)
+        elif current_reference_hw != reference_hw:
+            raise ValueError(
+                f"All full-view references must share the same image size. "
+                f"Expected {reference_hw}, got {current_reference_hw} for view `{view_id}`."
+            )
+        elif abs(float(resolved_scale) - float(normalized_sr_scale)) > 1e-6:
+            raise ValueError(
+                f"All full-view references must share the same sr scale. "
+                f"Expected {normalized_sr_scale}, got {resolved_scale} for view `{view_id}`."
+            )
+
+        reference_sequences.append(reference_frames)
+        if normalized_reference_mode == "native":
+            intrinsics_ref_sequences.append(intrinsics.clone())
+        else:
+            intrinsics_ref_sequences.append(intrinsics * float(resolved_scale))
+
+    if selected_frame_indices is None:
+        raise RuntimeError("Failed to resolve selected_frame_indices for full-view root inputs.")
+    if native_hw is None:
+        raise RuntimeError("Failed to resolve native image size for full-view root inputs.")
+
+    gt_images = torch.cat(gt_sequences, dim=0).unsqueeze(0)
+    cam_view = torch.cat(cam_view_sequences, dim=0).unsqueeze(0)
+    intrinsics = torch.cat(intrinsics_sequences, dim=0).unsqueeze(0)
+
+    if run_config.reference_root is not None:
+        reference_images = torch.cat(reference_sequences, dim=0).unsqueeze(0)
+        intrinsics_ref = torch.cat(intrinsics_ref_sequences, dim=0).unsqueeze(0)
+        assert reference_hw is not None
+    else:
+        reference_images, intrinsics_ref, _, reference_hw, normalized_sr_scale = _build_reference_supervision(
+            gt_images=gt_images,
+            intrinsics=intrinsics,
+            reference_mode=normalized_reference_mode,
+            sr_scale=run_config.sr_scale,
+            selected_frame_indices=flattened_frame_indices,
+        )
+
+    effective_view_id = selected_view_ids[0] if len(selected_view_ids) == 1 else None
+    return SceneBundle(
+        gt_images=gt_images,
+        cam_view=cam_view,
+        intrinsics=intrinsics,
+        frame_indices=flattened_frame_indices,
+        scene_index=run_config.scene_index,
+        view_id=effective_view_id,
+        view_ids=selected_view_ids,
+        target_index=None,
+        file_name=run_config.scene_stem,
+        reference_images=reference_images,
+        intrinsics_ref=intrinsics_ref,
+        native_hw=native_hw,
+        reference_hw=reference_hw,
+        reference_mode=normalized_reference_mode,
+        sr_scale=float(normalized_sr_scale),
+    )
 
 
 def _build_direct_input_batch(run_config: RefinementRunConfig) -> dict[str, Any] | None:
@@ -556,7 +842,9 @@ def _build_scene_loader_overrides(
         overrides["target_index_subsample"] = int(root_config.get("target_index_subsample"))
 
     selected_view_ids = None
-    if run_config.view_id is not None:
+    if run_config.view_ids is not None:
+        selected_view_ids = [str(item) for item in run_config.view_ids]
+    elif run_config.view_id is not None:
         selected_view_ids = [str(run_config.view_id)]
     elif root_config.get("static_view_indices_fixed") is not None:
         selected_view_ids = [str(item) for item in root_config.get("static_view_indices_fixed")]
@@ -578,6 +866,7 @@ def standardize_batch(
     batch: dict[str, Any],
     scene_index: int,
     view_id: str | None = None,
+    view_ids: list[str] | None = None,
     frame_indices: list[int] | None = None,
     target_subsample: int = 1,
     reference_mode: str = "native",
@@ -630,6 +919,7 @@ def standardize_batch(
         frame_indices=selected_frame_indices,
         scene_index=scene_index,
         view_id=view_id,
+        view_ids=view_ids if view_ids is not None else ([view_id] if view_id is not None else None),
         target_index=target_index,
         file_name=file_name,
         reference_images=reference_images,
@@ -652,10 +942,7 @@ def _load_scene_config(run_config: RefinementRunConfig):
     from omegaconf import OmegaConf
     from src.models.utils.misc import load_and_merge_configs
 
-    root_config = OmegaConf.load(str(run_config.config_path))
-    root_config_dict = OmegaConf.to_container(root_config, resolve=True)
-    if not isinstance(root_config_dict, dict):
-        raise TypeError("Top-level refinement config must resolve to a mapping.")
+    root_config_dict = _load_root_config_dict(run_config.config_path)
 
     scene_config_paths = _resolve_scene_config_paths(run_config.config_path, root_config_dict)
     if len(scene_config_paths) == 1:
@@ -681,6 +968,7 @@ def build_scene_bundle(
             batch=batch,
             scene_index=run_config.scene_index,
             view_id=run_config.view_id,
+            view_ids=run_config.view_ids,
             frame_indices=run_config.frame_indices,
             target_subsample=run_config.target_subsample,
             reference_mode=run_config.reference_mode,
@@ -689,12 +977,19 @@ def build_scene_bundle(
             reference_intrinsics_path=run_config.reference_intrinsics_path,
         )
 
+    if any(path is not None for path in (run_config.pose_root, run_config.intrinsics_root, run_config.rgb_root)):
+        root_config_dict = _load_root_config_dict(run_config.config_path)
+        multi_view_root_scene = _build_multi_view_root_scene_bundle(run_config, root_config=root_config_dict)
+        if multi_view_root_scene is not None:
+            return multi_view_root_scene
+
     direct_input_batch = _build_direct_input_batch(run_config)
     if direct_input_batch is not None:
         return standardize_batch(
             batch=direct_input_batch,
             scene_index=run_config.scene_index,
             view_id=run_config.view_id,
+            view_ids=run_config.view_ids,
             frame_indices=run_config.frame_indices,
             target_subsample=run_config.target_subsample,
             reference_mode=run_config.reference_mode,
@@ -725,6 +1020,7 @@ def build_scene_bundle(
             batch=batch_item,
             scene_index=run_config.scene_index,
             view_id=run_config.view_id,
+            view_ids=run_config.view_ids,
             frame_indices=run_config.frame_indices,
             target_subsample=run_config.target_subsample,
             reference_mode=run_config.reference_mode,

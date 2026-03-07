@@ -66,6 +66,17 @@
     - `--pose-path` 当前应提供 raw pose / `c2w` 风格的 `pose.npz`
     - 脚本内部会自动转换成 provider 兼容的 `cam_view = inverse(c2w).T`
     - 如果 `npz` 已显式使用 `cam_view` key,则不会再次转换
+- full-view root inputs v1
+  - `--scene-stem`
+  - `--view-ids`
+  - `--pose-root`
+  - `--intrinsics-root`
+  - `--rgb-root`
+  - `--reference-root`
+  - 注意:
+    - 这条模式不是“每个 view 各跑一遍”
+    - loader 会把多个 view 的 observation 按 `view-major` 顺序展平成同一个 `SceneBundle`
+    - `runner` 仍保持当前 5D `[B, N, C, H, W]` 契约,不需要把 patch 主逻辑改成 6D
 
 这些能力都从同一个脚本进入:
 
@@ -244,6 +255,107 @@ PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
 - 仍然是同一个 `scripts/refine_robust_v2.py`
 - 不是新程序
 - 只是 `build_scene_bundle(...)` 不再强依赖 provider / dataloader
+
+### 5.3 如果你现在要做的是 full-view 联合优化, 更推荐走 root mode
+
+这里说的 full-view, 是像 `sample.py` 一样:
+
+- 所有视频一起参与
+- 共同优化一个 gaussian scene
+- 不是把每个 view 单独跑完再人工比较
+
+当前第一版已经支持显式 root inputs:
+
+- `--scene-stem`
+- `--view-ids`
+- `--pose-root`
+- `--intrinsics-root`
+- `--rgb-root`
+- 可选 `--reference-root`
+
+当前 48G 主机上, 推荐先固定:
+
+- `--target-subsample 16`
+- 也就是 `8 frames/view * 6 views = 48 observations`
+
+已经验证过的边界是:
+
+- `--target-subsample 8`
+- 即 `96 observations`
+- 在 full-view `Stage 2A` 上会 OOM
+
+所以当前更稳妥的做法不是继续硬顶 observation 密度,而是先把 `48 observations` 这档 full-view native / SR 流程固定成主基线.
+
+如果你要先补齐 all-view `FlashVSR-Pro` reference, 可以直接跑:
+
+```bash
+PYTHONPATH="$(pwd)" pixi run python3 scripts/run_flashvsr_reference.py \
+  --input-root assets/demo/static/diffusion_output_generated \
+  --output-root outputs/flashvsr_reference \
+  --flashvsr-repo /workspace/FlashVSR-Pro \
+  --runner local \
+  --local-python /usr/local/miniconda3/envs/flashvsr/bin/python3 \
+  --view-ids 5,0,1,2,3,4 \
+  --scene-stem 00172 \
+  --mode full \
+  --debug-every 8
+```
+
+full-view native smoke:
+
+```bash
+PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
+  --config configs/demo/lyra_static.yaml \
+  --gaussians outputs/demo/lyra_static/static_view_indices_fixed_5_0_1_2_3_4/lyra_static_demo_generated/gaussians_orig/gaussians_0.ply \
+  --scene-stem 00172 \
+  --view-ids 5,0,1,2,3,4 \
+  --pose-root assets/demo/static/diffusion_output_generated \
+  --intrinsics-root assets/demo/static/diffusion_output_generated \
+  --rgb-root assets/demo/static/diffusion_output_generated \
+  --target-subsample 16 \
+  --iters-stage2a 2 \
+  --save-every 1 \
+  --stop-after stage2a \
+  --outdir outputs/refine_v2/full_view_native_stage2a_smoke_sub16
+```
+
+full-view SR smoke:
+
+```bash
+PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
+  --config configs/demo/lyra_static.yaml \
+  --gaussians outputs/demo/lyra_static/static_view_indices_fixed_5_0_1_2_3_4/lyra_static_demo_generated/gaussians_orig/gaussians_0.ply \
+  --scene-stem 00172 \
+  --view-ids 5,0,1,2,3,4 \
+  --pose-root assets/demo/static/diffusion_output_generated \
+  --intrinsics-root assets/demo/static/diffusion_output_generated \
+  --rgb-root assets/demo/static/diffusion_output_generated \
+  --reference-root outputs/flashvsr_reference/full_scale2x \
+  --reference-mode super_resolved \
+  --sr-scale 2.0 \
+  --target-subsample 16 \
+  --stage2a-mode enhanced \
+  --patch-size 256 \
+  --lambda-patch-rgb 0.25 \
+  --lambda-sampling-smooth 0.0005 \
+  --enable-pruning \
+  --iters-stage2a 1 \
+  --save-every 1 \
+  --stop-after stage2a \
+  --outdir outputs/refine_v2/full_view_sr_stage3sr_smoke_sub16
+```
+
+这两条命令都已经做过真实验证:
+
+- full-view native:
+  - `phase_reached = stage2a`
+  - `psnr = 19.4572 -> 20.3172`
+  - `residual_mean = 0.063859 -> 0.055581`
+- full-view SR:
+  - `phase_reached = stage3sr`
+  - `psnr = 19.4572 -> 20.3172`
+  - `residual_mean = 0.063859 -> 0.055581`
+  - `sr_selection_mean = 0.127218`
 
 ---
 
@@ -756,7 +868,14 @@ outdir/
 3. 再加 `--reference-path` 比较差异
 4. 如果外部视频不是纯放大,补 `--reference-intrinsics-path`
 
-### 路线 3: 继续增量细化
+### 路线 3: full-view 联合优化一个 gaussian scene
+
+1. 先确认你要的是“所有视频一起优化一个场景”, 不是逐个 view 单独评估
+2. 用 `--scene-stem + --view-ids + --pose-root + --intrinsics-root + --rgb-root` 组装 full-view `SceneBundle`
+3. 如果要接入超分, 先为所有 view 生成 `reference-root`
+4. 当前 48G 主机先固定 `--target-subsample 16`
+
+### 路线 4: 继续增量细化
 
 1. 先拿到 `gaussians_stage2a.ply`
 2. 用 `--start-stage stage2b` 续跑
@@ -809,6 +928,52 @@ PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
   --enable-stage2b \
   --enable-pose-diagnostic \
   --enable-joint-fallback
+```
+
+### 4) 如果你当前主任务是 full-view 联合优化
+
+先跑 native smoke:
+
+```bash
+PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
+  --config configs/demo/lyra_static.yaml \
+  --gaussians outputs/demo/lyra_static/static_view_indices_fixed_5_0_1_2_3_4/lyra_static_demo_generated/gaussians_orig/gaussians_0.ply \
+  --scene-stem 00172 \
+  --view-ids 5,0,1,2,3,4 \
+  --pose-root assets/demo/static/diffusion_output_generated \
+  --intrinsics-root assets/demo/static/diffusion_output_generated \
+  --rgb-root assets/demo/static/diffusion_output_generated \
+  --target-subsample 16 \
+  --iters-stage2a 2 \
+  --save-every 1 \
+  --stop-after stage2a \
+  --outdir outputs/refine_v2/full_view_native_stage2a_smoke_sub16
+```
+
+如果你还要比较 external SR, 再补:
+
+```bash
+PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
+  --config configs/demo/lyra_static.yaml \
+  --gaussians outputs/demo/lyra_static/static_view_indices_fixed_5_0_1_2_3_4/lyra_static_demo_generated/gaussians_orig/gaussians_0.ply \
+  --scene-stem 00172 \
+  --view-ids 5,0,1,2,3,4 \
+  --pose-root assets/demo/static/diffusion_output_generated \
+  --intrinsics-root assets/demo/static/diffusion_output_generated \
+  --rgb-root assets/demo/static/diffusion_output_generated \
+  --reference-root outputs/flashvsr_reference/full_scale2x \
+  --reference-mode super_resolved \
+  --sr-scale 2.0 \
+  --target-subsample 16 \
+  --stage2a-mode enhanced \
+  --patch-size 256 \
+  --lambda-patch-rgb 0.25 \
+  --lambda-sampling-smooth 0.0005 \
+  --enable-pruning \
+  --iters-stage2a 1 \
+  --save-every 1 \
+  --stop-after stage2a \
+  --outdir outputs/refine_v2/full_view_sr_stage3sr_smoke_sub16
 ```
 
 ---

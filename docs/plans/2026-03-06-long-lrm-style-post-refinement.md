@@ -53,7 +53,7 @@
 当前验证状态:
 
 - `PYTHONPATH="$(pwd)" pytest -q tests/refinement_v2`
-- 结果是 `78 passed`
+- 结果是 `82 passed`
 
 当前在主线里新增并已落地的能力:
 
@@ -63,6 +63,19 @@
   - `--rgb-path`
 - `build_scene_bundle(...)` 现在既能走 provider 模式
 - 也能直接从本地 `pose / intrinsics / rgb` 文件组装 `SceneBundle`
+- full-view root inputs v1
+  - `--scene-stem`
+  - `--view-ids`
+  - `--pose-root`
+  - `--intrinsics-root`
+  - `--rgb-root`
+  - `--reference-root`
+- `build_scene_bundle(...)` 现在也能从显式 multi-view roots 组装一个 full-view `SceneBundle`
+- 组装策略是:
+  - 保留 runner 当前 5D 输入
+  - 在 loader 层按 `view-major` 展平 observation 轴
+- `SceneBundle` 现在会保留:
+  - `view_ids`
 
 因此, 这份文档接下来更适合承担两件事:
 
@@ -114,6 +127,14 @@
   - `native_frames/`
   - `sr_frames/`
   - `compare_frames/`
+- 补充的 full-view 验证也已完成:
+  - `00172` 的 6 路 `FlashVSR` reference 都已生成
+  - 输出位于:
+    - `outputs/flashvsr_reference/full_scale2x/<view>/rgb/00172.mp4`
+  - full-view SR smoke 已真实跑到:
+    - `phase_reached = stage3sr`
+    - `target_subsample = 16`
+    - `48 observations`
 - 已完成真实 `SR vs native` 单变量对比:
   - `native_stage3sr`
     - `PSNR = 28.5179`
@@ -155,36 +176,63 @@
   - 也不是 direct-input `cam_view` 契约没修好
   - 当前更像是 selective SR 默认超参数还没有把外部 SR 价值真正吃满
 
-### Continuation Task B: 打通 full direct file inputs
+### Continuation Task B: 打通 full-view 联合优化的 root inputs
 
-**Status (2026-03-06):**
+**Status (2026-03-07 最新):**
 
-- 第一版已完成
+- 第一版已经完成并做过真实资产验证
 - 当前同一个 `scripts/refine_robust_v2.py` 入口已经支持:
-  - `--pose-path`
-  - `--intrinsics-path`
-  - `--rgb-path`
-- 当前 `build_scene_bundle(...)` 已支持在不依赖 provider 的情况下直接构造 `SceneBundle`
+  - `--scene-stem`
+  - `--view-ids`
+  - `--pose-root`
+  - `--intrinsics-root`
+  - `--rgb-root`
+  - `--reference-root`
+- 当前 `build_scene_bundle(...)` 已支持:
+  - single-view direct file inputs
+  - full-view native root inputs
+  - full-view external SR reference root inputs
+- 实现策略已经定住:
+  - 不改 runner 的 5D 输入面
+  - 在 loader 层做 full-view bundle flatten
+  - `SceneBundle` 额外保留 `view_ids`
+- 真实 full-view 验证结果:
+  - native `phase0` dry-run 通过
+  - native `Stage 2A` smoke 成功
+  - SR `Stage 3SR` smoke 成功
+- 当前 48G 主机上的推荐 observation 体量:
+  - `target_subsample = 16`
+  - 即 `8 frames/view * 6 views = 48 observations`
+- 已确认的边界:
+  - `target_subsample = 8`
+  - 即 `96 observations`
+  - 会在 full-view `Stage 2A` 上 OOM
 
 **Why:**
 
-- 当前 external reference contract 已经有了
-- 但仍然比较依赖现有 provider / scene config 形状
-- 如果后续要更自由地吃外部视频链路, 还需要把 direct file inputs 补齐
+- 用户当前真正要的不是“每个 view 单独评估”
+- 而是所有视频一起参与, 联合优化一个 gaussian scene
+- 在这个前提下,full-view joint bundle 比继续单 view 调参更优先
 
-**Focus:**
+**Focus(剩余工作):**
 
-- 评估并补齐:
-  - `--pose-path`
-  - `--intrinsics-path`
-  - `--rgb-path`
-- 目标不是另开新入口
-- 而是在 `scripts/refine_robust_v2.py` 这同一个 CLI 下,允许不完全依赖 provider
+- 把 full-view 基线文档和命令收口到统一口径
+- 在当前 `48 observations` 档位上继续做:
+  - native vs SR 的更长 smoke
+  - 需要时再接 `Stage 2B`
+- 更大 observation 密度留到:
+  - A100
+  - 或多卡
 
-**Done when:**
+**Done when(当前轮):**
 
-- 同一条 v2 主线既能走 provider 模式
-- 也能走 direct file inputs 模式
+- 同一条 v2 主线已经能走:
+  - provider 模式
+  - direct file inputs 模式
+  - full-view root mode
+- 当前 full-view 推荐基线已经明确写成:
+  - `target_subsample = 16`
+  - `48 observations`
 
 ### Continuation Task C: 收敛 stage 命名与使用文档
 
@@ -268,6 +316,179 @@
 下面的 `Task 1 ~ Task 10` 保留为这份文档最初形成时的历史任务拆解.
 它们有的已经落地, 有的已经被当前代码状态覆盖.
 保留它们是为了追溯思路, 不是为了把后续工作重新理解成“另起一条路线”.
+
+## Closest-to-SplatSuRe Track
+
+如果后续明确选择“最接近 SplatSuRe 的版本”, 当前建议不要继续在现有 `single-hotspot patch SR` 上小修小补.
+更接近论文原意的实现,应该一次性把下面这几件事补齐:
+
+### Track Goal
+
+把当前的:
+
+- native render 主输出
+- selective SR patch 辅助项
+
+推进成更接近 SplatSuRe 的:
+
+- HR render 主输出
+- 全图 LR consistency
+- 全图 selective SR weighted supervision
+
+### Gap Summary
+
+当前和 SplatSuRe 的关键差异有 6 个:
+
+1. 当前最终 render 仍是 native 分辨率,不是 HR 主输出
+2. 当前 SR supervision 只落在每视角单个 hotspot patch
+3. 当前 `sr_selection_map` 动态范围偏弱,没有像官方实现那样形成强监督区域
+4. 当前 `W_final_sr = W_robust * W_sr_select` 过于保守
+5. 当前 `Stage 3SR` 不动 geometry,也不和 densify 主循环耦合
+6. 当前 fidelity score 还是 render-meta 代理,还不是论文中的跨视角 `min/max radii ratio`
+
+### Phase A: 真正复刻 Gaussian Fidelity Score
+
+目标:
+
+- 不再只依赖单轮 render meta 的代理量
+- 而是像 SplatSuRe 一样,在全部训练视角上统计:
+  - `r_min`
+  - `r_max`
+  - `argmax_view`
+  - `num_times_seen`
+
+要点:
+
+- fidelity score 应直接基于:
+  - `rho = r_max / r_min`
+- 至少保留:
+  - `ratio_threshold`
+  - 平滑参数 `k`
+  - `num_times_seen < 3 -> score = 0`
+- 对每个训练视角额外记录:
+  - 哪些高斯的最大半径恰好出现在该视角
+
+完成标志:
+
+- 当前 `phase3s` 不再只是“第一版代理实现”
+- 而是能生成真正接近 SplatSuRe 的:
+  - per-Gaussian fidelity
+  - per-view max-view mask
+
+### Phase B: 从单 patch 升级到全图 weighted SR supervision
+
+目标:
+
+- 去掉“每视角只取一个 residual hotspot patch”的限制
+- 改成整张 HR reference 图上的逐像素加权监督
+
+要点:
+
+- 不再由:
+  - `sample_patch_windows()`
+  决定 SR 的有效区域
+- 而是直接使用:
+  - `W_sr_select`
+  在整张 HR 图上形成 loss
+- 如果显存不允许一次整图:
+  - 也应该是“按全图权重图切多个 patch”
+  - 不是单个 patch
+
+完成标志:
+
+- SR loss 的覆盖范围由选择图决定
+- 而不是由单个热点裁剪窗口决定
+
+### Phase C: 引入真正的 LR-SR 联合目标
+
+目标:
+
+- 像 SplatSuRe 一样:
+  - HR render 对 HR/SR 图像做选择性监督
+  - 同时把 HR render 下采样后,与原 LR/native 图像做全图一致性约束
+
+要点:
+
+- 新目标应更接近:
+  - `L = gamma * L_sr + (1 - gamma) * L_lr`
+- 这里的 `L_lr` 不该是当前 residual-based robust native loss 的完全替代
+- 更接近论文的版本是:
+  1. 直接从 HR render 下采样到 native 分辨率
+  2. 对 downsampled render 和 native GT 做全图 photometric / SSIM 约束
+  3. HR render 再对 SR reference 做加权损失
+
+完成标志:
+
+- 当前主训练目标不再是“native 主目标 + SR patch 旁路”
+- 而是“HR 主输出 + LR consistency + selective SR”
+
+### Phase D: 让最终输出真的成为 HR 输出
+
+目标:
+
+- 最终 `final_render.mp4` 不再停留在 native 分辨率
+- 而是能直接输出 reference 尺度的 HR render
+
+要点:
+
+- 当前 `self.scene` 仍是 native 场景
+- 需要明确区分:
+  - native scene
+  - hr scene
+- 最终指标也需要拆开:
+  - native-space metrics
+  - hr-space metrics
+
+完成标志:
+
+- 最终产物默认至少包含:
+  - native render
+  - hr render
+- 并能直接回答:
+  - 这轮优化到底有没有提升高分输出
+
+### Phase E: 允许 SR 真正改变结构,而不只是改纹理
+
+目标:
+
+- 让 SR 信息可以对 geometry 产生有限但真实的影响
+
+要点:
+
+- 当前 `Stage 3SR` 只训练:
+  - `opacity`
+  - `scales`
+  - `colors`
+- 更接近 SplatSuRe / 3DGS 主训练形态的版本,至少要评估两条路:
+  1. 在 SR 阶段允许有限 geometry 更新
+  2. 把 SR 阶段和 densify / prune 更紧地耦合
+
+完成标志:
+
+- SR 信息不再只表现为轻微锐度增益
+- 而能在某些结构缺失区带来更明显的可见收益
+
+### Recommended Execution Order
+
+如果真要做“最接近 SplatSuRe”的版本, 当前推荐顺序是:
+
+1. Phase A: fidelity / max-view mask 先做真
+2. Phase B: 从单 patch 升级到全图 weighted SR
+3. Phase C: 补 `HR render + LR downsample consistency`
+4. Phase D: 让最终导出支持 HR render
+5. Phase E: 最后再评估 geometry / densify 的耦合
+
+### Practical Warning
+
+这条路线的侵入性明显高于当前主线.
+它不是“再调几个超参数”就能得到的.
+
+但如果目标真的是:
+
+- 最大限度复刻 SplatSuRe 的方法论
+- 让 external SR 真正成为高分主监督
+
+那它就是当前最正确的方向.
 
 ---
 
@@ -1206,16 +1427,17 @@ git commit -s -m "feat: add dry run validation for post refinement"
 如果从今天的代码现实继续往前走, 推荐顺序不再是重跑下面的 `Task 1 ~ Task 10`.
 而是:
 
-1. 先完成 `Continuation Task B` 的真实资产验证与文档收口
-   - direct file inputs 第一版代码已经落地
-   - 现在更值得把它稳定成正式使用路径
-2. 再做 `Continuation Task D`
-   - 把 `Stage 3SR -> Stage 2B` 的衔接策略调稳
+1. 先把 `Continuation Task B` 收口成当前正式 full-view 使用路径
+   - full-view root mode 已经落地
+   - 当前更值得把 `48 observations` 这档主基线稳定下来
+2. 再在 full-view 口径下继续做 `Continuation Task D`
+   - 评估是否值得进入更长的 `Stage 2B`
+   - 如需更大 observation 密度,迁移到 A100 / 多卡
 3. 然后按需要回到 `Continuation Task A`
-   - 不是再验证“有没有接上 SR”
-   - 而是继续调 selective SR, 争取让 SR 路线真正超过 native
-4. 最后完成 `Continuation Task C`
-   - 把术语、usage 和 diagnostics 文档彻底收口
+   - 不是再证明“SR 有没有接上”
+   - 而是继续调 selective SR,争取让 full-view SR 真正超过 native
+4. 最后继续推进 `Closest-to-SplatSuRe Track`
+   - 只在 full-view 基线已经稳定之后再做高侵入改造
 
 ## Historical Execution Order
 
@@ -1249,7 +1471,7 @@ git commit -s -m "feat: add dry run validation for post refinement"
 
 ## 一句话继续顺序
 
-先固定 `native baseline -> Stage 2B` 为当前正式主线, 再回头继续调 selective SR 争取让 external SR 真正超过 native, 然后补 direct file inputs, 最后把所有术语和 usage 文档彻底收口.
+先把 full-view joint baseline 固定为当前正式入口, 在 48G 上先用 `target_subsample = 16` 稳定跑通 native / SR, 再视硬件条件继续放大 observation 密度或进入更接近 SplatSuRe 的高侵入改造.
 
 ---
 
