@@ -83,6 +83,28 @@ class WeightBuilder:
             "weight_std": float(weight_map.std().item()),
         }
 
+    def _canonicalize_screen_radii(self, radii: torch.Tensor | None) -> torch.Tensor | None:
+        """把 renderer 返回的投影半径统一压成标量半径.
+
+        当前代码最初按 `[B, V, N]` 理解 `radii`.
+        但真实 `gsplat`/本仓库渲染链路里,它可能已经是 `[B, V, N, 2]`,
+        表示屏幕空间两个主切向方向上的投影半径.
+
+        这里保守地取 `amax(dim=-1)`:
+        - 可见性判断保持“任一方向有支撑就算可见”
+        - 扩张 kernel 也更偏保守,不容易把真实支撑低估掉
+        """
+
+        if not isinstance(radii, torch.Tensor):
+            return None
+
+        radii = radii.detach().float()
+        if radii.ndim == 4 and radii.shape[-1] == 2:
+            return radii.amax(dim=-1)
+        if radii.ndim == 4 and radii.shape[-1] == 1:
+            return radii.squeeze(-1)
+        return radii
+
     def compute_gaussian_fidelity_score(
         self,
         render_meta: dict[str, torch.Tensor] | None,
@@ -105,7 +127,9 @@ class WeightBuilder:
         if not all(isinstance(item, torch.Tensor) for item in [radii, opacities, tiles_per_gauss]):
             return None
 
-        radii = radii.detach().float()
+        radii = self._canonicalize_screen_radii(radii)
+        if radii is None:
+            return None
         opacities = opacities.detach().float()
         tiles_per_gauss = tiles_per_gauss.detach().float()
 
@@ -167,7 +191,9 @@ class WeightBuilder:
             return None
 
         means2d = means2d.detach().float()
-        radii = radii.detach().float()
+        radii = self._canonicalize_screen_radii(radii)
+        if radii is None:
+            return None
         opacities = opacities.detach().float()
         fidelity_score = fidelity_score.detach().float()
 

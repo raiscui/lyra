@@ -47,7 +47,7 @@ def test_build_sr_selection_weight_projects_low_fidelity_gaussians_to_reference_
     fidelity_score = torch.tensor([[0.1, 0.95]], dtype=torch.float32)
     render_meta = {
         "means2d": torch.tensor([[[[1.0, 1.0], [3.0, 3.0]]]], dtype=torch.float32),
-        "radii": torch.tensor([[[1.2, 1.0]]], dtype=torch.float32),
+        "radii": torch.tensor([[[[1.2, 1.0], [1.0, 0.8]]]], dtype=torch.float32),
         "opacities": torch.tensor([[[0.9, 0.9]]], dtype=torch.float32),
     }
 
@@ -63,6 +63,24 @@ def test_build_sr_selection_weight_projects_low_fidelity_gaussians_to_reference_
     assert float(selection_map.mean().item()) > 0.0
     assert not torch.allclose(selection_map, torch.ones_like(selection_map))
     assert float(selection_map[0, 0, 0, 2, 2].item()) > float(selection_map[0, 0, 0, 6, 6].item())
+
+
+def test_compute_gaussian_fidelity_score_supports_vector_radii() -> None:
+    """真实 renderer 若返回双轴半径, 也应能正常产出 fidelity."""
+
+    builder = WeightBuilder()
+    render_meta = {
+        "radii": torch.tensor([[[[1.2, 0.8], [0.0, 0.0]]]], dtype=torch.float32),
+        "opacities": torch.tensor([[[0.9, 0.6]]], dtype=torch.float32),
+        "tiles_per_gauss": torch.tensor([[[3.0, 1.0]]], dtype=torch.float32),
+    }
+
+    fidelity = builder.compute_gaussian_fidelity_score(render_meta)
+
+    assert fidelity is not None
+    assert fidelity.shape == (1, 2)
+    assert float(fidelity[0, 0].item()) > 0.0
+    assert float(fidelity[0, 1].item()) == 0.0
 
 
 def test_combine_sr_weights_multiplies_robust_and_selection_maps() -> None:

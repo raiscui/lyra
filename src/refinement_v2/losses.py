@@ -24,6 +24,24 @@ class LossSummary:
     loss_pose_smooth: torch.Tensor | None = None
 
 
+def _canonicalize_screen_radii(radii: torch.Tensor | None) -> torch.Tensor | None:
+    """把投影半径统一压成可供损失项消费的标量半径.
+
+    真实 renderer 现在可能返回 `[B, V, N, 2]` 的双轴半径.
+    `sampling_smooth` 原来按 `[B, V, N]` 实现,这里先做兼容归一.
+    """
+
+    if not isinstance(radii, torch.Tensor):
+        return None
+
+    radii = radii.float()
+    if radii.ndim == 4 and radii.shape[-1] == 2:
+        return radii.amax(dim=-1)
+    if radii.ndim == 4 and radii.shape[-1] == 1:
+        return radii.squeeze(-1)
+    return radii
+
+
 def compute_weighted_rgb_loss(
     pred_rgb: torch.Tensor,
     gt_rgb: torch.Tensor,
@@ -79,7 +97,9 @@ def compute_sampling_smooth_loss(
     if not isinstance(radii, torch.Tensor) or not isinstance(opacities, torch.Tensor):
         return torch.zeros((), dtype=scales.dtype, device=scales.device)
 
-    radii = radii.float()
+    radii = _canonicalize_screen_radii(radii)
+    if radii is None:
+        return torch.zeros((), dtype=scales.dtype, device=scales.device)
     opacities = opacities.float()
     if radii.ndim == 2:
         radii = radii.unsqueeze(0)

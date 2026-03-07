@@ -43,7 +43,10 @@ def test_sampling_smooth_loss_penalizes_small_scale_low_fidelity_gaussians() -> 
     scales = torch.tensor([[0.1, 0.1, 0.1], [0.5, 0.4, 0.4]], dtype=torch.float32)
     fidelity_score = torch.tensor([[0.1, 0.9]], dtype=torch.float32)
     render_meta = {
-        "radii": torch.tensor([[[0.3, 2.2], [0.4, 2.0]]], dtype=torch.float32),
+        "radii": torch.tensor(
+            [[[[0.3, 0.2], [2.2, 2.0]], [[0.4, 0.3], [2.0, 1.8]]]],
+            dtype=torch.float32,
+        ),
         "opacities": torch.tensor([[[0.9, 0.9], [0.8, 0.8]]], dtype=torch.float32),
     }
 

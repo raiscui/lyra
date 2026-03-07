@@ -52,11 +52,12 @@ class MetaRecordingRenderer(RecordingRenderer):
         batch_size, num_gaussians, _ = gaussians.shape
         num_views = scene.gt_images.shape[1]
         height, width = scene.gt_images.shape[-2:]
-        radii = (
+        radii_scalar = (
             torch.linspace(1.0, 2.0, steps=num_gaussians, dtype=gaussians.dtype)
             .view(1, 1, num_gaussians)
             .repeat(batch_size, num_views, 1)
         )
+        radii = torch.stack([radii_scalar, radii_scalar * 0.8], dim=-1)
         tiles_per_gauss = (
             torch.linspace(2.0, 4.0, steps=num_gaussians, dtype=gaussians.dtype)
             .view(1, 1, num_gaussians)
@@ -245,6 +246,7 @@ def test_phase3s_builds_fidelity_summary_from_render_meta(tmp_path) -> None:
     assert metrics["fidelity_mean"] > 0.0
     assert metrics["sr_selection_mean"] > 0.0
     assert runner.diagnostics_state["phase3s_completed"] is True
+    assert "warnings" not in runner.diagnostics_state
     assert runner.sr_selection_map is not None
     assert not torch.allclose(runner.sr_selection_map, torch.ones_like(runner.sr_selection_map))
     assert (run_config.outdir / "metrics_phase3s.json").exists()
@@ -280,5 +282,5 @@ def test_stage3sr_records_sampling_smooth_loss_metric(tmp_path) -> None:
     stage3sr_metrics = json.loads((run_config.outdir / "metrics_stage3sr.json").read_text(encoding="utf-8"))
 
     assert "loss_sampling_smooth" in metrics
-    assert metrics["loss_sampling_smooth"] >= 0.0
+    assert metrics["loss_sampling_smooth"] > 0.0
     assert "loss_sampling_smooth" in stage3sr_metrics[-1]
