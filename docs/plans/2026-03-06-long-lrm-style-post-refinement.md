@@ -53,7 +53,7 @@
 当前验证状态:
 
 - `PYTHONPATH="$(pwd)" pytest -q tests/refinement_v2`
-- 结果是 `62 passed`
+- 结果是 `78 passed`
 
 当前在主线里新增并已落地的能力:
 
@@ -101,56 +101,59 @@
 
 ### Continuation Task A: 用真实外部 SR reference 做一轮系统验证
 
-**Status (2026-03-07):**
+**Status (2026-03-07 最新):**
 
-- 逻辑上可继续
-- 当前已补出 `scripts/run_flashvsr_reference.py`,用于把 `FlashVSR-Pro` 正式接入现有流程
-- 当前推荐顺序不再是“直接跑 refinement”
-- 而是:
-  1. `sample.py` 生成 baseline `.ply`
-  2. `FlashVSR-Pro` 生成真实 SR reference
-  3. 先看 `native_frames / sr_frames / compare_frames`
-  4. 再把 SR reference 喂给 `scripts/refine_robust_v2.py`
-
-**Why:**
-
-- 现在 selective SR 的代码闭环已经有了
-- 但目前还缺一轮系统性的真实外部超分 reference 验证
-- 需要确认它不是只在 synthetic / stub / subset 上看起来成立
-
-**Focus:**
-
-- 用 `FlashVSR-Pro` 的 `full` 模式先生成 reference:
-  - 默认不做 tiling
-  - 遇到 OOM 时再自动回退到 `tile_size=512`、`overlap=128`
-- 先把逐帧排查产物落出来:
+- 已完成真实系统验证
+- 当前已补出 `scripts/run_flashvsr_reference.py`,并在 48G 主机上真实跑通:
+  - `FlashVSR-Pro full mode`
+  - 输入:
+    - `assets/demo/static/diffusion_output_generated/3/rgb/00172.mp4`
+  - 输出:
+    - `outputs/flashvsr_reference/full_scale2x/3/rgb/00172.mp4`
+- 已导出排查证据:
   - `native_frames/`
   - `sr_frames/`
   - `compare_frames/`
-- 然后再用真实 `--reference-path` 的超分视频跑:
-  - `view 3`
-  - 当前最差轨迹
-- 检查:
-  - `compare_frames/*.png`
-  - `sr_selection_maps/*.png`
-  - `gaussian_fidelity_histogram.json`
-  - `metrics_stage3sr.json`
-- 输出:
-  - selective SR 对:
-    - `PSNR`
-    - `residual_mean`
-    - `sharpness`
-    - 局部双轮廓
-    的实际影响
+- 已完成真实 `SR vs native` 单变量对比:
+  - `native_stage3sr`
+    - `PSNR = 28.5179`
+    - `residual_mean = 0.018922`
+    - `sharpness = 0.005127`
+  - `sr_stage3sr`
+    - `PSNR = 28.4424`
+    - `residual_mean = 0.019096`
+    - `sharpness = 0.005211`
+- 当前结论:
+  - external SR reference 已经被 `Phase 3S / Stage 3SR` 真正消费
+  - 但在当前默认参数下,它还没有成为当前默认最优路线
+  - native 在 `PSNR / residual_mean` 上略优
+  - SR 在 `sharpness` 上略优
 
-**Done when:**
+**Why:**
 
-- 能先说清问题更像出在:
-  - diffusion 输出
-  - FlashVSR reference
-  - selective SR / refinement
-- 能给出至少一组“真实 SR reference 带来收益”的证据
-- 或者明确得出当前默认超参数不合适, 需要往哪里调
+- 这一步原本是为了把“代码闭环成立”推进到“真实 reference 证据成立”
+- 当前这个目标已经完成
+- 后续如果还想继续做 Task A,重点就不再是“有没有接上”
+- 而是:
+  - selective SR 的权重设计能否继续优化
+  - external SR 的优势能否被更稳定地提取出来
+
+**Focus(后续若继续):**
+
+- 不再重复证明“FlashVSR 能接进来”
+- 而是集中做:
+  - `W_sr_select`
+  - patch loss 配比
+  - `L_sampling_smooth`
+  - pruning / opacity 对 selective SR 的耦合影响
+- 目标是让 SR 路线真正超过 native baseline,而不是只在 `sharpness` 上略有优势
+
+**Done when(当前轮):**
+
+- 已能说清:
+  - 问题不在 `FlashVSR` 没接上
+  - 也不是 direct-input `cam_view` 契约没修好
+  - 当前更像是 selective SR 默认超参数还没有把外部 SR 价值真正吃满
 
 ### Continuation Task B: 打通 full direct file inputs
 
@@ -210,10 +213,24 @@
 
 ### Continuation Task D: 调 `Stage 2B` 和 selective SR 的衔接策略
 
+**Status (2026-03-07 最新):**
+
+- 当前默认衔接策略已经通过真实运行基本定住
+- 已完成:
+  - `native_stage3sr -> stage2b`
+  - `sr_stage3sr -> stage2b`
+  两条真实续跑
+- 同时修复了真实 warm-start workflow 中的 resume 断裂:
+  - `.ply` 导出会过滤低 opacity 高斯
+  - `state/latest.pt` 保留全量高斯
+  - `restore_latest_state()` 现已在数量不一致时按 state tensor 重建 `GaussianAdapter`
+
 **Why:**
 
-- 代码上 `Stage 2B` 已经会等待 `Phase 3S / Stage 3SR`
-- 但更细的调度和推荐默认值还没有真正定住
+- 代码上虽然早就能“进入 `Stage 2B`”
+- 但直到这轮真实对比完成前,还不能回答:
+  - 当前正式主线到底该不该继续 `Stage 2B`
+  - external SR 接上 `Stage 2B` 后会不会反超 native
 
 **Focus:**
 
@@ -225,9 +242,26 @@
   - 推荐 warm-start 方式
   - 推荐默认超参数
 
-**Done when:**
+**Current Result:**
 
-- `Stage 3SR -> Stage 2B` 的切换不再靠人工直觉
+- `native_stage2b`
+  - `PSNR = 30.7697`
+  - `residual_mean = 0.014952`
+  - `sharpness = 0.006509`
+- `sr_stage2b`
+  - `PSNR = 30.3745`
+  - `residual_mean = 0.015645`
+  - `sharpness = 0.006647`
+- 当前结论:
+  - `Stage 2B` 的收益明显大于当前 `native vs SR reference` 的差异
+  - `native baseline -> Stage 2B` 是当前正式推荐主线
+  - `SR -> Stage 2B` 仍可保留为锐度优先的可选分支
+
+**Done when(当前轮):**
+
+- `Stage 3SR -> Stage 2B` 的切换已经不再靠人工直觉
+- 当前正式推荐 workflow 已可明确写成:
+  - `native baseline -> Stage 2B`
 
 ## Historical 0-to-1 Tasks
 
@@ -1177,8 +1211,9 @@ git commit -s -m "feat: add dry run validation for post refinement"
    - 现在更值得把它稳定成正式使用路径
 2. 再做 `Continuation Task D`
    - 把 `Stage 3SR -> Stage 2B` 的衔接策略调稳
-3. 然后在满足 preflight gate 后恢复 `Continuation Task A`
-   - 用真实外部 SR reference 验 selective SR 的真实收益
+3. 然后按需要回到 `Continuation Task A`
+   - 不是再验证“有没有接上 SR”
+   - 而是继续调 selective SR, 争取让 SR 路线真正超过 native
 4. 最后完成 `Continuation Task C`
    - 把术语、usage 和 diagnostics 文档彻底收口
 
@@ -1214,7 +1249,7 @@ git commit -s -m "feat: add dry run validation for post refinement"
 
 ## 一句话继续顺序
 
-先在现有 v2 主线上用真实外部 SR reference 验 selective SR 的真实收益, 再收紧 `Stage 3SR -> Stage 2B` 的切换策略, 然后补 direct file inputs, 最后把所有术语和 usage 文档彻底收口.
+先固定 `native baseline -> Stage 2B` 为当前正式主线, 再回头继续调 selective SR 争取让 external SR 真正超过 native, 然后补 direct file inputs, 最后把所有术语和 usage 文档彻底收口.
 
 ---
 
