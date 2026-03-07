@@ -10,12 +10,13 @@
 
 - `README` 里的两步命令,只覆盖了 `SDG 生成 + baseline 3DGS 重建`
 - 这两步**不会自动触发** `joint_refinement_camera_gaussians_v2`
-- 要用到增强部分,还需要第 3 步单独运行 `scripts/refine_robust_v2.py`
+- 要用到增强部分,还需要单独运行 `scripts/refine_robust_v2.py`
+- 如果你走真实 external SR reference 路线,在 `scripts/refine_robust_v2.py` 之前,还需要先跑一步 `FlashVSR-Pro` reference 生成
 
 一句话说完:
 
 - `README 两步 = baseline`
-- `README 两步 + refine_robust_v2 第三步 = baseline 之上的 v2 增强`
+- `README 两步 + FlashVSR reference(可选) + refine_robust_v2 = baseline 之上的 v2 增强`
 
 ---
 
@@ -30,7 +31,8 @@
   -> 输出更干净的 gaussians_stage2a / gaussians_stage3sr / gaussians_stage2b / gaussians_refined
 ```
 
-这里面第 3 步 `refine_robust_v2.py` 才是 `joint_refinement_camera_gaussians_v2` 的实际入口。
+这里面真正进入 `joint_refinement_camera_gaussians_v2` 的实际入口,仍然是 `refine_robust_v2.py`.
+只是当你要喂真实 external SR reference 时,前面需要先补一段 `FlashVSR-Pro` reference 生成与逐帧核对。
 
 ---
 
@@ -129,7 +131,12 @@ refinement 的输入核心是:
 
 ### 5.1 最小必需链路
 
-如果你要真正用上 v2 增强,最少是 3 步:
+如果你要真正用上 v2 增强,至少要区分两条常用路径:
+
+- native reference 路线:
+  - 3 步
+- 真实 external SR reference 路线:
+  - 4 步
 
 ### 第 1 步: 生成或准备 SDG 输出
 
@@ -165,7 +172,32 @@ accelerate launch sample.py --config configs/demo/lyra_static.yaml \
 - 这不是 `refine_robust_v2.py` 本身的问题
 - 如果你已经有 baseline `.ply`,后面的 v2 refinement 仍然可以继续跑
 
-### 第 3 步: 用 `refine_robust_v2.py` 做增强细化
+### 第 3 步: 先生成 `FlashVSR-Pro` reference(仅 external SR 路线需要)
+
+如果你这次要验证真实 external SR reference,推荐先跑:
+
+```bash
+PYTHONPATH="$(pwd)" python3 scripts/run_flashvsr_reference.py \
+  --input-root assets/demo/static/diffusion_output_generated \
+  --output-root outputs/flashvsr_reference \
+  --flashvsr-repo /ABS/PATH/TO/FlashVSR-Pro \
+  --view-ids 3 \
+  --scene-stem 00172 \
+  --mode full \
+  --debug-every 8
+```
+
+这一步会生成:
+
+- `outputs/flashvsr_reference/full_scale2x/3/rgb/00172.mp4`
+- `outputs/flashvsr_reference/full_scale2x/3/debug/00172/native_frames/`
+- `outputs/flashvsr_reference/full_scale2x/3/debug/00172/sr_frames/`
+- `outputs/flashvsr_reference/full_scale2x/3/debug/00172/compare_frames/`
+
+推荐先把 `compare_frames/` 看一遍.
+如果这里已经能看出错位或奇怪纹理,先不要急着继续 refinement.
+
+### 第 4 步: 用 `refine_robust_v2.py` 做增强细化
 
 ```bash
 PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
@@ -211,7 +243,7 @@ PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
 
 ---
 
-## 6. 为什么第 3 步必须单独跑
+## 6. 为什么 refinement 这一步必须单独跑
 
 因为当前工程结构就是这样设计的:
 
@@ -243,6 +275,18 @@ PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
 
 - 这 3 个内部名字不是新的程序入口
 - 它们只是当前 `stage2a` 主线被拆开的可观测子阶段
+
+如果你现在就是想显式对比“以前的 `Stage 2A`”和“现在的 `Stage 2A`”, 当前 CLI 也已经支持直接写死模式:
+
+- `--stage2a-mode auto`
+  - 兼容旧行为
+  - 是否进入 `Phase 3S / Stage 3SR` 仍由 patch 参数决定
+- `--stage2a-mode legacy`
+  - 强制只跑 native cleanup
+  - 也就是对比实验里更接近“以前的 `Stage 2A`”
+- `--stage2a-mode enhanced`
+  - 强制跑 `Stage 3A -> Phase 3S -> Stage 3SR`
+  - 如果没给 patch supervision 所需参数,会直接报错,避免误跑成半套增强
 
 ---
 
@@ -480,6 +524,22 @@ PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
   - `--start-stage stage3sr`
 
 因为这些是 `stage2a` 内部子阶段,不是对外 CLI 的独立入口
+
+这里再补一个容易混淆的点:
+
+- `--start-stage`
+  - 决定从哪一个外层阶段开始
+- `--stage2a-mode`
+  - 决定当你真的进入 `stage2a` 时,内部走旧链路还是增强链路
+
+也就是说:
+
+- `--start-stage stage2a --stage2a-mode legacy`
+  - 适合跑“旧 `Stage 2A`”对比
+- `--start-stage stage2a --stage2a-mode enhanced`
+  - 适合跑“现在的 `Stage 2A`”对比
+- `--start-stage stage2b`
+  - 仍然表示直接跳过新的 `Stage 2A` optimizer step
 
 ---
 

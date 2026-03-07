@@ -93,7 +93,8 @@ class RefinementRunner:
             "phase_reached": "init",
             "used_pose_refinement": False,
             "used_joint_fallback": False,
-            "stage3sr_enabled": self._patch_supervision_enabled(),
+            "stage2a_mode_requested": self.run_config.stage2a_mode,
+            "stage3sr_enabled": self._stage2a_should_run_stage3sr(),
         }
         self.visual_artifacts: dict[str, str] = {}
 
@@ -199,12 +200,36 @@ class RefinementRunner:
         for frame_id in range(sr_selection_map.shape[1]):
             self.diagnostics.save_sr_selection_map(stage_name, frame_id, sr_selection_map[:, frame_id])
 
-    def _patch_supervision_enabled(self) -> bool:
-        """判断当前是否启用 patch supervision."""
+    def _patch_supervision_configured(self) -> bool:
+        """判断当前是否配置了 patch supervision 所需参数."""
 
         return self.hparams.patch_size > 0 and (
             self.hparams.lambda_patch_rgb > 0.0 or self.hparams.lambda_patch_perceptual > 0.0
         )
+
+    def _stage2a_should_run_stage3sr(self) -> bool:
+        """根据当前模式和参数,判断 Stage 2A 是否应进入增强链路."""
+
+        if self.run_config.stage2a_mode == "legacy":
+            return False
+        return self._patch_supervision_configured()
+
+    def _resolve_stage2a_mode(self) -> str:
+        """把 `auto/legacy/enhanced` 解析成本轮真正执行的模式."""
+
+        requested_mode = self.run_config.stage2a_mode
+        if requested_mode == "legacy":
+            return "legacy"
+        if requested_mode == "enhanced":
+            if not self._patch_supervision_configured():
+                raise RuntimeError(
+                    "stage2a_mode=enhanced requires patch supervision. "
+                    "Please set --patch-size > 0 and enable at least one patch loss weight."
+                )
+            return "enhanced"
+        if self._patch_supervision_configured():
+            return "enhanced"
+        return "legacy"
 
     def _get_reference_images(self) -> torch.Tensor:
         """统一解析当前 reference 图像张量."""
@@ -383,7 +408,7 @@ class RefinementRunner:
 
         loss_patch_rgb = torch.zeros((), dtype=reference_tensor.dtype, device=reference_tensor.device)
         loss_patch_perceptual = torch.zeros((), dtype=reference_tensor.dtype, device=reference_tensor.device)
-        if not self._patch_supervision_enabled():
+        if not self._patch_supervision_configured():
             return loss_patch_rgb, loss_patch_perceptual
 
         patch_windows_native = self.sample_patch_windows(residual_map)
@@ -630,7 +655,7 @@ class RefinementRunner:
     ) -> dict[str, Any]:
         """运行 selective SR patch supervision 的最小闭环."""
 
-        if not self._patch_supervision_enabled():
+        if not self._patch_supervision_configured():
             raise RuntimeError("Stage 3SR requires patch supervision to be enabled.")
         if not self.diagnostics_state.get("phase3s_completed", False):
             self.run_phase3s_build_sr_selection()
@@ -809,11 +834,16 @@ class RefinementRunner:
         如果当前没有启用 patch supervision,则只执行 native cleanup.
         """
 
+        resolved_mode = self._resolve_stage2a_mode()
+        self.diagnostics_state["stage2a_mode_resolved"] = resolved_mode
+        self.diagnostics_state["stage3sr_enabled"] = resolved_mode == "enhanced"
         final_metrics = self.run_stage3a_native_cleanup(
             stage_name="stage2a",
             export_file_name="gaussians_stage2a.ply",
         )
-        if not self._patch_supervision_enabled():
+        if resolved_mode == "legacy":
+            if self.run_config.stage2a_mode == "legacy" and self._patch_supervision_configured():
+                self.diagnostics_state.setdefault("warnings", []).append("stage2a_mode_legacy_skipped_patch_supervision")
             self._update_stage2b_diagnostics(final_metrics)
             return final_metrics
 

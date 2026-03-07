@@ -27,6 +27,7 @@ def test_cli_mapping_uses_defaults() -> None:
     assert run_config.reference_path is None
     assert run_config.reference_intrinsics_path is None
     assert run_config.start_stage == "stage2a"
+    assert run_config.stage2a_mode == "auto"
     assert run_config.enable_stage2b is False
     assert run_config.dry_run is False
     assert hparams.weight_floor == 0.20
@@ -56,6 +57,8 @@ def test_cli_mapping_reads_bool_flags_and_frame_indices() -> None:
             "1,3,7",
             "--start-stage",
             "stage2b",
+            "--stage2a-mode",
+            "enhanced",
             "--enable-stage2b",
             "--enable-pose-diagnostic",
             "--enable-joint-fallback",
@@ -73,6 +76,7 @@ def test_cli_mapping_reads_bool_flags_and_frame_indices() -> None:
     assert run_config.view_id == "5"
     assert run_config.frame_indices == [1, 3, 7]
     assert run_config.start_stage == "stage2b"
+    assert run_config.stage2a_mode == "enhanced"
     assert run_config.enable_stage2b is True
     assert run_config.enable_pose_diagnostic is True
     assert run_config.enable_joint_fallback is True

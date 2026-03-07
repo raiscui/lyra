@@ -27,6 +27,7 @@
 - 不新增第二套后处理入口.
 - 不在本轮处理 `sample.py` 的旧 GPU fallback.
 - 不把 `Continuation Task A` 和 `Continuation Task B` 混成一个任务.
+- 不跳过 SR reference 生成前的逐帧人工核对.
 
 ### 2.3 成功判定
 
@@ -34,6 +35,11 @@
 
 - baseline smoke test 成功结束.
 - 找到 `gaussians_orig/gaussians_0.ply`.
+- `FlashVSR-Pro` 成功导出一份真实 SR reference.
+- `FlashVSR-Pro` 输出目录里存在:
+  - `native_frames/`
+  - `sr_frames/`
+  - `compare_frames/`
 - `refine_robust_v2.py` 在真实 SR reference 下成功结束.
 - 输出目录里存在:
   - `metrics_phase3s.json`
@@ -59,10 +65,13 @@
 
 ### 3.2 Task A 额外输入
 
+- `FlashVSR-Pro` 仓库本地路径
+- `FlashVSR-Pro` 对应模型权重
 - 一份和 native 视频内容完全对等的 SR reference
-- 允许两种形态:
-  - 本地视频文件
-  - 帧目录
+  - 推荐直接由 `assets/demo/static/diffusion_output_generated/*/rgb/*.mp4` 生成
+  - 最终仍允许两种形态:
+    - 本地视频文件
+    - 帧目录
 
 如果 SR reference 是"纯整数倍放大",默认不需要额外 `reference_intrinsics`.
 
@@ -85,9 +94,19 @@ export POSE_PATH="${SCENE_ROOT}/pose/${SCENE_STEM}.npz"
 export INTRINSICS_PATH="${SCENE_ROOT}/intrinsics/${SCENE_STEM}.npz"
 export RGB_PATH="${SCENE_ROOT}/rgb/${SCENE_STEM}.mp4"
 
-# 这里填你真实的 SR reference 路径.
-# 它可以是 mp4,也可以是一个帧目录.
-export SR_REFERENCE_PATH="/ABS/PATH/TO/SR_REFERENCE.mp4"
+# `FlashVSR-Pro` 仓库本地路径.
+export FLASHVSR_REPO="/ABS/PATH/TO/FlashVSR-Pro"
+
+# `FlashVSR-Pro` 本机环境里的 python.
+# 在当前 48G 主机上的实际值是:
+# /usr/local/miniconda3/envs/flashvsr/bin/python3
+export FLASHVSR_LOCAL_PYTHON="/ABS/PATH/TO/flashvsr/bin/python3"
+
+# `FlashVSR-Pro` 产物根目录.
+export FLASHVSR_OUTPUT_ROOT="outputs/flashvsr_reference"
+
+# 如果按本手册默认流程跑,后面会自动得到这个路径.
+export SR_REFERENCE_PATH="$FLASHVSR_OUTPUT_ROOT/full_scale2x/${VIEW_ID}/rgb/${SCENE_STEM}.mp4"
 
 # 如果 SR 不是纯整数倍放大,就填真实内参; 否则留空.
 export SR_INTRINSICS_PATH=""
@@ -186,15 +205,110 @@ echo "$BASELINE_PLY"
 
 ### 7.1 任务目标
 
-这一阶段不是为了做最终最优调参.
+这一阶段现在拆成两段:
 
-这一阶段的目标更单纯:
+1. 先用 `FlashVSR-Pro` 生成真实 SR reference.
+2. 先看逐帧图,确认问题是不是在 SR 阶段就已经出现.
+3. 只有 SR reference 看起来基本靠谱,才继续跑 `Stage 2A -> Phase 3S -> Stage 3SR`.
 
-- 让真实 SR reference 进入 `reference_images`
-- 让 `Stage 2A -> Phase 3S -> Stage 3SR` 走完
-- 拿到 selective SR 的真实诊断证据
+也就是说:
 
-### 7.2 推荐第一版命令
+- 现在不推荐一上来就直接跑 `refine_robust_v2.py`.
+- 先把 SR reference 做出来.
+- 先把 `native / sr / compare` 三组图看一遍.
+
+### 7.2 先准备 `FlashVSR-Pro` 环境
+
+如果本机还没有准备好 `FlashVSR-Pro`,先做这一步:
+
+```bash
+git clone https://github.com/LujiaJin/FlashVSR-Pro "$FLASHVSR_REPO"
+git -C "$FLASHVSR_REPO" lfs install
+git -C "$FLASHVSR_REPO" lfs clone https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1 "$FLASHVSR_REPO/models/FlashVSR-v1.1"
+docker build -t flashvsr-pro:latest "$FLASHVSR_REPO"
+```
+
+如果你已经准备过这套环境,可以直接跳到下一步.
+
+#### 2026-03-07 已验证的主机结论
+
+- 当前这台 `48G` 主机上:
+  - Docker 包安装是成功的
+  - daemon 也能起来
+  - 但真实 `docker run` 会在 layer 注册阶段报:
+    - `failed to register layer: unshare: operation not permitted`
+- 这说明当前环境更像 nested 容器 / 外层 seccomp 约束.
+- 因此在这台机器上跑 `FlashVSR-Pro`, 当前推荐路线不是 docker runner, 而是:
+  - 本机 conda / venv 环境
+  - `scripts/run_flashvsr_reference.py --runner local --local-python "$FLASHVSR_LOCAL_PYTHON"`
+
+### 7.3 生成 SR reference + 逐帧排查图
+
+在 `48G` 显存主机上,默认先用 `full` 模式.
+先不做 tile.
+只有真的遇到 OOM,才自动回退到 `tile_size=512`、`overlap=128`.
+
+```bash
+PYTHONPATH="$(pwd)" pixi run python3 scripts/run_flashvsr_reference.py \
+  --input-root assets/demo/static/diffusion_output_generated \
+  --output-root "$FLASHVSR_OUTPUT_ROOT" \
+  --flashvsr-repo "$FLASHVSR_REPO" \
+  --runner local \
+  --local-python "$FLASHVSR_LOCAL_PYTHON" \
+  --view-ids "$VIEW_ID" \
+  --scene-stem "$SCENE_STEM" \
+  --mode full \
+  --debug-every 8
+```
+
+这条脚本会同时落盘:
+
+- `rgb/${SCENE_STEM}.mp4`
+- `debug/${SCENE_STEM}/native_frames/`
+- `debug/${SCENE_STEM}/sr_frames/`
+- `debug/${SCENE_STEM}/compare_frames/`
+- `manifests/${SCENE_STEM}.json`
+
+#### 2026-03-07 已验证的真实结果
+
+- 输入:
+  - `assets/demo/static/diffusion_output_generated/3/rgb/00172.mp4`
+- 输出:
+  - `outputs/flashvsr_reference/full_scale2x/3/rgb/00172.mp4`
+- 实际结果:
+  - `2560x1408`
+  - `121 frames`
+  - `duration=5.039567`
+  - `full` 模式成功
+  - 没有触发 tiled fallback
+- 逐帧目录也已完整生成:
+  - `native_frames/`
+  - `sr_frames/`
+  - `compare_frames/`
+
+### 7.4 先做逐帧人工核对
+
+```bash
+export FLASHVSR_DEBUG_DIR="$FLASHVSR_OUTPUT_ROOT/full_scale2x/${VIEW_ID}/debug/${SCENE_STEM}"
+find "$FLASHVSR_DEBUG_DIR" -maxdepth 2 -type f | sort | sed -n '1,200p'
+```
+
+重点先看:
+
+- `native_frames/`
+- `sr_frames/`
+- `compare_frames/`
+
+这里的判断目标不是“是否已经最终最优”.
+而是先确认:
+
+- SR 是否引入了明显错位
+- SR 是否已经开始出现奇怪纹理
+- 问题是否在进入 refinement 之前就已经能看出来
+
+### 7.5 再跑 selective SR smoke
+
+只有在 `FlashVSR-Pro` 输出看起来没有明显时序错位后,再继续这一步.
 
 先不要把 `Stage 2B` 混进来.
 先把 selective SR 本身跑清楚.
@@ -222,7 +336,7 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
   --reference-intrinsics-path "$SR_INTRINSICS_PATH"
 ```
 
-### 7.3 为什么先这样跑
+### 7.6 为什么先这样跑
 
 - `--stop-after stage2a`
   - 先只看 `Stage 3SR`
@@ -280,7 +394,13 @@ PY
 
 ### 8.3 肉眼检查建议
 
-至少看这些文件:
+先看 `FlashVSR-Pro` 的逐帧图:
+
+- `"$FLASHVSR_DEBUG_DIR/native_frames/*.png"`
+- `"$FLASHVSR_DEBUG_DIR/sr_frames/*.png"`
+- `"$FLASHVSR_DEBUG_DIR/compare_frames/*.png"`
+
+再看 refinement 产物:
 
 - `videos/baseline_render.mp4`
 - `videos/final_render.mp4`
@@ -335,6 +455,24 @@ PY
 - 如果不是纯放大:
   - 补 `--reference-intrinsics-path`
 
+#### 症状: `FlashVSR-Pro` 逐帧图里已经能看出问题
+
+动作:
+
+- 先不要继续跑 `refine_robust_v2.py`
+- 先只看这三组图:
+  - `native_frames`
+  - `sr_frames`
+  - `compare_frames`
+- 如果问题只在 `sr_frames` 里出现:
+  - 先把根因归到 SR 生成阶段
+  - 再考虑是否需要调整:
+    - `--mode`
+    - tiled fallback
+    - 输入视频选择
+- 如果 `native_frames` 本身就已经怪:
+  - 问题更可能在 diffusion 输出,不是 refinement
+
 #### 症状: `patch_size ... must be divisible by sr_scale`
 
 动作:
@@ -364,6 +502,17 @@ PY
   "baseline_smoke": {
     "status": "pass",
     "baseline_ply": "outputs/.../gaussians_orig/gaussians_0.ply"
+  },
+  "flashvsr_reference": {
+    "status": "pass",
+    "reference_path": "outputs/flashvsr_reference/full_scale2x/3/rgb/00172.mp4",
+    "debug_dir": "outputs/flashvsr_reference/full_scale2x/3/debug/00172",
+    "artifacts_present": [
+      "native_frames/",
+      "sr_frames/",
+      "compare_frames/",
+      "manifests/00172.json"
+    ]
   },
   "task_a": {
     "status": "pass",

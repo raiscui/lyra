@@ -101,11 +101,16 @@
 
 ### Continuation Task A: 用真实外部 SR reference 做一轮系统验证
 
-**Status (2026-03-06):**
+**Status (2026-03-07):**
 
 - 逻辑上可继续
-- 但当前机器上受 `sample.py` baseline 生成前置条件限制
-- 因此要么复用已有 baseline `.ply`, 要么切到 `sm_80+` 环境
+- 当前已补出 `scripts/run_flashvsr_reference.py`,用于把 `FlashVSR-Pro` 正式接入现有流程
+- 当前推荐顺序不再是“直接跑 refinement”
+- 而是:
+  1. `sample.py` 生成 baseline `.ply`
+  2. `FlashVSR-Pro` 生成真实 SR reference
+  3. 先看 `native_frames / sr_frames / compare_frames`
+  4. 再把 SR reference 喂给 `scripts/refine_robust_v2.py`
 
 **Why:**
 
@@ -115,10 +120,18 @@
 
 **Focus:**
 
-- 用真实 `--reference-path` 的超分视频跑:
+- 用 `FlashVSR-Pro` 的 `full` 模式先生成 reference:
+  - 默认不做 tiling
+  - 遇到 OOM 时再自动回退到 `tile_size=512`、`overlap=128`
+- 先把逐帧排查产物落出来:
+  - `native_frames/`
+  - `sr_frames/`
+  - `compare_frames/`
+- 然后再用真实 `--reference-path` 的超分视频跑:
   - `view 3`
   - 当前最差轨迹
 - 检查:
+  - `compare_frames/*.png`
   - `sr_selection_maps/*.png`
   - `gaussian_fidelity_histogram.json`
   - `metrics_stage3sr.json`
@@ -132,6 +145,10 @@
 
 **Done when:**
 
+- 能先说清问题更像出在:
+  - diffusion 输出
+  - FlashVSR reference
+  - selective SR / refinement
 - 能给出至少一组“真实 SR reference 带来收益”的证据
 - 或者明确得出当前默认超参数不合适, 需要往哪里调
 

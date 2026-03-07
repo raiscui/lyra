@@ -777,6 +777,15 @@ python3 scripts/refine_robust_v2.py \
   - 含义:
     - `stage2a`: 默认完整主线
     - `stage2b`: 把当前输入高斯视为“已完成 Stage 2A”的 warm start,跳过新的 Stage 2A optimizer step,直接评估是否进入 `Stage 2B`
+- `--stage2a-mode`
+  - 可选值:
+    - `auto`
+    - `legacy`
+    - `enhanced`
+  - 含义:
+    - `auto`: 保持兼容行为,是否进入 `Phase 3S / Stage 3SR` 由 patch supervision 参数决定
+    - `legacy`: 强制 `Stage 2A` 只跑 native cleanup
+    - `enhanced`: 强制 `Stage 2A` 跑 `Stage 3A -> Phase 3S -> Stage 3SR`,若缺少 patch supervision 参数则直接报错
 - `--enable-stage2b`
   - 是否允许 limited geometry
 - `--enable-pose-diagnostic`
@@ -832,6 +841,7 @@ python3 scripts/refine_robust_v2.py \
 - `--view-id`
 - `--outdir`
 - `--start-stage`
+- `--stage2a-mode`
 - `--enable-stage2b`
 - `--enable-pose-diagnostic`
 - `--enable-joint-fallback`

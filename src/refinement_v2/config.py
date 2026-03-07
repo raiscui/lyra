@@ -32,6 +32,7 @@ class RefinementRunConfig:
     frame_indices: list[int] | None = None
     target_subsample: int = 1
     start_stage: str = "stage2a"
+    stage2a_mode: str = "auto"
     enable_stage2b: bool = False
     enable_pruning: bool = False
     enable_pose_diagnostic: bool = False
@@ -177,6 +178,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["stage2a", "stage2b"],
         help="Optimization entry stage after Phase 0 / Phase 1 preparation.",
     )
+    parser.add_argument(
+        "--stage2a-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "legacy", "enhanced"],
+        help=(
+            "How Stage 2A behaves internally. "
+            "`auto` keeps the current compatible behavior, "
+            "`legacy` forces native cleanup only, "
+            "`enhanced` forces native cleanup + Phase 3S + Stage 3SR."
+        ),
+    )
     parser.add_argument("--enable-stage2b", action="store_true", help="Enable limited geometry refinement.")
     parser.add_argument(
         "--enable-pose-diagnostic",
@@ -260,6 +273,7 @@ def load_effective_config_from_cli(
         frame_indices=_parse_frame_indices(args.frame_indices),
         target_subsample=args.target_subsample,
         start_stage=args.start_stage,
+        stage2a_mode=args.stage2a_mode,
         enable_stage2b=args.enable_stage2b,
         enable_pruning=args.enable_pruning,
         enable_pose_diagnostic=args.enable_pose_diagnostic,
