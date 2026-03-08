@@ -20,17 +20,22 @@ import torch
 import numpy as np
 from typing import Any
 from cosmos_predict1.diffusion.inference.inference_utils import (
+    add_camera_center_arguments,
     add_common_arguments,
     add_moge_arguments,
     check_input_frames,
     load_moge_model,
+    maybe_apply_moge_focal_correction,
     validate_args,
 )
 from cosmos_predict1.diffusion.inference.gen3c_pipeline import Gen3cPipeline
 from cosmos_predict1.utils import log, misc
 from cosmos_predict1.utils.io import read_prompts_from_file, save_video
 from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_Buffer
-from cosmos_predict1.diffusion.inference.camera_utils import generate_camera_trajectory
+from cosmos_predict1.diffusion.inference.camera_utils import (
+    estimate_trajectory_center_depth,
+    generate_camera_trajectory,
+)
 import torch.nn.functional as F
 torch.enable_grad(False)
 
@@ -46,6 +51,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Prompt upsampler weights directory relative to checkpoint_dir",
     ) # TODO: do we need this?
     add_moge_arguments(parser)
+    add_camera_center_arguments(parser)
     parser.add_argument(
         "--input_image_path",
         type=str,
@@ -116,7 +122,9 @@ def validate_args(args):
 
 def _predict_moge_depth(current_image_path: str | np.ndarray,
                         target_h: int, target_w: int,
-                        device: torch.device, moge_model: Any):
+                        device: torch.device, moge_model: Any,
+                        loaded_moge_version: str,
+                        moge_v2_focal_scale: float):
     """Handles MoGe depth prediction for a single image.
 
     If the image is directly provided as a NumPy array, it should have shape [H, W, C],
@@ -184,6 +192,12 @@ def _predict_moge_depth(current_image_path: str | np.ndarray,
     moge_intrinsics_33[1, 2] *= height_scale_factor  # cy
     moge_intrinsics_33[0, 0] *= width_scale_factor  # fx
     moge_intrinsics_33[0, 2] *= width_scale_factor  # cx
+    # 只在实际加载到 v2 时校正焦距,不修改主点与相机路径本体.
+    moge_intrinsics_33 = maybe_apply_moge_focal_correction(
+        moge_intrinsics_33,
+        loaded_moge_version=loaded_moge_version,
+        moge_v2_focal_scale=moge_v2_focal_scale,
+    )
 
     moge_depth_b11hw = moge_depth_hw.unsqueeze(0).unsqueeze(0).unsqueeze(0)
     moge_depth_b11hw = torch.nan_to_num(moge_depth_b11hw, nan=1e4)
@@ -218,6 +232,80 @@ def _predict_moge_depth_from_tensor(
     moge_depth_11hw = torch.where(moge_mask_11hw==0, torch.tensor(1000.0, device=moge_depth_11hw.device), moge_depth_11hw)
 
     return moge_depth_11hw, moge_mask_11hw
+
+
+def _resolve_trajectory_center_depth(
+    args: argparse.Namespace,
+    moge_depth: torch.Tensor,
+    moge_mask: torch.Tensor | None,
+) -> float:
+    """根据 CLI 配置决定本次轨迹的旋转中心深度."""
+
+    if not args.auto_center_depth:
+        return 1.0
+
+    estimated_center_depth = estimate_trajectory_center_depth(
+        moge_depth,
+        moge_mask,
+        mode=args.auto_center_depth_mode,
+        depth_quantile=args.auto_center_depth_quantile,
+        center_crop_ratio=args.auto_center_depth_center_crop_ratio,
+        fallback_depth=1.0,
+    )
+    final_center_depth = estimated_center_depth * args.auto_center_depth_scale
+    log.info(
+        "Using auto-estimated trajectory center depth: "
+        f"mode={args.auto_center_depth_mode}, "
+        f"estimated={estimated_center_depth:.4f}, "
+        f"scale={args.auto_center_depth_scale:.4f}, "
+        f"final={final_center_depth:.4f}, "
+        f"quantile={args.auto_center_depth_quantile:.4f}, "
+        f"center_crop_ratio={args.auto_center_depth_center_crop_ratio:.4f}, "
+        f"translation_reference_depth={args.translation_reference_depth:.4f}, "
+        f"translation_reference_depth_scale={args.translation_reference_depth_scale}."
+    )
+    return final_center_depth
+
+
+def _resolve_translation_reference_depth(
+    args: argparse.Namespace,
+    center_depth: float,
+) -> float:
+    """决定本次轨迹位移缩放所使用的参考深度."""
+
+    if args.translation_reference_depth_scale is not None:
+        resolved_translation_reference_depth = center_depth * args.translation_reference_depth_scale
+        log.info(
+            "Using scaled translation reference depth: "
+            f"center_depth={center_depth:.4f}, "
+            f"scale={args.translation_reference_depth_scale:.4f}, "
+            f"final={resolved_translation_reference_depth:.4f}."
+        )
+        return resolved_translation_reference_depth
+
+    return float(args.translation_reference_depth)
+
+
+def _resolve_pipeline_offload_network(
+    args: argparse.Namespace,
+    *,
+    need_latent: bool,
+) -> bool:
+    """决定当前 pipeline 是否允许 offload diffusion transformer.
+
+    双 GPU context parallel 需要先拿到已加载的 `net`.
+    如果这时还保持 `offload_network=True`, pipeline 初始化阶段不会加载网络,
+    后续也无法在真正的 `net` 实例上挂 context parallel.
+    """
+
+    if not need_latent:
+        return True
+    if args.num_gpus > 1 and args.offload_diffusion_transformer:
+        log.info(
+            "Disabling diffusion transformer offload for multi-GPU context parallel inference."
+        )
+        return False
+    return bool(args.offload_diffusion_transformer)
 
 def demo(args):
     """Run video-to-world generation demo.
@@ -264,7 +352,7 @@ def demo(args):
         checkpoint_name="Gen3C-Cosmos-7B",
         prompt_upsampler_dir=args.prompt_upsampler_dir,
         enable_prompt_upsampler=not args.disable_prompt_upsampler,
-        offload_network=args.offload_diffusion_transformer,
+        offload_network=_resolve_pipeline_offload_network(args, need_latent=True),
         offload_tokenizer=args.offload_tokenizer,
         offload_text_encoder_model=args.offload_text_encoder_model,
         offload_prompt_upsampler=args.offload_prompt_upsampler,
@@ -284,7 +372,7 @@ def demo(args):
     generator = torch.Generator(device=device).manual_seed(args.seed)
     sample_n_frames = pipeline.model.chunk_size
     # MoGe v1/v2 都实现了 `.infer(...)`,这里通过 checkpoint 结构自动选版本,避免 v1/v2 混用.
-    moge_model, _moge_version = load_moge_model(
+    moge_model, loaded_moge_version = load_moge_model(
         moge_version=args.moge_version,
         moge_model_id=args.moge_model_id,
         moge_checkpoint_path=args.moge_checkpoint_path,
@@ -327,7 +415,13 @@ def demo(args):
             moge_initial_w2c_b144,
             moge_intrinsics_b133,
         ) = _predict_moge_depth(
-            current_image_path, args.height, args.width, device, moge_model
+            current_image_path,
+            args.height,
+            args.width,
+            device,
+            moge_model,
+            loaded_moge_version=loaded_moge_version,
+            moge_v2_focal_scale=args.moge_v2_focal_scale,
         )
 
         cache = Cache3D_Buffer(
@@ -348,6 +442,12 @@ def demo(args):
 
         # Generate camera trajectory using the new utility function
         try:
+            center_depth = _resolve_trajectory_center_depth(
+                args,
+                moge_depth_b11hw,
+                moge_mask_b11hw,
+            )
+            translation_reference_depth = _resolve_translation_reference_depth(args, center_depth)
             generated_w2cs, generated_intrinsics = generate_camera_trajectory(
                 trajectory_type=args.trajectory,
                 initial_w2c=initial_cam_w2c_for_traj,
@@ -355,7 +455,8 @@ def demo(args):
                 num_frames=args.num_video_frames,
                 movement_distance=args.movement_distance,
                 camera_rotation=args.camera_rotation,
-                center_depth=1.0,
+                center_depth=center_depth,
+                translation_reference_depth=translation_reference_depth,
                 device=device.type,
             )
         except (ValueError, NotImplementedError) as e:

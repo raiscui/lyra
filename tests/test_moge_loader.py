@@ -1,4 +1,4 @@
-"""MoGe 加载器回归测试."""
+"""MoGe 加载器与 v2 focal 校正回归测试."""
 
 from __future__ import annotations
 
@@ -8,7 +8,10 @@ from pathlib import Path
 
 import torch
 
-from cosmos_predict1.diffusion.inference.inference_utils import load_moge_model
+from cosmos_predict1.diffusion.inference.inference_utils import (
+    load_moge_model,
+    maybe_apply_moge_focal_correction,
+)
 
 
 class _FakeMoGeModel:
@@ -170,3 +173,46 @@ def test_load_moge_model_uses_built_in_default_repo_for_requested_version(monkey
         "Ruicheng/moge-vitl",
         "Ruicheng/moge-2-vitl",
     ]
+
+
+def test_maybe_apply_moge_focal_correction_only_scales_v2_focal_terms() -> None:
+    intrinsics = torch.tensor(
+        [
+            [790.0, 0.0, 640.0],
+            [0.0, 773.0, 352.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    adjusted = maybe_apply_moge_focal_correction(
+        intrinsics,
+        loaded_moge_version="v2",
+        moge_v2_focal_scale=1.04637,
+    )
+
+    assert torch.isclose(adjusted[0, 0], intrinsics[0, 0] * 1.04637)
+    assert torch.isclose(adjusted[1, 1], intrinsics[1, 1] * 1.04637)
+    assert adjusted[0, 2].item() == intrinsics[0, 2].item()
+    assert adjusted[1, 2].item() == intrinsics[1, 2].item()
+    assert intrinsics[0, 0].item() == 790.0
+    assert intrinsics[1, 1].item() == 773.0
+
+
+def test_maybe_apply_moge_focal_correction_keeps_v1_unchanged() -> None:
+    intrinsics = torch.tensor(
+        [
+            [827.0, 0.0, 640.0],
+            [0.0, 809.0, 352.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    adjusted = maybe_apply_moge_focal_correction(
+        intrinsics,
+        loaded_moge_version="v1",
+        moge_v2_focal_scale=1.04637,
+    )
+
+    assert torch.equal(adjusted, intrinsics)

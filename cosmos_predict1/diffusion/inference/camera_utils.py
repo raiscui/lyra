@@ -33,9 +33,9 @@ def look_at_matrix(camera_pos, target, invert_pos=True):
     forward = forward / torch.norm(forward)
 
     up = torch.tensor([0.0, 1.0, 0.0], device=camera_pos.device)  # assuming Y-up coordinate system
-    right = torch.cross(up, forward)
+    right = torch.cross(up, forward, dim=0)
     right = right / torch.norm(right)
-    up = torch.cross(forward, right)
+    up = torch.cross(forward, right, dim=0)
 
     look_at = torch.eye(4, device=camera_pos.device)
     look_at[0, :3] = right
@@ -46,9 +46,18 @@ def look_at_matrix(camera_pos, target, invert_pos=True):
     return look_at
 
 def create_horizontal_trajectory(
-    world_to_camera_matrix, center_depth, positive=True, n_steps=13, distance=0.1, device="cuda", axis="x", camera_rotation="center_facing"
+    world_to_camera_matrix,
+    center_depth,
+    positive=True,
+    n_steps=13,
+    distance=0.1,
+    device="cuda",
+    axis="x",
+    camera_rotation="center_facing",
+    translation_reference_depth: float | None = None,
 ):
     look_at = torch.tensor([0.0, 0.0, center_depth]).to(device)
+    translation_depth = center_depth if translation_reference_depth is None else translation_reference_depth
     # Spiral motion key points
     trajectory = []
     translation_positions = []
@@ -56,17 +65,17 @@ def create_horizontal_trajectory(
 
     for i in range(n_steps):
         if axis == "x": # pos - right
-            x = i * distance * center_depth / n_steps * (1 if positive else -1)
+            x = i * distance * translation_depth / n_steps * (1 if positive else -1)
             y = 0
             z = 0
         elif axis == "y": # pos - down
             x = 0
-            y = i * distance * center_depth / n_steps * (1 if positive else -1)
+            y = i * distance * translation_depth / n_steps * (1 if positive else -1)
             z = 0
         elif axis == "z": # pos - in
             x = 0
             y = 0
-            z = i * distance * center_depth / n_steps * (1 if positive else -1)
+            z = i * distance * translation_depth / n_steps * (1 if positive else -1)
         else:
             raise ValueError("Axis should be x, y or z")
 
@@ -100,16 +109,16 @@ def create_spiral_trajectory(
     device="cuda",
     start_from_zero=True,
     num_circles=1,
+    translation_reference_depth: float | None = None,
 ):
 
     look_at = torch.tensor([0.0, 0.0, center_depth]).to(device)
+    translation_depth = center_depth if translation_reference_depth is None else translation_reference_depth
 
     # Spiral motion key points
     trajectory = []
     spiral_positions = []
     initial_camera_pos = torch.tensor([0, 0, 0], device=device)  # world_to_camera_matrix[:3, 3].clone()
-
-    example_scale = 1.0
 
     theta_max = 2 * math.pi * num_circles
 
@@ -117,12 +126,12 @@ def create_spiral_trajectory(
         # theta = 2 * math.pi * i / (n_steps-1)  # angle for each point
         theta = theta_max * i / (n_steps - 1)  # angle for each point
         if start_from_zero:
-            x = radius_x * (math.cos(theta) - 1) * (1 if positive else -1) * (center_depth / example_scale)
+            x = radius_x * (math.cos(theta) - 1) * (1 if positive else -1) * translation_depth
         else:
-            x = radius_x * (math.cos(theta)) * (center_depth / example_scale)
+            x = radius_x * (math.cos(theta)) * translation_depth
 
-        y = radius_y * math.sin(theta) * (center_depth / example_scale)
-        z = radius_z * math.sin(theta) * (center_depth / example_scale)
+        y = radius_y * math.sin(theta) * translation_depth
+        z = radius_z * math.sin(theta) * translation_depth
         spiral_positions.append(torch.tensor([x, y, z], device=device))
 
     for pos in spiral_positions:
@@ -147,6 +156,7 @@ def generate_camera_trajectory(
     movement_distance: float,
     camera_rotation: str,
     center_depth: float = 1.0,
+    translation_reference_depth: float | None = None,
     device: str = "cuda",
     num_circles: int = 1,
     radius_x_factor: float = 1.0,
@@ -168,6 +178,9 @@ def generate_camera_trajectory(
         num_circles: Number of circles for spiral
         radius_x_factor: Multiple strength in x direction with factor for spiral
         radius_y_factor: Multiple strength in x direction with factor for spiral
+        translation_reference_depth: Optional reference depth used only to scale
+            the translation magnitude. If None, keep historical behavior and use
+            center_depth for both look-at depth and movement scale.
 
     Returns:
         A tuple (generated_w2cs, generated_intrinsics):
@@ -187,6 +200,7 @@ def generate_camera_trajectory(
             radius_x=radius_x,
             radius_y=radius_y,
             num_circles=num_circles,
+            translation_reference_depth=translation_reference_depth,
         )
     else:
         if trajectory_type == "left":
@@ -220,6 +234,7 @@ def generate_camera_trajectory(
             distance=movement_distance,
             device=device,
             camera_rotation=camera_rotation,
+            translation_reference_depth=translation_reference_depth,
         )
 
     generated_w2cs = new_w2cs_seq.unsqueeze(0)  # Shape: [1, num_frames, 4, 4]
@@ -229,6 +244,77 @@ def generate_camera_trajectory(
         generated_intrinsics = initial_intrinsics.unsqueeze(0)
 
     return generated_w2cs, generated_intrinsics
+
+
+def _extract_single_map_hw(input_tensor: torch.Tensor, tensor_name: str) -> torch.Tensor:
+    """把常见的 `[B,1,H,W] / [B,1,1,H,W]` 输入规整成单张 `H x W`."""
+
+    if input_tensor.ndim == 5:
+        return input_tensor[0, 0, 0]
+    if input_tensor.ndim == 4:
+        return input_tensor[0, 0]
+    if input_tensor.ndim == 3:
+        return input_tensor[0]
+    if input_tensor.ndim == 2:
+        return input_tensor
+    raise ValueError(f"Unsupported {tensor_name} tensor shape: {tuple(input_tensor.shape)}")
+
+
+def estimate_trajectory_center_depth(
+    depth_tensor: torch.Tensor,
+    mask_tensor: torch.Tensor | None = None,
+    *,
+    mode: str = "center_crop",
+    depth_quantile: float = 0.5,
+    center_crop_ratio: float = 0.5,
+    fallback_depth: float = 1.0,
+) -> float:
+    """根据深度统计估计更合理的旋转中心深度.
+
+    这里默认优先看图像中心区域,因为旋转中心更接近主体而不是四周背景.
+    如果中心裁剪区没有有效像素,则自动回退到整张图的有效深度统计.
+    """
+
+    if mode not in {"center_crop", "foreground_mask"}:
+        raise ValueError(f"Unsupported auto center depth mode: {mode}")
+    if not 0.0 <= depth_quantile <= 1.0:
+        raise ValueError(f"depth_quantile must be in [0, 1], got {depth_quantile}")
+    if not 0.0 < center_crop_ratio <= 1.0:
+        raise ValueError(f"center_crop_ratio must be in (0, 1], got {center_crop_ratio}")
+
+    depth_hw = _extract_single_map_hw(depth_tensor, "depth").to(dtype=torch.float32)
+    valid_mask_hw = torch.isfinite(depth_hw) & (depth_hw > 0)
+    input_mask_hw = None
+
+    if mask_tensor is not None:
+        input_mask_hw = _extract_single_map_hw(mask_tensor, "mask") > 0
+        valid_mask_hw = valid_mask_hw & input_mask_hw
+
+    if not torch.any(valid_mask_hw):
+        return float(fallback_depth)
+
+    if mode == "foreground_mask":
+        selected_mask_hw = valid_mask_hw
+    else:
+        selected_mask_hw = valid_mask_hw
+        height, width = depth_hw.shape
+        if center_crop_ratio < 1.0:
+            crop_height = max(1, int(round(height * center_crop_ratio)))
+            crop_width = max(1, int(round(width * center_crop_ratio)))
+            top = max(0, (height - crop_height) // 2)
+            left = max(0, (width - crop_width) // 2)
+
+            center_mask_hw = torch.zeros_like(valid_mask_hw, dtype=torch.bool)
+            center_mask_hw[top:top + crop_height, left:left + crop_width] = True
+            center_valid_mask_hw = valid_mask_hw & center_mask_hw
+            if torch.any(center_valid_mask_hw):
+                selected_mask_hw = center_valid_mask_hw
+
+    selected_depths = depth_hw[selected_mask_hw]
+    if selected_depths.numel() == 0:
+        return float(fallback_depth)
+
+    return float(torch.quantile(selected_depths, depth_quantile).item())
 
 
 def _align_inv_depth_to_depth(

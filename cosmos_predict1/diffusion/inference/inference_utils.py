@@ -216,6 +216,111 @@ def add_moge_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Pass local_files_only=True to hf_hub_download for MoGe weights (offline mode requires cached files).",
     )
+    parser.add_argument(
+        "--moge_v2_focal_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Optional focal correction applied only when the actually loaded MoGe "
+            "checkpoint is v2. This scales fx/fy only, keeps cx/cy unchanged, "
+            "and can be used to make v2 camera intrinsics closer to older v1-like demos."
+        ),
+    )
+
+
+def add_camera_center_arguments(parser: argparse.ArgumentParser) -> None:
+    """给单图 `MoGe` 入口补充旋转中心估计参数."""
+
+    parser.add_argument(
+        "--auto_center_depth",
+        action="store_true",
+        help=(
+            "Estimate trajectory look-at depth from predicted depth statistics "
+            "instead of using the historical fixed center_depth=1.0."
+        ),
+    )
+    parser.add_argument(
+        "--auto_center_depth_mode",
+        type=str,
+        choices=["center_crop", "foreground_mask"],
+        default="center_crop",
+        help=(
+            "How to choose the depth samples used for auto center depth estimation: "
+            "center_crop uses the centered crop window, foreground_mask uses all valid mask pixels."
+        ),
+    )
+    parser.add_argument(
+        "--auto_center_depth_quantile",
+        type=float,
+        default=0.5,
+        help="Quantile used for automatic center depth estimation. 0.5 means median depth.",
+    )
+    parser.add_argument(
+        "--auto_center_depth_center_crop_ratio",
+        type=float,
+        default=0.5,
+        help=(
+            "Use the centered crop of the depth map for auto center depth estimation. "
+            "1.0 means the full frame."
+        ),
+    )
+    parser.add_argument(
+        "--auto_center_depth_scale",
+        "--auto_center_depth_multiplier",
+        dest="auto_center_depth_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Additional multiplier applied to the auto-estimated median/quantile depth. "
+            "Values below 1.0 pull the rotation center forward again."
+        ),
+    )
+    parser.add_argument(
+        "--translation_reference_depth",
+        type=float,
+        default=1.0,
+        help=(
+            "Reference depth used only to scale translation magnitude. "
+            "Keeping this at 1.0 preserves the historical movement size even "
+            "when auto center depth is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--translation_reference_depth_scale",
+        type=float,
+        default=None,
+        help=(
+            "Optional proportional scale for translation reference depth. "
+            "If set, the actual translation reference depth becomes "
+            "center_depth * translation_reference_depth_scale."
+        ),
+    )
+
+
+def maybe_apply_moge_focal_correction(
+    moge_intrinsics_33: torch.Tensor,
+    *,
+    loaded_moge_version: str,
+    moge_v2_focal_scale: float,
+) -> torch.Tensor:
+    """按实际加载版本对 MoGe 内参做可选焦距校正.
+
+    目前仅在 `v2` 路径上调整 `fx/fy`.
+    这样可以把 `v2` 的视场角往旧 `v1` 风格拉回一点,
+    同时避免把主点修正或轨迹修改混进来.
+    """
+
+    adjusted_intrinsics_33 = moge_intrinsics_33.clone()
+    if loaded_moge_version != "v2" or moge_v2_focal_scale == 1.0:
+        return adjusted_intrinsics_33
+
+    adjusted_intrinsics_33[0, 0] *= moge_v2_focal_scale
+    adjusted_intrinsics_33[1, 1] *= moge_v2_focal_scale
+    log.info(
+        "Applying MoGe v2 focal correction: "
+        f"fx/fy *= {moge_v2_focal_scale} while keeping cx/cy unchanged."
+    )
+    return adjusted_intrinsics_33
 
 
 # Function to fully remove an argument

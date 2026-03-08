@@ -22,10 +22,12 @@ import random
 import numpy as np
 from typing import Dict, Any
 from cosmos_predict1.diffusion.inference.inference_utils import (
+    add_camera_center_arguments,
     add_common_arguments,
     add_moge_arguments,
     check_input_frames,
     load_moge_model,
+    maybe_apply_moge_focal_correction,
     validate_args,
 )
 from cosmos_predict1.diffusion.inference.gen3c_pipeline import Gen3cPipeline
@@ -33,6 +35,11 @@ from cosmos_predict1.utils import log, misc
 from cosmos_predict1.utils.io import read_prompts_from_file, save_video
 from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_Buffer
 from cosmos_predict1.diffusion.inference.camera_utils import generate_camera_trajectory
+from cosmos_predict1.diffusion.inference.gen3c_single_image import (
+    _resolve_pipeline_offload_network,
+    _resolve_trajectory_center_depth,
+    _resolve_translation_reference_depth,
+)
 import torch.nn.functional as F
 torch.enable_grad(False)
 
@@ -48,6 +55,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Prompt upsampler weights directory relative to checkpoint_dir",
     ) # TODO: do we need this?
     add_moge_arguments(parser)
+    add_camera_center_arguments(parser)
     parser.add_argument(
         "--input_image_path",
         type=str,
@@ -252,7 +260,9 @@ def _get_progress_status(args: argparse.Namespace, out_paths: dict[str, str]) ->
 
 def _predict_moge_depth(current_image_path: str | np.ndarray,
                         target_h: int, target_w: int,
-                        device: torch.device, moge_model: Any):
+                        device: torch.device, moge_model: Any,
+                        loaded_moge_version: str,
+                        moge_v2_focal_scale: float):
     """Handles MoGe depth prediction for a single image.
 
     If the image is directly provided as a NumPy array, it should have shape [H, W, C],
@@ -320,6 +330,12 @@ def _predict_moge_depth(current_image_path: str | np.ndarray,
     moge_intrinsics_33[1, 2] *= height_scale_factor  # cy
     moge_intrinsics_33[0, 0] *= width_scale_factor  # fx
     moge_intrinsics_33[0, 2] *= width_scale_factor  # cx
+    # 只把 v2 的焦距往 v1 风格拉回一点,不动 cx/cy 与相机路径本身.
+    moge_intrinsics_33 = maybe_apply_moge_focal_correction(
+        moge_intrinsics_33,
+        loaded_moge_version=loaded_moge_version,
+        moge_v2_focal_scale=moge_v2_focal_scale,
+    )
 
     moge_depth_b11hw = moge_depth_hw.unsqueeze(0).unsqueeze(0).unsqueeze(0)
     moge_depth_b11hw = torch.nan_to_num(moge_depth_b11hw, nan=1e4)
@@ -492,7 +508,10 @@ def demo(args):
     # -----------------------------
     pipeline: Gen3cPipeline | None = None
     if any_need_latent or any_need_video_decode:
-        pipeline_offload_network = args.offload_diffusion_transformer if any_need_latent else True
+        pipeline_offload_network = _resolve_pipeline_offload_network(
+            args,
+            need_latent=any_need_latent,
+        )
         pipeline = Gen3cPipeline(
             inference_type=inference_type,
             checkpoint_dir=args.checkpoint_dir,
@@ -524,6 +543,7 @@ def demo(args):
     generator = torch.Generator(device=device).manual_seed(args.seed) if any_need_latent else None
     # MoGe v1/v2 都实现了 `.infer(...)`,这里用 Any 作为最小接口,避免脚本固定绑死某个版本.
     moge_model: Any | None = None
+    loaded_moge_version: str | None = None
 
     for item in work_items:
         # 预扫描阶段已判断为必跳过的输入,这里保持原行为: 打 log 后 continue.
@@ -563,7 +583,7 @@ def demo(args):
             if need_pose or need_intrinsics:
                 if moge_model is None:
                     # MoGe 只在需要"从图像估计深度/内参"时才加载,避免无意义的显存占用.
-                    moge_model, _moge_version = load_moge_model(
+                    moge_model, loaded_moge_version = load_moge_model(
                         moge_version=args.moge_version,
                         moge_model_id=args.moge_model_id,
                         moge_checkpoint_path=args.moge_checkpoint_path,
@@ -578,13 +598,27 @@ def demo(args):
                     moge_initial_w2c_b144,
                     moge_intrinsics_b133,
                 ) = _predict_moge_depth(
-                    current_image_path, args.height, args.width, device, moge_model
+                    current_image_path,
+                    args.height,
+                    args.width,
+                    device,
+                    moge_model,
+                    loaded_moge_version=loaded_moge_version or args.moge_version,
+                    moge_v2_focal_scale=args.moge_v2_focal_scale,
                 )
 
                 initial_cam_w2c_for_traj = moge_initial_w2c_b144[0, 0]
                 initial_cam_intrinsics_for_traj = moge_intrinsics_b133[0, 0]
 
                 try:
+                    center_depth = _resolve_trajectory_center_depth(
+                        args,
+                        _moge_depth_b11hw,
+                        _moge_mask_b11hw,
+                    )
+                    translation_reference_depth = _resolve_translation_reference_depth(args, center_depth)
+                    trajectory_kwargs = dict(args.camera_gen_kwargs)
+                    trajectory_kwargs["translation_reference_depth"] = translation_reference_depth
                     generated_w2cs, generated_intrinsics = generate_camera_trajectory(
                         trajectory_type=args.trajectory,
                         initial_w2c=initial_cam_w2c_for_traj,
@@ -592,9 +626,9 @@ def demo(args):
                         num_frames=args.num_video_frames,
                         movement_distance=args.movement_distance,
                         camera_rotation=args.camera_rotation,
-                        center_depth=1.0,
+                        center_depth=center_depth,
                         device=device.type,
-                        **args.camera_gen_kwargs,
+                        **trajectory_kwargs,
                     )
                 except (ValueError, NotImplementedError) as e:
                     log.critical(f"Failed to generate trajectory: {e}")
@@ -687,7 +721,7 @@ def demo(args):
 
         if moge_model is None:
             # MoGe 仅在需要跑 diffusion 或补齐相机轨迹时才加载.
-            moge_model, _moge_version = load_moge_model(
+            moge_model, loaded_moge_version = load_moge_model(
                 moge_version=args.moge_version,
                 moge_model_id=args.moge_model_id,
                 moge_checkpoint_path=args.moge_checkpoint_path,
@@ -703,7 +737,13 @@ def demo(args):
             moge_initial_w2c_b144,
             moge_intrinsics_b133,
         ) = _predict_moge_depth(
-            current_image_path, args.height, args.width, device, moge_model
+            current_image_path,
+            args.height,
+            args.width,
+            device,
+            moge_model,
+            loaded_moge_version=loaded_moge_version or args.moge_version,
+            moge_v2_focal_scale=args.moge_v2_focal_scale,
         )
 
         cache = Cache3D_Buffer(
@@ -724,6 +764,14 @@ def demo(args):
 
         # Generate camera trajectory using the new utility function
         try:
+            center_depth = _resolve_trajectory_center_depth(
+                args,
+                moge_depth_b11hw,
+                moge_mask_b11hw,
+            )
+            translation_reference_depth = _resolve_translation_reference_depth(args, center_depth)
+            trajectory_kwargs = dict(args.camera_gen_kwargs)
+            trajectory_kwargs["translation_reference_depth"] = translation_reference_depth
             generated_w2cs, generated_intrinsics = generate_camera_trajectory(
                 trajectory_type=args.trajectory,
                 initial_w2c=initial_cam_w2c_for_traj,
@@ -731,9 +779,9 @@ def demo(args):
                 num_frames=args.num_video_frames,
                 movement_distance=args.movement_distance,
                 camera_rotation=args.camera_rotation,
-                center_depth=1.0,
+                center_depth=center_depth,
                 device=device.type,
-                **args.camera_gen_kwargs,
+                **trajectory_kwargs,
             )
         except (ValueError, NotImplementedError) as e:
             log.critical(f"Failed to generate trajectory: {e}")

@@ -13,6 +13,8 @@
 - 所以更大 observation 密度留到:
   - A100
   - 或多卡
+- 如果重跑 static demo 的 `MoGe v2 + auto center depth` 路线, 当前更接近 `v1` 体感的经验参数是:
+  - `--translation_reference_depth_scale 0.25`
 
 ## 1. 单路旧 `Stage 2A` 对照
 

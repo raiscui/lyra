@@ -123,7 +123,7 @@ class Gen3cPersistentModel():
         self.generator = torch.Generator(device=device).manual_seed(args.seed)
         self.sample_n_frames = pipeline.model.chunk_size
         # MoGe v1/v2 都实现了 `.infer(...)`,这里根据 checkpoint 结构自动选版本,避免 v1/v2 混用.
-        self.moge_model, _moge_version = load_moge_model(
+        self.moge_model, self.loaded_moge_version = load_moge_model(
             moge_version=args.moge_version,
             moge_model_id=args.moge_model_id,
             moge_checkpoint_path=args.moge_checkpoint_path,
@@ -182,7 +182,13 @@ class Gen3cPersistentModel():
                 moge_initial_w2c_b144,
                 moge_intrinsics_b133,
             ) = _predict_moge_depth(
-                input_image_np, self.args.height, self.args.width, self.device_with_rank, self.moge_model
+                input_image_np,
+                self.args.height,
+                self.args.width,
+                self.device_with_rank,
+                self.moge_model,
+                loaded_moge_version=self.loaded_moge_version,
+                moge_v2_focal_scale=self.args.moge_v2_focal_scale,
             )
 
             # TODO: MoGE provides camera params, is it okay to just ignore the user-provided ones?
