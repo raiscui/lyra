@@ -100,7 +100,10 @@ def compute_sampling_smooth_loss(
     radii = _canonicalize_screen_radii(radii)
     if radii is None:
         return torch.zeros((), dtype=scales.dtype, device=scales.device)
-    opacities = opacities.float()
+    radii = radii.to(device=scales.device, dtype=scales.dtype)
+    opacities = opacities.to(device=scales.device, dtype=scales.dtype)
+    if fidelity_score.device != scales.device or fidelity_score.dtype != scales.dtype:
+        fidelity_score = fidelity_score.to(device=scales.device, dtype=scales.dtype)
     if radii.ndim == 2:
         radii = radii.unsqueeze(0)
     if opacities.ndim == 2:
@@ -114,12 +117,12 @@ def compute_sampling_smooth_loss(
         return torch.zeros((), dtype=scales.dtype, device=scales.device)
 
     visible = (radii > 0).to(dtype=scales.dtype)
-    radius_deficit = F.relu(radius_threshold - radii.to(dtype=scales.dtype)) / max(radius_threshold, eps)
-    opacity_gate = opacities.to(dtype=scales.dtype).clamp(0.0, 1.0)
+    radius_deficit = F.relu(radius_threshold - radii) / max(radius_threshold, eps)
+    opacity_gate = opacities.clamp(0.0, 1.0)
     unsupported_per_view = radius_deficit * visible * opacity_gate
     unsupported_per_gaussian = unsupported_per_view.sum(dim=1) / visible.sum(dim=1).clamp_min(1.0)
 
-    low_fidelity = (1.0 - fidelity_score.to(dtype=scales.dtype)).clamp(0.0, 1.0)
+    low_fidelity = (1.0 - fidelity_score).clamp(0.0, 1.0)
     scale_max = scales.max(dim=-1).values.clamp_min(eps)
     return (low_fidelity * unsupported_per_gaussian / scale_max).mean()
 

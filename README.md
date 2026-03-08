@@ -56,6 +56,8 @@ CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) torchrun --nproc_per_node=1 cosmos_pre
 
 Increase total_movement_distance_factor to 2.0 for more camera motion, though it can create more artifacts in object-centric scenes. If you want to skip the diffusion part, we have pre-generated the latents in assets/demo/static/diffusion_output. By default we use pre-generated latents, change dataset_name in configs/demo/lyra_static.yaml from lyra_static_demo to lyra_static_demo_generated to use your own generated latents.
 
+Note: the packaged demo assets are not guaranteed to be pixel-identical to a fresh rerun of the command above. In particular, `--multi_trajectory` samples trajectory strength during generation, and the current default MoGe backbone is `v2`. If you want to try the older camera estimation path that is closer to the original static demo assets, add `--moge_version v1`.
+
 2) Reconstruct multi-view video latents with the 3DGS decoder (change dataset_name in the .yaml to generated path if 1. was done)
 
 ```bash

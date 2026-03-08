@@ -12,7 +12,7 @@ static_view_indices_fixed: ['5', '0', '1', '2', '3', '4']
 # static_view_indices_fixed: ['3']
 
 # Only render each 4. frame
-target_index_subsample: 8
+target_index_subsample: 4
 
 # 经验值: 适度收紧 gaussian_scale_cap 可以明显提升锐度,同时 PSNR 损失相对可控.
 # - baseline(scale_cap=0.30): PSNR≈21.61, sharpness≈191

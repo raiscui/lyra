@@ -124,6 +124,7 @@ class Gen3cPersistentModel():
         self.sample_n_frames = pipeline.model.chunk_size
         # MoGe v1/v2 都实现了 `.infer(...)`,这里根据 checkpoint 结构自动选版本,避免 v1/v2 混用.
         self.moge_model, _moge_version = load_moge_model(
+            moge_version=args.moge_version,
             moge_model_id=args.moge_model_id,
             moge_checkpoint_path=args.moge_checkpoint_path,
             hf_local_files_only=args.hf_local_files_only,

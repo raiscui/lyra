@@ -21,6 +21,7 @@ import numpy as np
 from typing import Any
 from cosmos_predict1.diffusion.inference.inference_utils import (
     add_common_arguments,
+    add_moge_arguments,
     check_input_frames,
     load_moge_model,
     validate_args,
@@ -44,23 +45,7 @@ def create_parser() -> argparse.ArgumentParser:
         default="Pixtral-12B",
         help="Prompt upsampler weights directory relative to checkpoint_dir",
     ) # TODO: do we need this?
-    parser.add_argument(
-        "--moge_model_id",
-        type=str,
-        default="Ruicheng/moge-2-vitl",
-        help="MoGe model HF repo_id (e.g., Ruicheng/moge-2-vitl or Ruicheng/moge-vitl). Can also be a local model.pt path.",
-    )
-    parser.add_argument(
-        "--moge_checkpoint_path",
-        type=str,
-        default=None,
-        help="Optional local path to MoGe checkpoint (model.pt). If provided, it takes precedence over --moge_model_id.",
-    )
-    parser.add_argument(
-        "--hf_local_files_only",
-        action="store_true",
-        help="Pass local_files_only=True to hf_hub_download for MoGe weights (offline mode requires cached files).",
-    )
+    add_moge_arguments(parser)
     parser.add_argument(
         "--input_image_path",
         type=str,
@@ -300,6 +285,7 @@ def demo(args):
     sample_n_frames = pipeline.model.chunk_size
     # MoGe v1/v2 都实现了 `.infer(...)`,这里通过 checkpoint 结构自动选版本,避免 v1/v2 混用.
     moge_model, _moge_version = load_moge_model(
+        moge_version=args.moge_version,
         moge_model_id=args.moge_model_id,
         moge_checkpoint_path=args.moge_checkpoint_path,
         hf_local_files_only=args.hf_local_files_only,

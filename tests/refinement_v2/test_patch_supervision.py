@@ -195,6 +195,36 @@ def test_native_reference_mode_reuses_same_patch_path(tmp_path) -> None:
     assert torch.allclose(patch_intrinsics[0, 0], torch.tensor([2.0, 2.0, 0.5, 0.5]))
 
 
+def test_render_patch_prediction_with_render_devices_does_not_reuse_stale_intrinsics(tmp_path) -> None:
+    """双设备打开时,连续 patch render 也必须看到新的局部内参."""
+
+    renderer = RecordingRenderer()
+    run_config = build_run_config(
+        tmp_path,
+        reference_mode="super_resolved",
+        sr_scale=2.0,
+        render_devices=["cpu", "cpu"],
+    )
+    hparams = build_stage_hparams(patch_size=4)
+    scene = _build_patch_scene(reference_mode="super_resolved", sr_scale=2.0)
+
+    runner = RefinementRunner(
+        scene=scene,
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=renderer,
+    )
+
+    runner.render_patch_prediction(torch.tensor([[[0, 0, 2, 2]]], dtype=torch.long))
+    runner.render_patch_prediction(torch.tensor([[[1, 1, 2, 2]]], dtype=torch.long))
+
+    assert len(renderer.calls) == 2
+    assert torch.allclose(renderer.calls[0]["intrinsics"][0, 0], torch.tensor([4.0, 4.0, 3.0, 3.0]))
+    assert torch.allclose(renderer.calls[1]["intrinsics"][0, 0], torch.tensor([4.0, 4.0, 1.0, 1.0]))
+
+
 def test_stage2a_with_patch_supervision_records_patch_losses(tmp_path) -> None:
     """开启 patch supervision 后, Stage 2A 指标里应包含 patch loss."""
 

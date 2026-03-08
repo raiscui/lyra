@@ -67,6 +67,7 @@ class RefinementRunner:
         self.run_config: RefinementRunConfig = controller.run_config
         self.hparams = hparams
         self.device = self._resolve_device(self.run_config.device)
+        self.render_devices = self._resolve_render_devices(self.run_config.render_devices)
 
         self.scene = self._move_scene_to_device(scene, self.device)
         self.gaussians = gaussians.to(self.device)
@@ -89,12 +90,14 @@ class RefinementRunner:
         self.gaussian_fidelity_score: torch.Tensor | None = None
         self.sr_selection_map: torch.Tensor | None = None
         self.renderer_cache: dict[tuple[int, int], GaussianSceneRenderer] = {}
+        self.scene_shard_cache: dict[tuple[Any, ...], SceneBundle] = {}
         self.diagnostics_state: dict[str, Any] = {
             "phase_reached": "init",
             "used_pose_refinement": False,
             "used_joint_fallback": False,
             "stage2a_mode_requested": self.run_config.stage2a_mode,
             "stage3sr_enabled": self._stage2a_should_run_stage3sr(),
+            "render_devices": [str(device) for device in self.render_devices],
         }
         self.visual_artifacts: dict[str, str] = {}
 
@@ -104,6 +107,33 @@ class RefinementRunner:
         if device_name.startswith("cuda") and not torch.cuda.is_available():
             return torch.device("cpu")
         return torch.device(device_name)
+
+    def _resolve_render_devices(self, device_names: list[str] | None) -> list[torch.device]:
+        """解析渲染设备列表.
+
+        当前优化器与高斯参数仍固定在 `self.device`.
+        `render_devices` 只负责把 view 维渲染负载分摊到多张卡.
+        """
+
+        if not device_names:
+            return [self.device]
+
+        resolved_devices: list[torch.device] = []
+        for device_name in device_names:
+            resolved_device = self._resolve_device(device_name)
+            if resolved_device.type == "cuda":
+                device_index = resolved_device.index if resolved_device.index is not None else 0
+                if device_index >= torch.cuda.device_count():
+                    raise ValueError(
+                        f"render device `{device_name}` is out of range for {torch.cuda.device_count()} visible CUDA devices."
+                    )
+            resolved_devices.append(resolved_device)
+
+        # 主设备始终放在第一位.
+        # 这样 loss 汇总和 optimizer step 不需要改现有语义.
+        if str(self.device) not in {str(device) for device in resolved_devices}:
+            resolved_devices.insert(0, self.device)
+        return resolved_devices
 
     def _move_scene_to_device(self, scene: SceneBundle, device: torch.device) -> SceneBundle:
         """把场景 tensor 迁移到目标设备."""
@@ -126,6 +156,300 @@ class RefinementRunner:
             sr_scale=scene.sr_scale,
         )
 
+    def _slice_scene_view_range(self, scene: SceneBundle, start_index: int, end_index: int) -> SceneBundle:
+        """按 view 维切出一个 scene shard.
+
+        full-view joint optimization 的 batch 仍是 `B=1`.
+        多卡这里只沿着 `V` 维切,保持单个高斯场景共享.
+        """
+
+        target_index = scene.target_index[:, start_index:end_index] if isinstance(scene.target_index, torch.Tensor) else scene.target_index
+        reference_images = (
+            scene.reference_images[:, start_index:end_index] if isinstance(scene.reference_images, torch.Tensor) else scene.reference_images
+        )
+        intrinsics_ref = (
+            scene.intrinsics_ref[:, start_index:end_index] if isinstance(scene.intrinsics_ref, torch.Tensor) else scene.intrinsics_ref
+        )
+        return SceneBundle(
+            gt_images=scene.gt_images[:, start_index:end_index],
+            cam_view=scene.cam_view[:, start_index:end_index],
+            intrinsics=scene.intrinsics[:, start_index:end_index],
+            frame_indices=scene.frame_indices[start_index:end_index],
+            scene_index=scene.scene_index,
+            view_id=scene.view_id,
+            # `view_ids` 是 scene-level metadata,不是 flatten 后逐 observation 的列表.
+            # 因此 shard 里继续保留原始多视角集合,避免 diagnostics 语义漂移.
+            view_ids=scene.view_ids,
+            target_index=target_index,
+            file_name=scene.file_name,
+            reference_images=reference_images,
+            intrinsics_ref=intrinsics_ref,
+            native_hw=scene.native_hw,
+            reference_hw=scene.reference_hw,
+            reference_mode=scene.reference_mode,
+            sr_scale=scene.sr_scale,
+        )
+
+    def _get_scene_shard(self, scene: SceneBundle, device: torch.device, start_index: int, end_index: int) -> SceneBundle:
+        """获取指定 view range 的缓存 shard."""
+
+        height, width = scene.gt_images.shape[-2:]
+        cache_key = (
+            str(device),
+            start_index,
+            end_index,
+            height,
+            width,
+            id(scene.gt_images),
+            id(scene.cam_view),
+            id(scene.intrinsics),
+            id(scene.reference_images) if isinstance(scene.reference_images, torch.Tensor) else -1,
+            id(scene.intrinsics_ref) if isinstance(scene.intrinsics_ref, torch.Tensor) else -1,
+        )
+        if cache_key not in self.scene_shard_cache:
+            shard = self._slice_scene_view_range(scene, start_index, end_index)
+            self.scene_shard_cache[cache_key] = self._move_scene_to_device(shard, device)
+        return self.scene_shard_cache[cache_key]
+
+    def _get_scene_device(self, scene: SceneBundle) -> torch.device:
+        """读取 scene 当前所在设备."""
+
+        return scene.gt_images.device
+
+    def _get_gaussians_for_device(
+        self,
+        device: torch.device,
+        gaussians_primary: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """按目标设备拿到可参与 autograd 的高斯张量副本."""
+
+        active_gaussians = self.gaussians.to_tensor() if gaussians_primary is None else gaussians_primary
+        if active_gaussians.device == device:
+            return active_gaussians
+        return active_gaussians.to(device)
+
+    def _build_render_shards(self, num_views: int) -> list[tuple[torch.device, int, int]]:
+        """把 view 维均匀切到可用渲染设备上."""
+
+        active_devices = self.render_devices[: min(len(self.render_devices), num_views)]
+        num_active_devices = len(active_devices)
+        if num_active_devices <= 1:
+            return [(active_devices[0], 0, num_views)]
+
+        # 真实 CUDA renderer 在 `render_meta` 合并阶段会为 shard 内全部 view
+        # 额外保留一份 dense meta.
+        # 对 full-view sub4 这类大 observation 任务来说, 即便已经做了双卡分片,
+        # “每张卡一次吃 3 个 view” 仍然可能在 renderer 内部 OOM.
+        # 因此多 CUDA 设备场景下进一步收成“单 view shard + 设备轮转”,
+        # 用更多前向次数换稳定落地.
+        if num_active_devices > 1 and any(device.type == "cuda" for device in active_devices):
+            return [
+                (active_devices[view_index % num_active_devices], view_index, view_index + 1)
+                for view_index in range(num_views)
+            ]
+
+        shard_specs: list[tuple[torch.device, int, int]] = []
+        start_index = 0
+        base_views_per_device = num_views // num_active_devices
+        extra_views = num_views % num_active_devices
+        for device_index, device in enumerate(active_devices):
+            shard_length = base_views_per_device + (1 if device_index < extra_views else 0)
+            end_index = start_index + shard_length
+            if shard_length > 0:
+                shard_specs.append((device, start_index, end_index))
+            start_index = end_index
+        return shard_specs
+
+    def _move_render_meta_to_device(
+        self,
+        render_meta: dict[str, Any] | None,
+        device: torch.device,
+        *,
+        detach_tensors: bool = False,
+    ) -> dict[str, Any] | None:
+        """把 renderer meta 迁回主设备."""
+
+        if not isinstance(render_meta, dict):
+            return None
+
+        moved_meta: dict[str, Any] = {}
+        for key, value in render_meta.items():
+            if isinstance(value, torch.Tensor):
+                moved_tensor = value.detach() if detach_tensors else value
+                moved_meta[key] = moved_tensor.to(device)
+            else:
+                moved_meta[key] = value
+        return moved_meta
+
+    def _merge_render_meta_shards(self, render_meta_shards: list[dict[str, Any] | None]) -> dict[str, Any] | None:
+        """把多卡 view shard 的 meta 沿 view 维重新拼回去."""
+
+        valid_meta_shards = [render_meta for render_meta in render_meta_shards if isinstance(render_meta, dict)]
+        if not valid_meta_shards:
+            return None
+
+        merged_meta: dict[str, Any] = {}
+        all_keys = set().union(*(render_meta.keys() for render_meta in valid_meta_shards))
+        for key in all_keys:
+            values = [render_meta.get(key) for render_meta in valid_meta_shards]
+            tensor_values = [value for value in values if isinstance(value, torch.Tensor)]
+            if len(tensor_values) == len(values):
+                if tensor_values[0].ndim >= 2:
+                    merged_meta[key] = torch.cat(tensor_values, dim=1)
+                else:
+                    merged_meta[key] = tensor_values[0]
+                continue
+
+            first_non_none = next((value for value in values if value is not None), None)
+            if first_non_none is not None:
+                merged_meta[key] = first_non_none
+
+        return merged_meta
+
+    def _render_scene_single_device(self, scene: SceneBundle) -> dict[str, torch.Tensor]:
+        """沿用现有单设备渲染路径."""
+
+        renderer = self._get_renderer_for_scene(scene)
+        render_output = renderer.render(
+            self._get_gaussians_for_device(self._get_scene_device(scene)),
+            scene,
+        )
+        if "images_pred" not in render_output:
+            raise KeyError("Renderer output must contain `images_pred`.")
+        return render_output
+
+    def _render_scene_shards(self, scene: SceneBundle) -> list[dict[str, Any]]:
+        """渲染并返回每个 view shard 的原始输出.
+
+        这个辅助函数不做任何聚合.
+        调用方可以按自己的需要:
+        - 聚到主卡
+        - 聚到 CPU
+        - 或者逐 shard 直接做 loss/backward
+        """
+
+        if scene.gt_images.shape[0] != 1:
+            self.diagnostics_state.setdefault("warnings", []).append("multi_device_render_fallback_batch_gt_1")
+            return []
+
+        shard_specs = self._build_render_shards(scene.gt_images.shape[1])
+        if len(shard_specs) <= 1:
+            return []
+
+        gaussians_primary = self.gaussians.to_tensor()
+        shard_outputs: list[dict[str, Any]] = []
+        for render_device, start_index, end_index in shard_specs:
+            shard_scene = self._get_scene_shard(scene, render_device, start_index, end_index)
+            renderer = self._get_renderer_for_scene(shard_scene)
+            shard_output = renderer.render(
+                self._get_gaussians_for_device(render_device, gaussians_primary),
+                shard_scene,
+            )
+            if "images_pred" not in shard_output:
+                raise KeyError("Renderer output must contain `images_pred`.")
+            shard_outputs.append(
+                {
+                    "device": render_device,
+                    "start_index": start_index,
+                    "end_index": end_index,
+                    "scene": shard_scene,
+                    "output": shard_output,
+                }
+            )
+        return shard_outputs
+
+    def _use_multi_device_render(self, scene: SceneBundle) -> bool:
+        """判断当前 scene 是否真的启用多设备渲染."""
+
+        return len(self.render_devices) > 1 and scene.gt_images.shape[1] > 1
+
+    def _render_scene_multi_device(
+        self,
+        scene: SceneBundle,
+        *,
+        gather_device: torch.device | None = None,
+        detach_outputs: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """按 view shard 把渲染负载切到多张设备上.
+
+        这里仍由主设备持有参数与 optimizer.
+        其它设备只负责前向渲染对应的 view 子集.
+        """
+
+        if scene.gt_images.shape[0] != 1:
+            self.diagnostics_state.setdefault("warnings", []).append("multi_device_render_fallback_batch_gt_1")
+            return self._render_scene_single_device(scene)
+
+        shard_outputs = self._render_scene_shards(scene)
+        if not shard_outputs:
+            return self._render_scene_single_device(scene)
+
+        target_device = self.device if gather_device is None else gather_device
+        image_shards: list[torch.Tensor] = []
+        alpha_shards: list[torch.Tensor] = []
+        depth_shards: list[torch.Tensor] = []
+        render_meta_shards: list[dict[str, Any] | None] = []
+
+        for shard_payload in shard_outputs:
+            shard_output = shard_payload["output"]
+            image_tensor = shard_output["images_pred"].detach() if detach_outputs else shard_output["images_pred"]
+            image_shards.append(image_tensor.to(target_device))
+            if isinstance(shard_output.get("alphas_pred"), torch.Tensor):
+                alpha_tensor = shard_output["alphas_pred"].detach() if detach_outputs else shard_output["alphas_pred"]
+                alpha_shards.append(alpha_tensor.to(target_device))
+            if isinstance(shard_output.get("depths_pred"), torch.Tensor):
+                depth_tensor = shard_output["depths_pred"].detach() if detach_outputs else shard_output["depths_pred"]
+                depth_shards.append(depth_tensor.to(target_device))
+            render_meta_shards.append(
+                self._move_render_meta_to_device(
+                    shard_output.get("render_meta"),
+                    target_device,
+                    detach_tensors=detach_outputs,
+                )
+            )
+
+        merged_output: dict[str, torch.Tensor | dict[str, Any]] = {
+            "images_pred": torch.cat(image_shards, dim=1),
+        }
+        if alpha_shards:
+            merged_output["alphas_pred"] = torch.cat(alpha_shards, dim=1)
+        if depth_shards:
+            merged_output["depths_pred"] = torch.cat(depth_shards, dim=1)
+
+        merged_meta = self._merge_render_meta_shards(render_meta_shards)
+        if merged_meta is not None:
+            merged_output["render_meta"] = merged_meta
+
+        return merged_output  # type: ignore[return-value]
+
+    def _render_scene_for_evaluation(self, scene: SceneBundle) -> dict[str, torch.Tensor]:
+        """渲染一个仅用于指标/诊断的 scene.
+
+        多卡场景下把结果直接聚合到 CPU.
+        这样可以避免 Phase 0 / Phase 1 / Phase 3S 这类无 backward 阶段
+        在主卡上重新拼完整 view tensor 时再次 OOM.
+        """
+
+        if self._use_multi_device_render(scene):
+            return self._render_scene_multi_device(scene, gather_device=torch.device("cpu"), detach_outputs=True)
+
+        render_output = self._render_scene_single_device(scene)
+        output_cpu: dict[str, torch.Tensor | dict[str, Any]] = {
+            "images_pred": render_output["images_pred"].detach().cpu(),
+        }
+        if isinstance(render_output.get("alphas_pred"), torch.Tensor):
+            output_cpu["alphas_pred"] = render_output["alphas_pred"].detach().cpu()
+        if isinstance(render_output.get("depths_pred"), torch.Tensor):
+            output_cpu["depths_pred"] = render_output["depths_pred"].detach().cpu()
+        render_meta = self._move_render_meta_to_device(
+            render_output.get("render_meta"),
+            torch.device("cpu"),
+            detach_tensors=True,
+        )
+        if render_meta is not None:
+            output_cpu["render_meta"] = render_meta
+        return output_cpu  # type: ignore[return-value]
+
     def _get_renderer_for_scene(self, scene: SceneBundle) -> Any:
         """按目标分辨率选择可复用的 renderer."""
 
@@ -145,11 +469,9 @@ class RefinementRunner:
     def render_scene(self, scene: SceneBundle) -> dict[str, torch.Tensor]:
         """渲染任意分辨率的场景视图."""
 
-        renderer = self._get_renderer_for_scene(scene)
-        render_output = renderer.render(self.gaussians.to_tensor(), scene)
-        if "images_pred" not in render_output:
-            raise KeyError("Renderer output must contain `images_pred`.")
-        return render_output
+        if self._use_multi_device_render(scene):
+            return self._render_scene_multi_device(scene)
+        return self._render_scene_single_device(scene)
 
     def render_current_scene(self) -> dict[str, torch.Tensor]:
         """渲染当前高斯场景."""
@@ -232,32 +554,54 @@ class RefinementRunner:
             return "enhanced"
         return "legacy"
 
-    def _get_reference_images(self) -> torch.Tensor:
+    def _get_reference_images(self, scene: SceneBundle | None = None) -> torch.Tensor:
         """统一解析当前 reference 图像张量."""
 
-        if isinstance(self.scene.reference_images, torch.Tensor):
-            return self.scene.reference_images
-        return self.scene.gt_images
+        active_scene = self.scene if scene is None else scene
+        if isinstance(active_scene.reference_images, torch.Tensor):
+            return active_scene.reference_images
+        return active_scene.gt_images
 
-    def _resolve_patch_sizes(self) -> tuple[int, int, int]:
+    def _get_gt_images(
+        self,
+        scene: SceneBundle | None = None,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """统一拿到当前 scene 的 GT 图像,并按需要对齐设备/类型."""
+
+        active_scene = self.scene if scene is None else scene
+        gt_images = active_scene.gt_images
+        if device is None and dtype is None:
+            return gt_images
+
+        target_device = gt_images.device if device is None else device
+        target_dtype = gt_images.dtype if dtype is None else dtype
+        if gt_images.device == target_device and gt_images.dtype == target_dtype:
+            return gt_images
+        return gt_images.to(device=target_device, dtype=target_dtype)
+
+    def _resolve_patch_sizes(self, scene: SceneBundle | None = None) -> tuple[int, int, int]:
         """解析 native/reference patch 尺寸和缩放倍率."""
 
+        active_scene = self.scene if scene is None else scene
         reference_patch_size = int(self.hparams.patch_size)
         if reference_patch_size <= 0:
             raise ValueError("patch_size must be positive when patch supervision is enabled.")
 
-        scale_value = float(self.scene.sr_scale)
+        scale_value = float(active_scene.sr_scale)
         scale_int = int(round(scale_value))
         if scale_int <= 0 or abs(scale_value - scale_int) > 1e-6:
-            raise ValueError(f"Patch supervision requires integer sr_scale, got {self.scene.sr_scale}.")
+            raise ValueError(f"Patch supervision requires integer sr_scale, got {active_scene.sr_scale}.")
         if reference_patch_size % scale_int != 0:
             raise ValueError(
                 f"patch_size {reference_patch_size} must be divisible by sr_scale {scale_int}."
             )
 
         native_patch_size = reference_patch_size // scale_int
-        native_height, native_width = self.scene.gt_images.shape[-2:]
-        reference_images = self._get_reference_images()
+        native_height, native_width = active_scene.gt_images.shape[-2:]
+        reference_images = self._get_reference_images(active_scene)
         reference_height, reference_width = reference_images.shape[-2:]
         if native_patch_size > native_height or native_patch_size > native_width:
             raise ValueError(
@@ -269,10 +613,10 @@ class RefinementRunner:
             )
         return native_patch_size, reference_patch_size, scale_int
 
-    def sample_patch_windows(self, residual_map: torch.Tensor) -> torch.Tensor:
+    def sample_patch_windows(self, residual_map: torch.Tensor, scene: SceneBundle | None = None) -> torch.Tensor:
         """根据 residual 热点在 native 尺度采样 patch window."""
 
-        native_patch_size, _, _ = self._resolve_patch_sizes()
+        native_patch_size, _, _ = self._resolve_patch_sizes(scene)
         batch_size, num_views, _, height, width = residual_map.shape
         patch_windows = torch.zeros(batch_size, num_views, 4, dtype=torch.long, device=residual_map.device)
         residual_energy = residual_map.detach().mean(dim=2)
@@ -291,19 +635,27 @@ class RefinementRunner:
                 )
         return patch_windows
 
-    def map_patch_windows_to_reference(self, patch_windows_native: torch.Tensor) -> torch.Tensor:
+    def map_patch_windows_to_reference(
+        self,
+        patch_windows_native: torch.Tensor,
+        scene: SceneBundle | None = None,
+    ) -> torch.Tensor:
         """把 native patch window 映射到 reference 尺度."""
 
-        _, _, scale_int = self._resolve_patch_sizes()
+        _, _, scale_int = self._resolve_patch_sizes(scene)
         patch_windows_ref = patch_windows_native.detach().clone()
         patch_windows_ref[..., 0:2] *= scale_int
         patch_windows_ref[..., 2:4] *= scale_int
         return patch_windows_ref
 
-    def gather_reference_patch(self, patch_windows_ref: torch.Tensor) -> torch.Tensor:
+    def gather_reference_patch(
+        self,
+        patch_windows_ref: torch.Tensor,
+        scene: SceneBundle | None = None,
+    ) -> torch.Tensor:
         """从 reference 图像中提取 patch."""
 
-        reference_images = self._get_reference_images()
+        reference_images = self._get_reference_images(scene)
         return self._gather_tensor_patch(reference_images, patch_windows_ref)
 
     def _gather_tensor_patch(self, source_tensor: torch.Tensor, patch_windows: torch.Tensor) -> torch.Tensor:
@@ -338,10 +690,11 @@ class RefinementRunner:
         )
         return resized.view(batch_size, num_views, channels, *output_hw)
 
-    def build_patch_intrinsics(self, patch_windows_ref: torch.Tensor) -> torch.Tensor:
+    def build_patch_intrinsics(self, patch_windows_ref: torch.Tensor, scene: SceneBundle | None = None) -> torch.Tensor:
         """基于 reference intrinsics 构造 patch camera intrinsics."""
 
-        base_intrinsics = self.scene.intrinsics_ref if isinstance(self.scene.intrinsics_ref, torch.Tensor) else self.scene.intrinsics
+        active_scene = self.scene if scene is None else scene
+        base_intrinsics = active_scene.intrinsics_ref if isinstance(active_scene.intrinsics_ref, torch.Tensor) else active_scene.intrinsics
         patch_intrinsics = base_intrinsics.detach().clone()
         patch_intrinsics[..., 2] -= patch_windows_ref[..., 1].to(dtype=patch_intrinsics.dtype)
         patch_intrinsics[..., 3] -= patch_windows_ref[..., 0].to(dtype=patch_intrinsics.dtype)
@@ -350,32 +703,37 @@ class RefinementRunner:
     def render_patch_prediction(
         self,
         patch_windows_native: torch.Tensor,
+        scene: SceneBundle | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """在 reference 尺度渲染 patch 并返回对应参考图."""
 
-        patch_windows_ref = self.map_patch_windows_to_reference(patch_windows_native)
-        reference_patch = self.gather_reference_patch(patch_windows_ref)
-        patch_intrinsics = self.build_patch_intrinsics(patch_windows_ref)
-        native_patch_size, reference_patch_size, _ = self._resolve_patch_sizes()
+        active_scene = self.scene if scene is None else scene
+        patch_windows_ref = self.map_patch_windows_to_reference(patch_windows_native, scene=active_scene)
+        reference_patch = self.gather_reference_patch(patch_windows_ref, scene=active_scene)
+        patch_intrinsics = self.build_patch_intrinsics(patch_windows_ref, scene=active_scene)
+        native_patch_size, reference_patch_size, _ = self._resolve_patch_sizes(active_scene)
 
         patch_scene = SceneBundle(
             gt_images=torch.zeros_like(reference_patch),
-            cam_view=self.scene.cam_view,
+            cam_view=active_scene.cam_view,
             intrinsics=patch_intrinsics,
-            frame_indices=self.scene.frame_indices,
-            scene_index=self.scene.scene_index,
-            view_id=self.scene.view_id,
-            view_ids=self.scene.view_ids,
-            target_index=self.scene.target_index,
-            file_name=self.scene.file_name,
+            frame_indices=active_scene.frame_indices,
+            scene_index=active_scene.scene_index,
+            view_id=active_scene.view_id,
+            view_ids=active_scene.view_ids,
+            target_index=active_scene.target_index,
+            file_name=active_scene.file_name,
             reference_images=reference_patch,
             intrinsics_ref=patch_intrinsics,
             native_hw=(native_patch_size, native_patch_size),
             reference_hw=(reference_patch_size, reference_patch_size),
-            reference_mode=self.scene.reference_mode,
-            sr_scale=self.scene.sr_scale,
+            reference_mode=active_scene.reference_mode,
+            sr_scale=active_scene.sr_scale,
         )
-        patch_render_output = self.render_scene(patch_scene)
+        # patch 渲染的目标只是局部监督.
+        # 即便主场景启用了多卡,这里也直接在 patch scene 当前设备上单卡渲染,
+        # 避免再次走整段 view 聚合,把小 patch 路径重新放大成主卡 OOM 风险点.
+        patch_render_output = self._render_scene_single_device(patch_scene)
         return patch_render_output["images_pred"], reference_patch, patch_intrinsics
 
     def _compute_psnr(self, pred_rgb: torch.Tensor, gt_rgb: torch.Tensor) -> float:
@@ -401,6 +759,10 @@ class RefinementRunner:
         self,
         residual_map: torch.Tensor,
         reference_tensor: torch.Tensor,
+        *,
+        scene: SceneBundle | None = None,
+        native_weight_map: torch.Tensor | None = None,
+        sr_selection_map: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """统一计算可选 patch supervision 损失.
 
@@ -413,22 +775,34 @@ class RefinementRunner:
         if not self._patch_supervision_configured():
             return loss_patch_rgb, loss_patch_perceptual
 
-        patch_windows_native = self.sample_patch_windows(residual_map)
-        pred_patch, reference_patch, _ = self.render_patch_prediction(patch_windows_native)
-        patch_windows_ref = self.map_patch_windows_to_reference(patch_windows_native)
+        active_scene = self.scene if scene is None else scene
+        patch_windows_native = self.sample_patch_windows(residual_map, scene=active_scene)
+        pred_patch, reference_patch, _ = self.render_patch_prediction(patch_windows_native, scene=active_scene)
+        patch_windows_ref = self.map_patch_windows_to_reference(patch_windows_native, scene=active_scene)
 
-        native_weight_map = self.prev_weight_map
-        if native_weight_map is None:
-            native_weight_map = torch.ones_like(residual_map)
-        robust_patch_native = self._gather_tensor_patch(native_weight_map, patch_windows_native)
+        active_weight_map = self.prev_weight_map if native_weight_map is None else native_weight_map
+        if active_weight_map is None:
+            active_weight_map = torch.ones_like(residual_map)
+        elif active_weight_map.device != residual_map.device or active_weight_map.dtype != residual_map.dtype:
+            active_weight_map = active_weight_map.to(device=residual_map.device, dtype=residual_map.dtype)
+        robust_patch_native = self._gather_tensor_patch(active_weight_map, patch_windows_native)
         robust_patch = self._resize_patch_tensor(robust_patch_native, pred_patch.shape[-2:])
 
-        if self.sr_selection_map is None:
+        active_sr_selection = self.sr_selection_map if sr_selection_map is None else sr_selection_map
+        if active_sr_selection is None:
             sr_selection_patch = torch.ones_like(robust_patch)
         else:
-            sr_selection_patch = self._gather_tensor_patch(self.sr_selection_map, patch_windows_ref).to(dtype=pred_patch.dtype)
+            if active_sr_selection.device != pred_patch.device or active_sr_selection.dtype != pred_patch.dtype:
+                active_sr_selection = active_sr_selection.to(device=pred_patch.device, dtype=pred_patch.dtype)
+            sr_selection_patch = self._gather_tensor_patch(active_sr_selection, patch_windows_ref).to(
+                device=pred_patch.device,
+                dtype=pred_patch.dtype,
+            )
 
-        patch_weights = self.weight_builder.combine_sr_weights(robust_patch.to(dtype=pred_patch.dtype), sr_selection_patch)
+        patch_weights = self.weight_builder.combine_sr_weights(
+            robust_patch.to(device=pred_patch.device, dtype=pred_patch.dtype),
+            sr_selection_patch,
+        )
         loss_patch_rgb = compute_weighted_rgb_loss(pred_patch, reference_patch, patch_weights)
         loss_patch_perceptual = compute_patch_perceptual_loss(pred_patch, reference_patch)
         return loss_patch_rgb, loss_patch_perceptual
@@ -438,11 +812,15 @@ class RefinementRunner:
         pred_rgb: torch.Tensor,
         residual_map: torch.Tensor | None = None,
         weight_map: torch.Tensor | None = None,
+        gt_rgb: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """汇总当前预测对应的指标."""
 
+        target_rgb = self._get_gt_images(device=pred_rgb.device, dtype=pred_rgb.dtype) if gt_rgb is None else gt_rgb
+        if target_rgb.device != pred_rgb.device or target_rgb.dtype != pred_rgb.dtype:
+            target_rgb = target_rgb.to(device=pred_rgb.device, dtype=pred_rgb.dtype)
         summary = {
-            "psnr": self._compute_psnr(pred_rgb, self.scene.gt_images),
+            "psnr": self._compute_psnr(pred_rgb, target_rgb),
             "sharpness": self._compute_sharpness(pred_rgb),
         }
         summary.update(self.gaussians.summarize_gaussian_stats())
@@ -489,6 +867,223 @@ class RefinementRunner:
         self.diagnostics_state["need_geometry"] = local_overlap_persistent and stage2b_signal_count >= 2
         self.diagnostics_state["local_overlap_persistent"] = local_overlap_persistent
 
+    def _slice_view_tensor(
+        self,
+        tensor: torch.Tensor | None,
+        start_index: int,
+        end_index: int,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor | None:
+        """切 view shard,并按需要对齐设备和 dtype."""
+
+        if tensor is None:
+            return None
+
+        tensor_shard = tensor[:, start_index:end_index]
+        target_device = tensor_shard.device if device is None else device
+        target_dtype = tensor_shard.dtype if dtype is None else dtype
+        if tensor_shard.device == target_device and tensor_shard.dtype == target_dtype:
+            return tensor_shard
+        return tensor_shard.to(device=target_device, dtype=target_dtype)
+
+    def _run_appearance_stage_multi_device(
+        self,
+        *,
+        stage_name: str,
+        freeze_stage_name: str,
+        include_patch_supervision: bool,
+        allow_pruning: bool,
+    ) -> dict[str, Any]:
+        """运行真正的多卡 appearance 优化循环.
+
+        核心策略:
+        1. 每张卡只渲染并保留自己负责的 view shard 计算图
+        2. residual / diagnostics 先 detach 后聚到 CPU
+        3. 全局权重图在 CPU 上按完整 residual 统一构造
+        4. 再把对应 shard 的权重切回各卡做 loss/backward
+        """
+
+        self.current_stage = stage_name
+        self.gaussians.freeze_for_stage(freeze_stage_name)
+        optimizer = self.gaussians.build_optimizer(freeze_stage_name, self.hparams)
+        gt_rgb_cpu = self._get_gt_images().detach().cpu()
+        total_views = self.scene.gt_images.shape[1]
+
+        final_metrics: dict[str, Any] = {}
+        for iter_idx in range(self.hparams.iters_stage2a):
+            optimizer.zero_grad(set_to_none=True)
+            shard_outputs = self._render_scene_shards(self.scene)
+            if not shard_outputs:
+                raise RuntimeError("multi-device appearance stage requires at least two render shards.")
+
+            pred_rgb_cpu_shards: list[torch.Tensor] = []
+            residual_cpu_shards: list[torch.Tensor] = []
+            render_meta_cpu_shards: list[dict[str, Any] | None] = []
+            shard_records: list[dict[str, Any]] = []
+
+            for shard_payload in shard_outputs:
+                shard_scene = shard_payload["scene"]
+                shard_output = shard_payload["output"]
+                pred_rgb_shard = shard_output["images_pred"]
+                render_meta_shard = self._extract_render_meta(shard_output)
+                residual_map_shard = self.weight_builder.build_residual_map(pred_rgb_shard, shard_scene.gt_images)
+
+                pred_rgb_cpu_shards.append(pred_rgb_shard.detach().cpu())
+                residual_cpu_shards.append(residual_map_shard.detach().cpu())
+                render_meta_cpu_shards.append(
+                    self._move_render_meta_to_device(
+                        render_meta_shard,
+                        torch.device("cpu"),
+                        detach_tensors=True,
+                    )
+                )
+                shard_records.append(
+                    {
+                        "start_index": shard_payload["start_index"],
+                        "end_index": shard_payload["end_index"],
+                        "scene": shard_scene,
+                        "pred_rgb": pred_rgb_shard,
+                        "residual_map": residual_map_shard,
+                        "render_meta": render_meta_shard,
+                    }
+                )
+
+            pred_rgb_cpu = torch.cat(pred_rgb_cpu_shards, dim=1)
+            residual_map_cpu = torch.cat(residual_cpu_shards, dim=1)
+            previous_weight_map = self.prev_weight_map.detach().cpu() if isinstance(self.prev_weight_map, torch.Tensor) else None
+            weight_map_cpu = self.weight_builder.build_weight_map(residual_map_cpu, previous_weight_map).detach().cpu()
+            self.prev_weight_map = weight_map_cpu
+            self.latest_render_meta = self._merge_render_meta_shards(render_meta_cpu_shards)
+
+            loss_rgb_value = 0.0
+            loss_patch_rgb_value = 0.0
+            loss_patch_perceptual_value = 0.0
+            loss_sampling_smooth_value = 0.0
+
+            for shard_record in shard_records:
+                start_index = int(shard_record["start_index"])
+                end_index = int(shard_record["end_index"])
+                shard_scene = shard_record["scene"]
+                pred_rgb_shard = shard_record["pred_rgb"]
+                residual_map_shard = shard_record["residual_map"]
+                render_meta_shard = shard_record["render_meta"]
+                shard_view_fraction = float(end_index - start_index) / float(total_views)
+
+                weight_map_shard = self._slice_view_tensor(
+                    weight_map_cpu,
+                    start_index,
+                    end_index,
+                    device=pred_rgb_shard.device,
+                    dtype=pred_rgb_shard.dtype,
+                )
+                if weight_map_shard is None:
+                    raise RuntimeError("weight_map_shard should never be None during multi-device appearance stage.")
+
+                loss_rgb = compute_weighted_rgb_loss(pred_rgb_shard, shard_scene.gt_images, weight_map_shard)
+                shard_loss_total = shard_view_fraction * loss_rgb
+                loss_rgb_value += float(loss_rgb.item()) * shard_view_fraction
+
+                if include_patch_supervision:
+                    sr_selection_map_shard = self._slice_view_tensor(
+                        self.sr_selection_map,
+                        start_index,
+                        end_index,
+                        device=pred_rgb_shard.device,
+                        dtype=pred_rgb_shard.dtype,
+                    )
+                    loss_patch_rgb, loss_patch_perceptual = self._compute_patch_losses(
+                        residual_map_shard,
+                        loss_rgb,
+                        scene=shard_scene,
+                        native_weight_map=weight_map_shard,
+                        sr_selection_map=sr_selection_map_shard,
+                    )
+                    fidelity_score = self.gaussian_fidelity_score
+                    if isinstance(fidelity_score, torch.Tensor):
+                        fidelity_score = fidelity_score.to(device=pred_rgb_shard.device, dtype=pred_rgb_shard.dtype)
+                    scales_tensor = self.gaussians.scales
+                    if scales_tensor.device != pred_rgb_shard.device:
+                        scales_tensor = scales_tensor.to(pred_rgb_shard.device)
+                    loss_sampling_smooth = compute_sampling_smooth_loss(
+                        scales=scales_tensor,
+                        fidelity_score=fidelity_score,
+                        render_meta=render_meta_shard,
+                        radius_threshold=self.hparams.sampling_radius_threshold,
+                    )
+                    shard_loss_total = shard_loss_total + shard_view_fraction * (
+                        self.hparams.lambda_patch_rgb * loss_patch_rgb
+                        + self.hparams.lambda_patch_perceptual * loss_patch_perceptual
+                        + self.hparams.lambda_sampling_smooth * loss_sampling_smooth
+                    )
+                    loss_patch_rgb_value += float(loss_patch_rgb.item()) * shard_view_fraction
+                    loss_patch_perceptual_value += float(loss_patch_perceptual.item()) * shard_view_fraction
+                    loss_sampling_smooth_value += float(loss_sampling_smooth.item()) * shard_view_fraction
+
+                shard_loss_total.backward()
+
+            loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
+            loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
+            common_loss = self.hparams.lambda_scale_tail * loss_scale + self.hparams.lambda_opacity_sparse * loss_opacity
+            common_loss.backward()
+
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            self.gaussians.clamp_stage_constraints(freeze_stage_name, self.hparams)
+
+            final_metrics = self._summarize_prediction(
+                pred_rgb_cpu,
+                residual_map=residual_map_cpu,
+                weight_map=weight_map_cpu,
+                gt_rgb=gt_rgb_cpu,
+            )
+            final_metrics.update(
+                {
+                    "loss_total": (
+                        loss_rgb_value
+                        + self.hparams.lambda_scale_tail * float(loss_scale.item())
+                        + self.hparams.lambda_opacity_sparse * float(loss_opacity.item())
+                        + self.hparams.lambda_patch_rgb * loss_patch_rgb_value
+                        + self.hparams.lambda_patch_perceptual * loss_patch_perceptual_value
+                        + self.hparams.lambda_sampling_smooth * loss_sampling_smooth_value
+                    ),
+                    "loss_rgb_weighted": loss_rgb_value,
+                    "loss_scale_tail": float(loss_scale.item()),
+                    "loss_opacity_sparse": float(loss_opacity.item()),
+                }
+            )
+            if include_patch_supervision:
+                final_metrics.update(
+                    {
+                        "loss_patch_rgb": loss_patch_rgb_value,
+                        "loss_patch_perceptual": loss_patch_perceptual_value,
+                        "loss_sampling_smooth": loss_sampling_smooth_value,
+                    }
+                )
+
+            if allow_pruning and self.controller.should_prune_now(iter_idx + 1):
+                prune_summary = self.gaussians.prune_low_opacity(
+                    threshold=self.hparams.opacity_prune_threshold,
+                    max_fraction=self.hparams.prune_max_fraction,
+                    min_gaussians_to_keep=self.hparams.min_gaussians_to_keep,
+                )
+                self.diagnostics.write_prune_summary(iteration=iter_idx + 1, summary=prune_summary)
+                final_metrics.update(self.gaussians.summarize_gaussian_stats())
+                self.diagnostics_state.setdefault("prune_history", []).append(prune_summary)
+                self.diagnostics_state["last_prune"] = prune_summary
+
+                if prune_summary["pruned_count"] > 0:
+                    optimizer = self.gaussians.build_optimizer(freeze_stage_name, self.hparams)
+
+            self._log_and_maybe_save(stage_name, final_metrics, residual_map_cpu, weight_map_cpu, iter_idx=iter_idx)
+
+            stage_history = self.diagnostics.stage_history.get(stage_name, [])
+            if self.controller.should_stop_stage(stage_name, stage_history):
+                break
+
+        return final_metrics
+
     def _run_appearance_stage(
         self,
         *,
@@ -505,6 +1100,14 @@ class RefinementRunner:
         - 是否允许 pruning
         """
 
+        if self._use_multi_device_render(self.scene):
+            return self._run_appearance_stage_multi_device(
+                stage_name=stage_name,
+                freeze_stage_name=freeze_stage_name,
+                include_patch_supervision=include_patch_supervision,
+                allow_pruning=allow_pruning,
+            )
+
         self.current_stage = stage_name
         self.gaussians.freeze_for_stage(freeze_stage_name)
         optimizer = self.gaussians.build_optimizer(freeze_stage_name, self.hparams)
@@ -515,10 +1118,14 @@ class RefinementRunner:
             pred_rgb = render_output["images_pred"]
             render_meta = self._extract_render_meta(render_output)
             self.latest_render_meta = render_meta
-            residual_map = self.weight_builder.build_residual_map(pred_rgb, self.scene.gt_images)
-            self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, self.prev_weight_map)
+            gt_rgb = self._get_gt_images(device=pred_rgb.device, dtype=pred_rgb.dtype)
+            residual_map = self.weight_builder.build_residual_map(pred_rgb, gt_rgb)
+            previous_weight_map = self.prev_weight_map
+            if isinstance(previous_weight_map, torch.Tensor):
+                previous_weight_map = previous_weight_map.to(device=pred_rgb.device, dtype=pred_rgb.dtype)
+            self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, previous_weight_map)
 
-            loss_rgb = compute_weighted_rgb_loss(pred_rgb, self.scene.gt_images, self.prev_weight_map)
+            loss_rgb = compute_weighted_rgb_loss(pred_rgb, gt_rgb, self.prev_weight_map)
             loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
             loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
             if include_patch_supervision:
@@ -548,7 +1155,12 @@ class RefinementRunner:
             optimizer.zero_grad(set_to_none=True)
             self.gaussians.clamp_stage_constraints(freeze_stage_name, self.hparams)
 
-            final_metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map)
+            final_metrics = self._summarize_prediction(
+                pred_rgb,
+                residual_map=residual_map,
+                weight_map=self.prev_weight_map,
+                gt_rgb=gt_rgb,
+            )
             final_metrics.update(
                 {
                     "loss_total": float(loss_total.item()),
@@ -616,9 +1228,10 @@ class RefinementRunner:
         """基于 renderer meta 构造第一版 fidelity 与 selection 诊断."""
 
         self.current_stage = "phase3s"
-        render_output = self.render_current_scene()
+        render_output = self._render_scene_for_evaluation(self.scene)
         pred_rgb = render_output["images_pred"]
-        residual_map = self.weight_builder.build_residual_map(pred_rgb, self.scene.gt_images)
+        gt_rgb = self._get_gt_images(device=pred_rgb.device, dtype=pred_rgb.dtype)
+        residual_map = self.weight_builder.build_residual_map(pred_rgb, gt_rgb)
         render_meta = self._extract_render_meta(render_output)
 
         fidelity_score = self.weight_builder.compute_gaussian_fidelity_score(render_meta)
@@ -636,10 +1249,10 @@ class RefinementRunner:
             sr_selection_map = self._build_default_sr_selection_map(residual_map)
             self.diagnostics_state.setdefault("warnings", []).append("phase3s_missing_sr_selection_meta")
         self.latest_render_meta = render_meta
-        self.gaussian_fidelity_score = fidelity_score.detach()
-        self.sr_selection_map = sr_selection_map.detach()
+        self.gaussian_fidelity_score = fidelity_score.detach().cpu()
+        self.sr_selection_map = sr_selection_map.detach().cpu()
 
-        metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map)
+        metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map, gt_rgb=gt_rgb)
         metrics.update(self.weight_builder.summarize_fidelity_stats(fidelity_score))
         metrics["sr_selection_mean"] = float(sr_selection_map.mean().item())
         self._log_and_maybe_save("phase3s", metrics, residual_map, self.prev_weight_map, iter_idx=0)
@@ -690,16 +1303,20 @@ class RefinementRunner:
         """
 
         self.current_stage = "stage2a"
-        render_output = self.render_current_scene()
+        render_output = self._render_scene_for_evaluation(self.scene)
         pred_rgb = render_output["images_pred"]
-        residual_map = self.weight_builder.build_residual_map(pred_rgb, self.scene.gt_images)
-        self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, self.prev_weight_map)
+        gt_rgb = self._get_gt_images(device=pred_rgb.device, dtype=pred_rgb.dtype)
+        residual_map = self.weight_builder.build_residual_map(pred_rgb, gt_rgb)
+        prev_weight_map = self.prev_weight_map
+        if isinstance(prev_weight_map, torch.Tensor):
+            prev_weight_map = prev_weight_map.to(device=pred_rgb.device, dtype=pred_rgb.dtype)
+        self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, prev_weight_map).detach().cpu()
 
-        loss_rgb = compute_weighted_rgb_loss(pred_rgb, self.scene.gt_images, self.prev_weight_map)
+        loss_rgb = compute_weighted_rgb_loss(pred_rgb, gt_rgb, self.prev_weight_map)
         loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
         loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
         loss_patch_rgb, loss_patch_perceptual = self._compute_patch_losses(residual_map, loss_rgb)
-        metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map)
+        metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map, gt_rgb=gt_rgb)
         metrics.update(
             {
                 "loss_total": float(loss_rgb.item()),
@@ -758,7 +1375,7 @@ class RefinementRunner:
         # baseline 是“优化前”的核心对照.
         # 在 Phase 0 就立刻落盘,后面无论 stop 在哪一阶段都能拿到 before 结果.
         self._export_rgb_artifacts("baseline_render", pred_rgb)
-        self._export_rgb_artifacts("gt_reference", self.scene.gt_images)
+        self._export_rgb_artifacts("gt_reference", self._get_gt_images().detach().cpu())
 
     def _log_and_maybe_save(
         self,
@@ -789,10 +1406,11 @@ class RefinementRunner:
         """运行 baseline 渲染与诊断."""
 
         self.current_stage = "phase0"
-        render_output = self.render_current_scene()
+        render_output = self._render_scene_for_evaluation(self.scene)
         pred_rgb = render_output["images_pred"]
-        residual_map = self.weight_builder.build_residual_map(pred_rgb, self.scene.gt_images)
-        baseline = self._summarize_prediction(pred_rgb, residual_map=residual_map)
+        gt_rgb = self._get_gt_images(device=pred_rgb.device, dtype=pred_rgb.dtype)
+        residual_map = self.weight_builder.build_residual_map(pred_rgb, gt_rgb)
+        baseline = self._summarize_prediction(pred_rgb, residual_map=residual_map, gt_rgb=gt_rgb)
         self._export_baseline_visuals(pred_rgb)
 
         metrics = dict(baseline)
@@ -813,12 +1431,16 @@ class RefinementRunner:
         """构造 Stage 2A 起始权重图."""
 
         self.current_stage = "phase1"
-        render_output = self.render_current_scene()
+        render_output = self._render_scene_for_evaluation(self.scene)
         pred_rgb = render_output["images_pred"]
-        residual_map = self.weight_builder.build_residual_map(pred_rgb, self.scene.gt_images)
-        self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, self.prev_weight_map)
+        gt_rgb = self._get_gt_images(device=pred_rgb.device, dtype=pred_rgb.dtype)
+        residual_map = self.weight_builder.build_residual_map(pred_rgb, gt_rgb)
+        prev_weight_map = self.prev_weight_map
+        if isinstance(prev_weight_map, torch.Tensor):
+            prev_weight_map = prev_weight_map.to(device=pred_rgb.device, dtype=pred_rgb.dtype)
+        self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, prev_weight_map).detach().cpu()
 
-        metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map)
+        metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map, gt_rgb=gt_rgb)
         metrics["loss_total"] = float(residual_map.mean().item())
         self._log_and_maybe_save("phase1", metrics, residual_map, self.prev_weight_map, iter_idx=0)
 
@@ -863,10 +1485,14 @@ class RefinementRunner:
         for iter_idx in range(self.hparams.iters_stage2b):
             render_output = self.render_current_scene()
             pred_rgb = render_output["images_pred"]
-            residual_map = self.weight_builder.build_residual_map(pred_rgb, self.scene.gt_images)
-            self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, self.prev_weight_map)
+            gt_rgb = self._get_gt_images(device=pred_rgb.device, dtype=pred_rgb.dtype)
+            residual_map = self.weight_builder.build_residual_map(pred_rgb, gt_rgb)
+            previous_weight_map = self.prev_weight_map
+            if isinstance(previous_weight_map, torch.Tensor):
+                previous_weight_map = previous_weight_map.to(device=pred_rgb.device, dtype=pred_rgb.dtype)
+            self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, previous_weight_map)
 
-            loss_rgb = compute_weighted_rgb_loss(pred_rgb, self.scene.gt_images, self.prev_weight_map)
+            loss_rgb = compute_weighted_rgb_loss(pred_rgb, gt_rgb, self.prev_weight_map)
             loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
             loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
             loss_patch_rgb, loss_patch_perceptual = self._compute_patch_losses(residual_map, loss_rgb)
@@ -889,7 +1515,12 @@ class RefinementRunner:
             optimizer.zero_grad(set_to_none=True)
             self.gaussians.clamp_stage_constraints("stage2b", self.hparams)
 
-            final_metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map)
+            final_metrics = self._summarize_prediction(
+                pred_rgb,
+                residual_map=residual_map,
+                weight_map=self.prev_weight_map,
+                gt_rgb=gt_rgb,
+            )
             final_metrics.update(
                 {
                     "loss_total": float(loss_total.item()),
@@ -954,10 +1585,14 @@ class RefinementRunner:
         for iter_idx in range(self.hparams.iters_joint):
             render_output = self.render_current_scene()
             pred_rgb = render_output["images_pred"]
-            residual_map = self.weight_builder.build_residual_map(pred_rgb, self.scene.gt_images)
-            self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, self.prev_weight_map)
+            gt_rgb = self._get_gt_images(device=pred_rgb.device, dtype=pred_rgb.dtype)
+            residual_map = self.weight_builder.build_residual_map(pred_rgb, gt_rgb)
+            previous_weight_map = self.prev_weight_map
+            if isinstance(previous_weight_map, torch.Tensor):
+                previous_weight_map = previous_weight_map.to(device=pred_rgb.device, dtype=pred_rgb.dtype)
+            self.prev_weight_map = self.weight_builder.build_weight_map(residual_map, previous_weight_map)
 
-            loss_rgb = compute_weighted_rgb_loss(pred_rgb, self.scene.gt_images, self.prev_weight_map)
+            loss_rgb = compute_weighted_rgb_loss(pred_rgb, gt_rgb, self.prev_weight_map)
             loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
             loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
             loss_total = loss_rgb + self.hparams.lambda_scale_tail * loss_scale + self.hparams.lambda_opacity_sparse * loss_opacity
@@ -967,7 +1602,12 @@ class RefinementRunner:
             optimizer.zero_grad(set_to_none=True)
             self.gaussians.clamp_stage_constraints("phase4", self.hparams)
 
-            final_metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map)
+            final_metrics = self._summarize_prediction(
+                pred_rgb,
+                residual_map=residual_map,
+                weight_map=self.prev_weight_map,
+                gt_rgb=gt_rgb,
+            )
             final_metrics.update({"loss_total": float(loss_total.item())})
             self._log_and_maybe_save("phase4", final_metrics, residual_map, self.prev_weight_map, iter_idx=iter_idx)
 
@@ -1043,7 +1683,7 @@ class RefinementRunner:
 
         # 结束前再次渲染当前高斯.
         # 这样无论 stop 在哪一阶段,都能得到统一命名的 after 视频.
-        final_render_output = self.render_current_scene()
+        final_render_output = self._render_scene_for_evaluation(self.scene)
         final_pred_rgb = final_render_output["images_pred"]
         self._export_rgb_artifacts("final_render", final_pred_rgb)
 

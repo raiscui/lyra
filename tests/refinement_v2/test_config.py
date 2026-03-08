@@ -34,6 +34,7 @@ def test_cli_mapping_uses_defaults() -> None:
     assert run_config.reference_intrinsics_path is None
     assert run_config.start_stage == "stage2a"
     assert run_config.stage2a_mode == "auto"
+    assert run_config.render_devices is None
     assert run_config.enable_stage2b is False
     assert run_config.dry_run is False
     assert hparams.weight_floor == 0.20
@@ -90,6 +91,28 @@ def test_cli_mapping_reads_bool_flags_and_frame_indices() -> None:
     assert run_config.dry_run is True
     assert hparams.weight_floor == 0.3
     assert hparams.iters_stage2a == 111
+
+
+def test_cli_mapping_reads_render_devices() -> None:
+    """确认多设备渲染入口能稳定映射到配置对象."""
+
+    run_config, _ = load_effective_config_from_cli(
+        [
+            "--config",
+            "configs/demo/lyra_static.yaml",
+            "--gaussians",
+            "outputs/demo/gaussians_0.ply",
+            "--outdir",
+            "outputs/refine_v2/test",
+            "--device",
+            "cuda:0",
+            "--render-devices",
+            "cuda:0,cuda:1",
+        ]
+    )
+
+    assert run_config.device == "cuda:0"
+    assert run_config.render_devices == ["cuda:0", "cuda:1"]
 
 
 def test_cli_mapping_reads_pruning_flags() -> None:

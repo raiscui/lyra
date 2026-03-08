@@ -16,6 +16,7 @@
 import argparse
 import importlib
 from contextlib import contextmanager
+from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple
 
 import einops
@@ -48,6 +49,11 @@ elif (
     from torch.quantization import FakeQuantizeBase, ObserverBase
 
 DEFAULT_AUGMENT_SIGMA = 0.001
+DEFAULT_MOGE_MODEL_IDS = {
+    "v1": "Ruicheng/moge-vitl",
+    "v2": "Ruicheng/moge-2-vitl",
+}
+MOGE_VERSION_CHOICES = ("auto", "v1", "v2")
 
 
 def add_common_arguments(parser):
@@ -170,6 +176,48 @@ def add_common_arguments(parser):
     )
 
 
+def add_moge_arguments(parser: argparse.ArgumentParser) -> None:
+    """给需要 MoGe 的入口统一补齐 CLI 参数.
+
+    这里把默认模型选择集中在一个地方维护,避免多个脚本各自写一份,
+    之后再切回 v1 或继续扩展时出现行为不一致.
+    """
+
+    parser.add_argument(
+        "--moge_version",
+        type=str,
+        choices=MOGE_VERSION_CHOICES,
+        default="auto",
+        help=(
+            "Select MoGe loading mode: "
+            "auto (inspect checkpoint and choose automatically), "
+            "v1 (prefer original Ruicheng/moge-vitl), "
+            "v2 (prefer Ruicheng/moge-2-vitl)."
+        ),
+    )
+    parser.add_argument(
+        "--moge_model_id",
+        type=str,
+        default=None,
+        help=(
+            "Optional MoGe HF repo_id or local model.pt path. "
+            "If omitted, the built-in default for --moge_version is used "
+            "(auto/v2 -> Ruicheng/moge-2-vitl, v1 -> Ruicheng/moge-vitl)."
+        ),
+    )
+    parser.add_argument(
+        "--moge_checkpoint_path",
+        type=str,
+        default=None,
+        help="Optional local path to MoGe checkpoint (model.pt). If provided, it takes precedence over --moge_model_id.",
+    )
+    parser.add_argument(
+        "--hf_local_files_only",
+        action="store_true",
+        help="Pass local_files_only=True to hf_hub_download for MoGe weights (offline mode requires cached files).",
+    )
+
+
 # Function to fully remove an argument
 def remove_argument(parser, arg_name):
     # Get a list of actions to remove
@@ -201,14 +249,36 @@ def validate_args(args: argparse.Namespace, inference_type: str) -> None:
         ), "--input_image_or_video_path must be provided for single video generation."
 
 
+def _infer_moge_version_from_model_config(model_config: dict) -> str:
+    """根据 checkpoint 结构识别 MoGe 主版本."""
+
+    encoder_config = model_config.get("encoder", None)
+    if isinstance(encoder_config, dict):
+        return "v2"
+    return "v1"
+
+
+def _resolve_default_moge_model_id(moge_version: str) -> str:
+    """在未显式指定 repo_id 时,给出稳定默认值.
+
+    `auto` 仍保持当前仓库的现行为先,默认走 v2.
+    这样不会意外改变没有传任何参数的旧命令行为.
+    """
+
+    if moge_version == "v1":
+        return DEFAULT_MOGE_MODEL_IDS["v1"]
+    return DEFAULT_MOGE_MODEL_IDS["v2"]
+
+
 def load_moge_model(
     *,
-    moge_model_id: str,
+    moge_version: str,
+    moge_model_id: Optional[str],
     moge_checkpoint_path: Optional[str],
     hf_local_files_only: bool,
     device: torch.device,
 ) -> Tuple[torch.nn.Module, str]:
-    """加载 MoGe 模型(v1 或 v2),并自动根据 checkpoint 结构选择正确的实现.
+    """加载 MoGe 模型,支持 `auto / v1 / v2` 三种显式选择.
 
     关键点:
     - `Ruicheng/moge-vitl` 属于 v1 checkpoint: `model_config["encoder"]` 是 string.
@@ -218,8 +288,13 @@ def load_moge_model(
     - `(moge_model, moge_version)`,其中 `moge_version` 为 "v1" 或 "v2".
     """
 
+    if moge_version not in MOGE_VERSION_CHOICES:
+        raise ValueError(
+            f"Unsupported MoGe version selector: {moge_version}. "
+            f"Expected one of {MOGE_VERSION_CHOICES}."
+        )
+
     # NOTE: 这里使用惰性 import,避免把 MoGe/HF 依赖扩大到不需要它的推理路径.
-    from pathlib import Path
 
     try:
         from huggingface_hub import hf_hub_download
@@ -229,6 +304,8 @@ def load_moge_model(
             "请安装 huggingface_hub,或改用 --moge_checkpoint_path 指向本地 model.pt."
         ) from exc
 
+    requested_model_id = moge_model_id or _resolve_default_moge_model_id(moge_version)
+
     # 约定: 若显式给了本地路径,就完全绕过 Hugging Face 下载逻辑,方便离线运行.
     if moge_checkpoint_path:
         checkpoint_path = Path(moge_checkpoint_path)
@@ -237,12 +314,12 @@ def load_moge_model(
         resolved_checkpoint_path = str(checkpoint_path)
     else:
         # 兼容: 允许用户把 `moge_model_id` 直接写成一个本地文件路径.
-        maybe_local_path = Path(moge_model_id)
+        maybe_local_path = Path(requested_model_id)
         if maybe_local_path.exists():
             resolved_checkpoint_path = str(maybe_local_path)
         else:
             resolved_checkpoint_path = hf_hub_download(
-                repo_id=moge_model_id,
+                repo_id=requested_model_id,
                 repo_type="model",
                 filename="model.pt",
                 local_files_only=hf_local_files_only,
@@ -254,26 +331,37 @@ def load_moge_model(
     if not isinstance(model_config, dict):
         raise ValueError(f"MoGe checkpoint 缺少有效的 model_config: {resolved_checkpoint_path}")
 
-    # 通过 encoder 字段类型判断 checkpoint 版本,从根上避免 v1/v2 混用.
-    if isinstance(model_config.get("encoder", None), dict):
+    # 先从 checkpoint 结构识别真实版本,再决定是否允许继续加载.
+    detected_moge_version = _infer_moge_version_from_model_config(model_config)
+    if moge_version != "auto" and detected_moge_version != moge_version:
+        raise ValueError(
+            "MoGe version mismatch: "
+            f"requested {moge_version}, but checkpoint resolved from "
+            f"{moge_checkpoint_path or requested_model_id} is {detected_moge_version}."
+        )
+
+    if detected_moge_version == "v2":
         from moge.model.v2 import MoGeModel as MoGeModelV2
 
         moge_model: torch.nn.Module = MoGeModelV2(**model_config)
         moge_model.load_state_dict(checkpoint["model"], strict=False)
-        moge_version = "v2"
+        loaded_moge_version = "v2"
     else:
         from moge.model.v1 import MoGeModel as MoGeModelV1
 
         moge_model = MoGeModelV1(**model_config)
         moge_model.load_state_dict(checkpoint["model"])
-        moge_version = "v1"
+        loaded_moge_version = "v1"
 
     moge_model = moge_model.to(device)
     moge_model.eval()
 
-    log.info(f"Loaded MoGe checkpoint ({moge_version}) from: {resolved_checkpoint_path}")
+    log.info(
+        "Loaded MoGe checkpoint "
+        f"(requested={moge_version}, loaded={loaded_moge_version}) from: {resolved_checkpoint_path}"
+    )
 
-    return moge_model, moge_version
+    return moge_model, loaded_moge_version
 
 
 class _IncompatibleKeys(

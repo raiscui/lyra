@@ -45,6 +45,7 @@ class RefinementRunConfig:
     enable_joint_fallback: bool = False
     stop_after: str | None = None
     device: str = "cuda"
+    render_devices: list[str] | None = None
     mixed_precision: bool = False
     save_every: int = 50
     resume: bool = False
@@ -113,6 +114,17 @@ def _parse_view_ids(raw_value: str | None) -> list[str] | None:
     items = [item.strip() for item in raw_value.split(",")]
     view_ids = [item for item in items if item]
     return view_ids or None
+
+
+def _parse_device_names(raw_value: str | None) -> list[str] | None:
+    """把 `cuda:0,cuda:1` 这样的字符串转成设备名列表."""
+
+    if raw_value is None or raw_value.strip() == "":
+        return None
+
+    items = [item.strip() for item in raw_value.split(",")]
+    device_names = [item for item in items if item]
+    return device_names or None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -267,6 +279,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop after a specific stage for debugging.",
     )
     parser.add_argument("--device", type=str, default="cuda", help="Device string, e.g. cuda or cpu.")
+    parser.add_argument(
+        "--render-devices",
+        type=str,
+        default=None,
+        help="Optional comma-separated render devices, e.g. cuda:0,cuda:1. The first device remains the optimizer/main device.",
+    )
     parser.add_argument("--mixed-precision", action="store_true", help="Enable mixed precision for refinement.")
     parser.add_argument("--save-every", type=int, default=50, help="Save intermediate state every N iterations.")
     parser.add_argument("--resume", action="store_true", help="Resume from latest saved state.")
@@ -339,6 +357,7 @@ def load_effective_config_from_cli(
         enable_joint_fallback=args.enable_joint_fallback,
         stop_after=args.stop_after,
         device=args.device,
+        render_devices=_parse_device_names(args.render_devices),
         mixed_precision=args.mixed_precision,
         save_every=args.save_every,
         resume=args.resume,
