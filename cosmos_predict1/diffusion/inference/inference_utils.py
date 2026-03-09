@@ -231,6 +231,18 @@ def add_moge_arguments(parser: argparse.ArgumentParser) -> None:
 def add_camera_center_arguments(parser: argparse.ArgumentParser) -> None:
     """给单图 `MoGe` 入口补充旋转中心估计参数."""
 
+    class _StoreValueAndMarkExplicitAction(argparse.Action):
+        """在保留参数值的同时,额外记录这个参数是否由用户显式传入."""
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            setattr(namespace, self.dest, values)
+            setattr(namespace, f"_{self.dest}_explicit", True)
+
+    parser.set_defaults(
+        _translation_reference_depth_explicit=False,
+        _translation_reference_depth_scale_explicit=False,
+    )
+
     parser.add_argument(
         "--auto_center_depth",
         action="store_true",
@@ -278,21 +290,25 @@ def add_camera_center_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--translation_reference_depth",
         type=float,
+        action=_StoreValueAndMarkExplicitAction,
         default=1.0,
         help=(
             "Reference depth used only to scale translation magnitude. "
-            "Keeping this at 1.0 preserves the historical movement size even "
-            "when auto center depth is enabled."
+            "An explicit value here overrides the default auto-center scale fallback."
         ),
     )
     parser.add_argument(
         "--translation_reference_depth_scale",
         type=float,
-        default=None,
+        action=_StoreValueAndMarkExplicitAction,
+        default=0.35,
         help=(
-            "Optional proportional scale for translation reference depth. "
-            "If set, the actual translation reference depth becomes "
-            "center_depth * translation_reference_depth_scale."
+            "Proportional scale for translation reference depth. "
+            "When auto center depth is enabled, the default behavior uses "
+            "center_depth * 0.35 unless an explicit --translation_reference_depth "
+            "or explicit scale override is provided. "
+            "This scale only changes translation magnitude and does not modify "
+            "the look-at center depth itself."
         ),
     )
 

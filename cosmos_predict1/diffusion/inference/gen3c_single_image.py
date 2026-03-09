@@ -273,7 +273,11 @@ def _resolve_translation_reference_depth(
 ) -> float:
     """决定本次轨迹位移缩放所使用的参考深度."""
 
-    if args.translation_reference_depth_scale is not None:
+    scale_explicit = bool(getattr(args, "_translation_reference_depth_scale_explicit", False))
+    fixed_depth_explicit = bool(getattr(args, "_translation_reference_depth_explicit", False))
+    auto_center_enabled = bool(getattr(args, "auto_center_depth", False))
+
+    if scale_explicit or (auto_center_enabled and args.translation_reference_depth_scale is not None and not fixed_depth_explicit):
         resolved_translation_reference_depth = center_depth * args.translation_reference_depth_scale
         log.info(
             "Using scaled translation reference depth: "

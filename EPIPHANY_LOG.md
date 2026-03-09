@@ -526,3 +526,29 @@
   - ModelScope 数据集页面 / 配套文档
   - 论文 supplementary / data generation section
   - 仓库外的数据准备脚本(若后续补到仓库)
+
+## 2026-03-09 03:19 UTC 主题: 相机参数的新默认值, 不应静默改坏旧轨迹语义
+
+### 发现来源
+- 用户要求把 `--translation_reference_depth_scale 0.35` 直接改成默认值.
+- 代码核对发现: 如果机械把默认从 `None` 改成 `0.35`, 会把所有未开启 `auto_center_depth` 的单图轨迹一起改掉.
+
+### 核心问题
+- 相机类参数的“默认值”不只是 CLI 文案.
+- 它会直接改变历史命令在未显式传参时的运动语义.
+
+### 为什么重要
+- 这类回归很隐蔽.
+- 表面上只是“优化了默认参数”, 实际上会把旧命令的相机行为整体漂移.
+
+### 当前结论
+- 对这类新默认值, 更稳的做法是:
+  1. 只在目标工作流中启用新默认
+  2. 保留显式旧参数的覆盖能力
+  3. 用测试锁死优先级
+
+### 后续讨论入口
+- 下次再改单图 / SDG 相机默认参数时, 先看:
+  - `cosmos_predict1/diffusion/inference/inference_utils.py`
+  - `cosmos_predict1/diffusion/inference/gen3c_single_image.py`
+  - `tests/test_camera_trajectory_center_depth.py`

@@ -13,6 +13,7 @@ from cosmos_predict1.diffusion.inference.camera_utils import (
 )
 from cosmos_predict1.diffusion.inference.gen3c_single_image import (
     _resolve_pipeline_offload_network,
+    _resolve_trajectory_center_depth,
     _resolve_translation_reference_depth,
 )
 from cosmos_predict1.diffusion.inference.inference_utils import add_camera_center_arguments
@@ -136,12 +137,28 @@ def test_add_camera_center_arguments_accepts_translation_reference_depth_scale()
 
     assert args.translation_reference_depth == pytest.approx(1.0)
     assert args.translation_reference_depth_scale == pytest.approx(0.25)
+    assert args._translation_reference_depth_scale_explicit is True
+
+
+def test_add_camera_center_arguments_uses_default_translation_reference_depth_scale() -> None:
+    parser = argparse.ArgumentParser()
+    add_camera_center_arguments(parser)
+
+    args = parser.parse_args([])
+
+    assert args.translation_reference_depth == pytest.approx(1.0)
+    assert args.translation_reference_depth_scale == pytest.approx(0.35)
+    assert args._translation_reference_depth_explicit is False
+    assert args._translation_reference_depth_scale_explicit is False
 
 
 def test_resolve_translation_reference_depth_prefers_scale_when_provided() -> None:
     args = argparse.Namespace(
+        auto_center_depth=True,
         translation_reference_depth=1.0,
         translation_reference_depth_scale=0.25,
+        _translation_reference_depth_explicit=False,
+        _translation_reference_depth_scale_explicit=True,
     )
 
     resolved = _resolve_translation_reference_depth(args, center_depth=12.0)
@@ -149,15 +166,76 @@ def test_resolve_translation_reference_depth_prefers_scale_when_provided() -> No
     assert resolved == pytest.approx(3.0)
 
 
-def test_resolve_translation_reference_depth_uses_fixed_value_when_scale_missing() -> None:
+def test_resolve_translation_reference_depth_uses_default_scale_for_auto_center_mode() -> None:
     args = argparse.Namespace(
+        auto_center_depth=True,
+        translation_reference_depth=1.0,
+        translation_reference_depth_scale=0.35,
+        _translation_reference_depth_explicit=False,
+        _translation_reference_depth_scale_explicit=False,
+    )
+
+    resolved = _resolve_translation_reference_depth(args, center_depth=12.0)
+
+    assert resolved == pytest.approx(4.2)
+
+
+def test_resolve_translation_reference_depth_preserves_fixed_default_when_auto_center_disabled() -> None:
+    args = argparse.Namespace(
+        auto_center_depth=False,
+        translation_reference_depth=1.0,
+        translation_reference_depth_scale=0.35,
+        _translation_reference_depth_explicit=False,
+        _translation_reference_depth_scale_explicit=False,
+    )
+
+    resolved = _resolve_translation_reference_depth(args, center_depth=12.0)
+
+    assert resolved == pytest.approx(1.0)
+
+
+def test_resolve_translation_reference_depth_allows_explicit_fixed_depth_to_override_default_scale() -> None:
+    args = argparse.Namespace(
+        auto_center_depth=True,
         translation_reference_depth=1.5,
-        translation_reference_depth_scale=None,
+        translation_reference_depth_scale=0.35,
+        _translation_reference_depth_explicit=True,
+        _translation_reference_depth_scale_explicit=False,
     )
 
     resolved = _resolve_translation_reference_depth(args, center_depth=12.0)
 
     assert resolved == pytest.approx(1.5)
+
+
+def test_translation_reference_depth_scale_does_not_change_auto_center_depth() -> None:
+    args = argparse.Namespace(
+        auto_center_depth=True,
+        auto_center_depth_mode="center_crop",
+        auto_center_depth_quantile=0.5,
+        auto_center_depth_center_crop_ratio=0.5,
+        auto_center_depth_scale=1.0,
+        translation_reference_depth=1.0,
+        translation_reference_depth_scale=0.35,
+        _translation_reference_depth_explicit=False,
+        _translation_reference_depth_scale_explicit=False,
+    )
+    depth = torch.tensor(
+        [
+            [2.0, 2.0, 2.0, 2.0],
+            [2.0, 10.0, 10.0, 2.0],
+            [2.0, 10.0, 10.0, 2.0],
+            [2.0, 2.0, 2.0, 2.0],
+        ],
+        dtype=torch.float32,
+    ).unsqueeze(0).unsqueeze(0)
+    mask = torch.ones_like(depth, dtype=torch.bool)
+
+    center_depth = _resolve_trajectory_center_depth(args, depth, mask)
+    translation_reference_depth = _resolve_translation_reference_depth(args, center_depth=center_depth)
+
+    assert center_depth == pytest.approx(10.0)
+    assert translation_reference_depth == pytest.approx(3.5)
 
 
 def test_resolve_pipeline_offload_network_disables_transformer_offload_on_multi_gpu() -> None:
