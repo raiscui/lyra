@@ -1,9 +1,9 @@
 # Save all renderings etc. in this folder
-out_dir_inference: outputs/demo/lyra_static
+out_dir_inference: outputs/demo/lyra_static_v1
 
 # Define dataset name defined in src/models/data/registry.py
 # dataset_name: lyra_static_demo # Use pre-generated latents
-dataset_name: lyra_static_demo_generated # Generate own latents
+dataset_name: lyra_static_demo_generated_v1 # Generate own latents
 # dataset_name: lyra_static_demo_generated_one # Generate own latents
 
 # Order of camera trajectory indices

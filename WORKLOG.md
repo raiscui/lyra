@@ -1016,3 +1016,24 @@
 - 这类“改默认值”最容易埋下的雷,不是代码改动本身,而是把旧行为彻底变成无法恢复。
 - 这次通过“默认开启 + 显式关闭开关 + 测试锁死”的方式,把新默认和历史兼容都保住了。
 - 运行 Python 测试时要注意环境差异: 当前相机轨迹测试依赖 `warp`,并且在 `pixi` 环境下仍需显式补 `PYTHONPATH`。
+
+## 2026-03-09 任务名称: 排查 static view 索引与 dataset_registry 对应关系
+
+### 任务内容
+- 核对 `static_view_indices_fixed=['5','0','1','2','3','4']` 与 `dataset_registry` 中 `sampling_buckets`、`start_view_idx` 是否存在错位.
+- 覆盖 `src/models/data/provider.py`、`src/models/data/radym.py`、`src/models/data/registry.py` 与相关测试.
+
+### 完成过程
+- 回读历史实验记录,确认仓库曾经主动把静态轨迹顺序改成 `5,0,1,2,3,4` 作为推理输入顺序.
+- 静态阅读确认:
+  - fixed 模式直接使用 `static_view_indices_fixed`
+  - `sampling_buckets` 只在 `random_bucket` 模式下使用
+  - `start_view_idx` 只影响随机 bucket 偏移与默认起始 view
+- 动态验证:
+  - 使用 `.pixi/envs/default/bin/python` 实例化 `Provider('lyra_static_demo_generated', training=False)`
+  - 实测 `provider._get_indices_static(0)` 返回 `input_view_indices = ['5', '0', '1', '2', '3', '4']`
+  - 资产目录 `assets/demo/static/diffusion_output_generated/{0..5}/rgb/00172.mp4` 全部存在
+
+### 总结感悟
+- 当前不是“fixed 列表位置要和 bucket 位置对齐”的设计, 而是 fixed 列表本身就是最终 view ID 顺序.
+- 以后只有在切回 `random_bucket` 或修改 view 编号起点时, 才需要重新审查 `sampling_buckets` 和 `start_view_idx`.

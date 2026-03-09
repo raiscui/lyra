@@ -51,8 +51,10 @@ CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) torchrun --nproc_per_node=1 cosmos_pre
     --video_save_folder assets/demo/static/diffusion_output_generated \
     --foreground_masking \
     --multi_trajectory \
-    --auto_center_depth_quantile 0.35 \
-    --translation_reference_depth_scale 0.65
+    --moge_version v2 \
+    --auto_center_depth_quantile 0.25 \
+    --translation_reference_depth_scale 0.7 \
+    --total_movement_distance_factor 1.25
 ```
 
 `auto_center_depth` is enabled by default for the single-image/static SDG path. Add `--no_auto_center_depth` if you want to recover the historical fixed `center_depth=1.0` behavior. Increase total_movement_distance_factor to 2.0 for more camera motion, though it can create more artifacts in object-centric scenes. If you want to skip the diffusion part, we have pre-generated the latents in assets/demo/static/diffusion_output. By default we use pre-generated latents, change dataset_name in configs/demo/lyra_static.yaml from lyra_static_demo to lyra_static_demo_generated to use your own generated latents.

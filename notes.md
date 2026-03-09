@@ -189,3 +189,42 @@ env PYTHONPATH="$(pwd)" PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
   1. 第 1 步 `gen3c_single_image_sdg.py` 若不传 `--moge_version`,实际会走 `v2`
   2. 第 2 步 `sample.py` 不再参与 `MoGe` 版本选择
 - `scripts/bash/static_sdg.sh` 也没有额外传 `--moge_version`,因此同样继承 `auto -> v2`。
+
+## 2026-03-09 视角索引对应关系排查
+
+### 现象
+
+- 顶层配置常用 `static_view_indices_fixed: ['5', '0', '1', '2', '3', '4']`.
+- `dataset_registry` 中 `sampling_buckets` 仍是 `[['0'], ['1'], ['2'], ['3'], ['4'], ['5']]`, `start_view_idx=0`.
+
+### 静态证据
+
+- `Provider._sample_view_indices_bucket()` 在 `static_view_indices_sampling == 'fixed'` 时直接返回 `self.opt.static_view_indices_fixed`.
+- `sampling_buckets` 只在 `static_view_indices_sampling == 'random_bucket'` 时进入 `_sample_view_indices_from_bucket()`.
+- `start_view_idx` 只用于:
+  - 随机生成 bucket 索引时的偏移
+  - 未显式给 view 时默认从哪个视角开始读数据
+- `Radym._read_data()` 对多视角数据会直接用传入的 `view_idx` 拼路径 `<root>/<view_idx>/...`.
+
+### 动态证据
+
+- 用 `.pixi/envs/default/bin/python` 实例化 `Provider('lyra_static_demo_generated', training=False)`.
+- 覆盖:
+  - `static_view_indices_sampling='fixed'`
+  - `static_view_indices_fixed=['5','0','1','2','3','4']`
+  - `num_input_multi_views=6`
+- `provider._get_indices_static(0)` 输出:
+  - `num_input_multi_views = 6`
+  - `input_view_indices = ['5', '0', '1', '2', '3', '4']`
+- 资产目录 `assets/demo/static/diffusion_output_generated/{0..5}/rgb/00172.mp4` 全部存在.
+
+### 中间判断
+
+- 当前不是“bucket 第 0 位一定要对上 fixed 第 0 位”的设计.
+- fixed 模式下, 顶层配置给出的字符串列表就是最终视角 ID 顺序.
+- 因此 `['5','0','1','2','3','4']` 与 registry 中顺序不同, 本身不会导致错位.
+
+### 补充风险
+
+- 如果未来改回 `static_view_indices_sampling='random_bucket'`,这时才会走 `sampling_buckets` + `start_view_idx` 的映射逻辑.
+- 如果未来数据集目录不是 `0..5`,而是别的编号起点,才需要同步修改 `start_view_idx` 和 bucket 内容.

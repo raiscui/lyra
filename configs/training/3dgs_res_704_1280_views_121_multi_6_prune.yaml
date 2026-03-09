@@ -11,5 +11,5 @@ lpips_chunk_size: 1
 lambda_opacity: 0.1
 gaussians_prune_ratio: 0.8
 gaussians_random_ratio: 0.0
-checkpointing_steps: 50
+checkpointing_steps: 200
 max_train_steps: 83000
