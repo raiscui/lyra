@@ -16,9 +16,5 @@ lyra_dataset/
 .vscode/
 
 # Codex/Agent 工作记忆文件(本地使用,避免污染仓库)
-task_plan*.md
-notes*.md
-WORKLOG*.md
-LATER_PLANS*.md
-ERRORFIX*.md
 outputs/
+AGENTS.override.md

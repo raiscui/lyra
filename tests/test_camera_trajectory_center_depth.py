@@ -124,6 +124,24 @@ def test_add_camera_center_arguments_accepts_mode_and_multiplier_alias() -> None
     assert args.auto_center_depth_scale == pytest.approx(0.8)
 
 
+def test_add_camera_center_arguments_enables_auto_center_depth_by_default() -> None:
+    parser = argparse.ArgumentParser()
+    add_camera_center_arguments(parser)
+
+    args = parser.parse_args([])
+
+    assert args.auto_center_depth is True
+
+
+def test_add_camera_center_arguments_accepts_explicit_disable_flag() -> None:
+    parser = argparse.ArgumentParser()
+    add_camera_center_arguments(parser)
+
+    args = parser.parse_args(["--no_auto_center_depth"])
+
+    assert args.auto_center_depth is False
+
+
 def test_add_camera_center_arguments_accepts_translation_reference_depth_scale() -> None:
     parser = argparse.ArgumentParser()
     add_camera_center_arguments(parser)

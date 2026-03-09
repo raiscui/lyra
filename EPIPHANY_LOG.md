@@ -552,3 +552,38 @@
   - `cosmos_predict1/diffusion/inference/inference_utils.py`
   - `cosmos_predict1/diffusion/inference/gen3c_single_image.py`
   - `tests/test_camera_trajectory_center_depth.py`
+
+## [2026-03-09 04:20:00 UTC] 主题: baseline_render depth anchor 的本质是 anti-drift,不是 geometry correction
+
+### 发现来源
+- 本轮重新评估 OpenSpec change `add-refinement-v2-depth-anchor`
+- 对照了 `refinement_v2` 的 stage freeze 语义、renderer depth 输出和现有测试
+
+### 核心问题
+- 很容易把“给 refinement_v2 补一个 depth loss”直觉化地理解成“可以修几何”。
+- 但当前 V1 方案的 reference 来自 baseline render 自身,不是 GT / external depth。
+
+### 为什么重要
+- 这会直接影响项目对该 change 的收益预期。
+- 如果口径说成“能修 baseline 厚表面”,实现后很容易被误判为效果不达标。
+
+### 未来风险
+- 若忽略这条边界:
+  - 会把 self-anchor 错当成 geometry correction
+  - 会在 baseline 已经错误时,反而把错误一起锚住
+  - 会低估它与 `loss_opacity_sparse`、pruning、低 alpha expected depth 数值稳定性的耦合
+
+### 当前结论
+- 当前已知事实:
+  1. `Stage 2A / Stage 3SR` 不动 `means/rotations`,只动 `opacity/scales/colors`
+  2. renderer depth 来自 `gsplat` 的 `RGB+ED` expected depth
+  3. `Phase 0 / Phase 1` 已存在可复用的 baseline evaluation render 路径
+- 更准确的定位:
+  - baseline_render depth anchor 适合作为 anti-drift loss
+  - 不适合作为几何纠偏能力来承诺
+
+### 后续讨论入口
+- 下次若决定继续推进,优先先讨论:
+  1. V1 是否先只落在 `Stage 3SR`
+  2. valid mask 是否只看 reference alpha,还是叠加一个极小的 pred alpha 数值稳定裁剪
+  3. baseline reference 是挂在 `Phase 0` 还是 `Phase 1`

@@ -239,6 +239,7 @@ def add_camera_center_arguments(parser: argparse.ArgumentParser) -> None:
             setattr(namespace, f"_{self.dest}_explicit", True)
 
     parser.set_defaults(
+        auto_center_depth=True,
         _translation_reference_depth_explicit=False,
         _translation_reference_depth_scale_explicit=False,
     )
@@ -247,8 +248,17 @@ def add_camera_center_arguments(parser: argparse.ArgumentParser) -> None:
         "--auto_center_depth",
         action="store_true",
         help=(
-            "Estimate trajectory look-at depth from predicted depth statistics "
-            "instead of using the historical fixed center_depth=1.0."
+            "Estimate trajectory look-at depth from predicted depth statistics. "
+            "This behavior is enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no_auto_center_depth",
+        dest="auto_center_depth",
+        action="store_false",
+        help=(
+            "Disable automatic center depth estimation and keep the historical "
+            "fixed center_depth=1.0 behavior."
         ),
     )
     parser.add_argument(
