@@ -43,6 +43,10 @@ def test_cli_mapping_uses_defaults() -> None:
     assert hparams.lambda_rotation_reg == 0.01
     assert hparams.lambda_sampling_smooth == 5e-4
     assert hparams.sampling_radius_threshold == 1.5
+    assert hparams.fidelity_ratio_threshold == 1.5
+    assert hparams.fidelity_sigmoid_k == 6.0
+    assert hparams.fidelity_min_views == 3
+    assert hparams.fidelity_opacity_threshold == 1e-4
 
 
 def test_cli_mapping_reads_bool_flags_and_frame_indices() -> None:
@@ -165,6 +169,8 @@ def test_cli_mapping_reads_patch_supervision_flags() -> None:
             "2.0",
             "--patch-size",
             "256",
+            "--sr-patches-per-view",
+            "4",
             "--lambda-patch-rgb",
             "0.5",
             "--lambda-patch-perceptual",
@@ -175,8 +181,62 @@ def test_cli_mapping_reads_patch_supervision_flags() -> None:
     assert run_config.reference_mode == "super_resolved"
     assert run_config.sr_scale == 2.0
     assert hparams.patch_size == 256
+    assert hparams.sr_patches_per_view == 4
     assert hparams.lambda_patch_rgb == 0.5
     assert hparams.lambda_patch_perceptual == 0.1
+
+
+def test_cli_mapping_reads_fidelity_supervision_flags() -> None:
+    """确认 fidelity 相关超参数能稳定映射到配置对象."""
+
+    _, hparams = load_effective_config_from_cli(
+        [
+            "--config",
+            "configs/demo/lyra_static.yaml",
+            "--gaussians",
+            "outputs/demo/gaussians_0.ply",
+            "--outdir",
+            "outputs/refine_v2/test",
+            "--fidelity-ratio-threshold",
+            "1.8",
+            "--fidelity-sigmoid-k",
+            "9.5",
+            "--fidelity-min-views",
+            "5",
+            "--fidelity-opacity-threshold",
+            "0.02",
+        ]
+    )
+
+    assert hparams.fidelity_ratio_threshold == 1.8
+    assert hparams.fidelity_sigmoid_k == 9.5
+    assert hparams.fidelity_min_views == 5
+    assert hparams.fidelity_opacity_threshold == 0.02
+
+
+def test_cli_mapping_reads_phase_c_full_frame_hr_flags() -> None:
+    """确认 Phase C 的 full-frame HR 参数能稳定映射到配置对象."""
+
+    _, hparams = load_effective_config_from_cli(
+        [
+            "--config",
+            "configs/demo/lyra_static.yaml",
+            "--gaussians",
+            "outputs/demo/gaussians_0.ply",
+            "--outdir",
+            "outputs/refine_v2/test",
+            "--lambda-hr-rgb",
+            "0.75",
+            "--lambda-lr-consistency",
+            "1.25",
+            "--reference-render-shard-views",
+            "3",
+        ]
+    )
+
+    assert hparams.lambda_hr_rgb == 0.75
+    assert hparams.lambda_lr_consistency == 1.25
+    assert hparams.reference_render_shard_views == 3
 
 
 def test_cli_mapping_reads_external_reference_flags() -> None:

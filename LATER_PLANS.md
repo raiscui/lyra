@@ -1,122 +1,110 @@
 # LATER_PLANS
 
+## 2026-03-10 03:48:00 UTC
 
-## 2026-03-04 13:32 UTC
+- `Phase B` first validation 已完成:
+  - `multi4` OOM
+  - `multi2` 可跑但收益接近持平
+- 当前更值得继续的后手顺序:
+  1. 把 `fidelity_ratio_threshold / fidelity_sigmoid_k / fidelity_min_views` 暴露到 CLI,做小范围 calibration
+  2. 如果 calibration 仍然无明显收益, 直接进入 `Phase C`, 不再继续堆 patch 数量
 
-- 为 `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py` 增加"外部视频输入"模式:
-  - 支持 `--input_video_path` 直接读取外部 mp4.
-  - 用 tokenizer encoder(`model.encode`)把外部视频编码成 `latent/*.pkl`.
-  - pose/intrinsics 优先支持从外部 `*.npz` 载入;若不提供,才使用脚本当前的 `generate_camera_trajectory(...)`(并提示用户必须保证相机运动匹配).
-- 核对并可能修复长视频模式的 latent 拼接维度:
-  - 当前脚本对 `latents` 使用 `torch.cat(..., axis=0)` 的拼接方式可疑,需要通过一次实际运行打印 shape 来确认时序维度约定.
+## 2026-03-10 06:10:00 UTC
 
-## 2026-03-04 14:25 UTC
+- fidelity 参数打通与第一轮 calibration 已完成:
+  - 已暴露 `--fidelity-ratio-threshold`
+  - 已暴露 `--fidelity-sigmoid-k`
+  - 已暴露 `--fidelity-min-views`
+  - 已暴露 `--fidelity-opacity-threshold`
+- 第一轮 calibration 结果:
+  - `outputs/refine_v2/full_view_sr_stage3sr_phaseA_rho_thr1p1_sub8_iter20_20260310`
+  - `selection_mean` 从 `0.01574` 提到 `0.04699`
+  - 但最终仍未超过 `Phase A` rerun
+- 当前后手顺序更新为:
+  1. 直接推进 `Phase C: HR render + LR consistency`
+  2. 如果未来还想继续压榨 `Phase A`, 再做 `fidelity_sigmoid_k` 或 `fidelity_min_views` 的小范围 sweep, 但优先级已经低于 `Phase C`
 
-- 跟进 Warp 1.7.2 在 CUDA 13 driver 下的 `cuDeviceGetUuid` 初始化告警:
-  - 目标: 确认是否仅为噪音,或是否会影响长时间运行/多进程场景的稳定性.
-  - 若影响: 评估升级 warp 或从源码按当前 CUDA driver/toolkit 重新构建.
+## 2026-03-10 06:35:00 UTC
+
+- `Phase C` 方案和任务已按新共识改写到计划文档
+- 当前正式后手顺序改成:
+  1. 实现 `Phase C.1`: full-frame HR render 路径
+  2. 实现 `Phase C.2`: HR -> LR consistency 路径
+  3. 实现 `Phase C.3`: 重组 `Stage 3SR` 目标
+  4. 实现 `Phase C.4`: diagnostics / metrics / tests
+- `Phase A` calibration 与旧 `Continuation Task B/D/A` 现在都不是主线 blocker
 
 
-## 2026-03-06 04:49 UTC
+## 2026-03-10 06:35:00 UTC
 
-- 如果后续目标从"当前单轨迹去重影"扩展为"无可靠 pose 的外部长视频 / 多段轨迹增量融合",可以单开一条 `LongSplat-style` 路线:
-  - 引入新帧注册(PnP + pose refinement)
-  - 增加 local/global sliding window schedule
-  - 研究 visibility ratio 驱动的窗口推进
-  - 评估 anchor/octree 表示是否值得替换当前高斯组织方式
+- `Phase C` 的最小真实 `sub8` smoke 已跑通:
+  - `outputs/refine_v2/full_view_sr_stage3sr_phaseC_smoke_sub8_streamshard_20260310`
+- 当前下一批最值得继续的任务:
+  1. 用同一条 `stream-sharded full-frame HR` 路径把 `iters-stage2a` 提到真实对照长度, 观察是否能接近或超过当前 `Phase A`
+  2. 评估 `lambda-hr-rgb` / `lambda-lr-consistency` 配比, 当前 smoke 中 `loss_lr_consistency` 仍明显主导
+  3. 在 `Phase C` 已可跑的前提下, 再决定是否进入 `Phase D` 的 HR 导出主线
 
 
-## 2026-03-06 05:37 UTC
+## 2026-03-10 07:05:00 UTC
 
-- 如果后续决定把“超分对等视频”真正落地到现有 Lyra 流程,优先做成 `sample.py` 之后的独立 post-refinement 阶段,不要先走“把超分视频直接回灌 feed-forward 主链”:
-  - 输入建议:
-    - `gaussians_init_ply`
-    - 原 `pose/*.npz`
-    - 原 `intrinsics/*.npz`
-    - 超分后的对等视频
-  - 默认策略:
-    - 先 `gaussian-only refinement`
-    - 先外观/透明度,后有限几何
-    - 默认不先碰 pose
-  - 关键前提:
-    - 超分视频必须保持同一 crop / aspect / 时序
-    - intrinsics 要按超分倍率同步缩放
-    - 优先做 patch-based 高分辨率监督,避免整帧显存爆炸
+- `Phase C` 的 `hr=32, lr=1.0, iter8` 已拿到第一轮长程证据:
+  - `outputs/refine_v2/full_view_sr_stage3sr_phaseC_hr32_lr1_sub8_iter8_20260310`
+- 下一轮最有信息量的两个方向:
+  1. 固定 `lambda_hr_rgb=32`, 开始扫 `lambda_lr_consistency=0.5 / 0.25`
+  2. 把当前 `hr=32, lr=1.0` 继续拉长到更接近 `Phase A iter20` 的长度, 做更公平对照
 
-## 2026-03-06 07:28 UTC
+## 2026-03-10 07:47:33 UTC
 
-- 下一轮优先继续补强 `Stage 2A` 后的质量项:
-  - opacity/pruning
-  - patch-based supervision
-  - 如有必要再进入 `Stage 2B`
+- `Phase C` 的 `hr32, lr0.5, iter20, sub8` 长跑已经完成并收口:
+  - `outputs/refine_v2/full_view_sr_stage3sr_phaseC_hr32_lr0p5_sub8_iter20_20260310`
+- 当前后手顺序进一步更新为:
+  1. 优先推进 `Phase D`, 让最终导出支持真正的 HR render
+  2. 如果后面仍要继续压 `Phase C`, 优先做:
+     - 更长 iter
+     - `lambda_lr_consistency` 在 `0.5` 附近的进一步 sweep
+  3. 不再默认回到 `1 iter` 的参数 sweep
 
-## 2026-03-06 08:33 UTC
+## 2026-03-10 08:11:59 UTC
 
-- `refinement_v2` 的 `opacity/pruning` 已完成落地并做过真实验证,后续待办里不再把它当“未实现项”.
-- 下一轮优先级更新为:
-  1. patch-based supervision
-  2. 如 patch 监督后仍存在明显重影,再评估更强的 `stage2b` 或更激进的 pruning 调度
+- `Phase D` 最小闭环已经落地并通过 `113 passed` 回归。
+- 但真实 full-view `sub8` smoke 仍缺一条新的动态证据:
+  - 需要在 A800 没有外部 `~49 GiB` 常驻占用时, 重跑一次:
+    - `outputs/refine_v2/full_view_sr_stage3sr_phaseD_export_smoke_sub8_20260310_retry`
+  - 目标是确认真实资产下也能完整生成:
+    - `baseline_render_hr.mp4`
+    - `gt_reference_hr.mp4`
+    - `final_render_hr.mp4`
+- 这条验证完成后, 再继续回到:
+  1. `Phase C` 更长 iter
+  2. `lambda_lr_consistency≈0.5` 附近的小范围继续实验
 
-## 2026-03-06 09:12 UTC
+## 2026-03-10 08:13:02 UTC
 
-- `patch-based supervision` 的第一版已经完成,后续待办不再是“是否实现 patch path”,而是:
-  1. 是否接入真正的外部 SR/reference 视频到 `reference_images`
-  2. 是否继续推进 `stage2b` 来补锐度与几何层问题
-  3. 是否把当前推荐参数更新为 `lambda_patch_rgb=0.25` 作为困难轨迹默认起点
+- `Phase D` 已完成最小交付:
+  - 当前若继续主线, 优先回到 `Phase C` 的质量推进
+- 下一轮最有信息量的后手顺序改成:
+  1. 继续基于 `hr=32, lr=0.5` 压更长 iter 或近邻 sweep
+  2. 如果 `Phase C` 的 native gap 迟迟不再缩小, 再评估是否进入 `Phase E`
+  3. `Phase B` 只在确认需要扩大 supervision coverage 时再回头做
 
-## 2026-03-06 07:28 UTC
+## 2026-03-10 08:13:38 UTC
 
-- 在 `Long-LRM style post refinement` 主线稳定后,可以评估两个明确的后续分支:
-  1. `Mip-Splatting` 的 renderer-level `2D Mip filter`
-     - 当前只吸收了 `3D smoothing` 思想
-     - 如果后续 selective SR 稳定后仍存在明显 aliasing / dilation,再研究是否需要改造 rasterization 行为
-  2. `EDGS-style local reinitialization`
-     - 当前只保留为 deferred idea
-     - 只有在 Stage 3A + Stage 3SR 后仍有局部结构缺失,并且证据更像初始化覆盖不足时,才考虑做局部 dense correspondence + triangulation re-seed
+- 回滚一条过于保守的口径:
+  - `Phase D` 不是“还没有真实 smoke 证据”
+  - 它已经有 `outputs/refine_v2/phaseD_phase0_hr_export_smoke_20260310`
+- 当前真正还没补到的动态验证是:
+  - full-view
+  - `--target-subsample 8`
+  - `stop_after=stage2a`
+  这一条更重的 HR 导出 smoke
 
-## 2026-03-06 10:37 UTC
+## 2026-03-10 08:53:00 UTC
 
-- `Stage 2B` 本身已经完成,后续待办不再是“是否实现 Stage 2B”,而是更偏调参与增强方向:
-  1. 评估 `Stage 2B` 从原始高斯直接启动时,是否需要独立的更长 `iters_stage2a` 或不同 gate 统计项.
-  2. 把“从已验证 Stage 2A 基线续跑 Stage 2B”整理成一个显式 CLI/workflow 模式.
-  3. 继续推进真正的外部 SR/reference 视频接入,让 `Stage 2B` 能吃到真实高分参考而不是仅 native patch.
-
-## 2026-03-06 11:02 UTC
-
-- 如果后续要继续榨 `Stage 2B` warm-start 的极限质量,可以评估是否增加一个显式 warmup 选项:
-  - 例如 `stage2a_warmup_iters_before_stage2b`
-- 动机:
-  - 旧手工路线比新 `--start-stage stage2b` 略强
-  - 证据更像是“进入 Stage 2B 前多跑了 1 轮 Stage 2A”带来的额外收益
-
-## 2026-03-06 11:36 UTC
-
-- external reference contract 已经完成,因此后续待办应从“能不能接外部 reference”转成更深一层的两个方向:
-  1. full direct file inputs
-     - `--pose-path`
-     - `--intrinsics-path`
-     - `--rgb-path`
-     - 不依赖 dataloader 直接构造 `SceneBundle`
-  2. selective SR 主线补全
-     - `gaussian_fidelity_score`
-     - `W_sr_select`
-     - `W_final_sr`
-     - `L_sampling_smooth`
-     - `Phase 3S / Stage 3SR`
-
-## 2026-03-08 07:04 UTC
-
-- 如果后续要真正解锁 full-view `target_subsample=4`, 优先研究 `src/rendering/gs.py` 的 `render_meta` 内存路径:
-  1. 只保留 refinement 当前真正需要的 meta key
-  2. 改成按阶段按需 materialize, 不在 `Phase 0` 全量 `cat + stack`
-  3. 评估能否把部分统计改成 chunk 内归约, 而不是保留完整 dense tensor
-- 动机:
-  - A800 80GB 上两轮 `sub4` smoke 都在 `_merge_chunk_meta()` OOM
-  - 说明单纯换 allocator 已不足以支撑这档 observation 密度
-
-## 2026-03-09 04:20 UTC
-
-- 如果后续继续推进 `add-refinement-v2-depth-anchor`,优先采用更保守的落地顺序:
-  1. baseline reference 复用 `Phase 0 / Phase 1` evaluation render,不要先改 dataloader depth 契约
-  2. V1 先观察 `Stage 3SR` 单独启用 depth anchor 的收益与副作用
-  3. 只有在证据表明不会明显锁死 baseline 厚表面时,再扩到 `Stage 2A`
+- `Phase D` 的 `phase0` 与更重的 `full-view + sub8 + stage2a` 级 HR 导出 smoke 都已经完成, 不再是当前 blocker。
+- `Phase C hr32 lr0.5 sub8 iter32` 现在已经在 native `psnr` 上超过 `Phase A iter20`。
+- 当前后手顺序更新为:
+  1. 固定 `lambda_hr_rgb=32`, 继续做 `lambda_lr_consistency≈0.5` 的近邻 sweep, 优先:
+     - `0.6`
+     - `0.4`
+  2. 如果 native `residual_mean` 仍始终压不过 `Phase A`, 再评估 `Phase E`
+  3. `Phase B` 只在新的 objective 下重新暴露 coverage / 显存问题时再回头

@@ -81,7 +81,11 @@ class DiagnosticsWriter:
         output_path = self.sr_selection_dir / f"{stage_name}_frame_{frame_id:04d}.png"
         self._save_tensor_map(selection_map, output_path)
 
-    def write_gaussian_fidelity_summary(self, fidelity_score: torch.Tensor) -> Path:
+    def write_gaussian_fidelity_summary(
+        self,
+        fidelity_score: torch.Tensor,
+        fidelity_diagnostics: dict[str, torch.Tensor] | None = None,
+    ) -> Path:
         """把 fidelity score 的摘要和直方图落盘.
 
         第一版先保存:
@@ -103,6 +107,33 @@ class DiagnosticsWriter:
             "fidelity_std": float(score_cpu.std(unbiased=False).item()),
             "bins": histogram.tolist(),
         }
+
+        if isinstance(fidelity_diagnostics, dict):
+            rho = fidelity_diagnostics.get("rho")
+            num_times_seen = fidelity_diagnostics.get("num_times_seen")
+            max_view_mask = fidelity_diagnostics.get("max_view_mask")
+            if isinstance(rho, torch.Tensor):
+                rho_cpu = rho.detach().float().cpu()
+                payload.update(
+                    {
+                        "rho_min": float(rho_cpu.min().item()),
+                        "rho_max": float(rho_cpu.max().item()),
+                        "rho_mean": float(rho_cpu.mean().item()),
+                        "rho_std": float(rho_cpu.std(unbiased=False).item()),
+                    }
+                )
+            if isinstance(num_times_seen, torch.Tensor):
+                seen_cpu = num_times_seen.detach().float().cpu()
+                payload.update(
+                    {
+                        "num_times_seen_min": float(seen_cpu.min().item()),
+                        "num_times_seen_max": float(seen_cpu.max().item()),
+                        "num_times_seen_mean": float(seen_cpu.mean().item()),
+                    }
+                )
+            if isinstance(max_view_mask, torch.Tensor):
+                max_view_cpu = max_view_mask.detach().float().cpu()
+                payload["max_view_counts"] = max_view_cpu.sum(dim=(0, 2)).to(dtype=torch.int64).tolist()
 
         output_path = self.outdir / "gaussian_fidelity_histogram.json"
         output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

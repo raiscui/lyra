@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import pytest
 import torch
 
 from src.refinement_v2.diagnostics import DiagnosticsWriter
@@ -268,3 +269,37 @@ def test_restore_latest_state_rebuilds_adapter_when_state_and_ply_counts_differ(
     assert summary["phase_reached"] == "stage2b"
     assert summary["warm_start_stage2b"] is True
     assert (run_config.outdir / "metrics_stage2b.json").exists()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA to reproduce warm-start mixed-device path")
+def test_bootstrap_stage2b_with_patch_supervision_handles_missing_sr_selection_on_cuda(tmp_path) -> None:
+    """warm-start 时即便还没恢复 `sr_selection_map`, 也不该因 mixed-device fallback 崩溃."""
+
+    run_config = build_run_config(
+        tmp_path,
+        start_stage="stage2b",
+        enable_stage2b=True,
+        stop_after="stage2b",
+        device="cuda",
+    )
+    hparams = build_stage_hparams(
+        patch_size=4,
+        lambda_patch_rgb=0.25,
+        iters_stage2b=2,
+    )
+    runner = RefinementRunner(
+        scene=build_scene_bundle(),
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=FakeRenderer(),
+    )
+
+    runner.run_phase0()
+    runner.run_phase1_prepare_weights()
+    runner.sr_selection_map = None
+
+    metrics = runner.bootstrap_stage2b_from_current_gaussians()
+
+    assert "loss_patch_rgb" in metrics

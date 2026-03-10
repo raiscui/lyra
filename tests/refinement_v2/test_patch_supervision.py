@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 import torch
 
 from src.refinement_v2.diagnostics import DiagnosticsWriter
@@ -225,6 +226,129 @@ def test_render_patch_prediction_with_render_devices_does_not_reuse_stale_intrin
     assert torch.allclose(renderer.calls[1]["intrinsics"][0, 0], torch.tensor([4.0, 4.0, 1.0, 1.0]))
 
 
+def test_render_reference_scene_for_training_uses_reference_resolution_and_intrinsics(tmp_path) -> None:
+    """Phase C 的整图 HR render 必须吃 reference 分辨率和 `intrinsics_ref`."""
+
+    renderer = RecordingRenderer()
+    run_config = build_run_config(tmp_path, reference_mode="super_resolved", sr_scale=2.0)
+    hparams = build_stage_hparams(lambda_hr_rgb=0.5, lambda_lr_consistency=1.0, reference_render_shard_views=1)
+    scene = _build_patch_scene(reference_mode="super_resolved", sr_scale=2.0)
+
+    runner = RefinementRunner(
+        scene=scene,
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=renderer,
+    )
+
+    render_output = runner._render_reference_scene_for_training()
+
+    assert render_output["images_pred"].shape == (1, 1, 3, 8, 8)
+    assert renderer.calls[-1]["hw"] == (8, 8)
+    assert torch.allclose(renderer.calls[-1]["intrinsics"], scene.intrinsics_ref)
+
+
+def test_sample_sr_patch_window_sets_uses_selection_priority_for_multiple_windows(tmp_path) -> None:
+    """Phase B 最小版应按 selection map 选出多个 non-trivial patch,而不是只取单热点."""
+
+    renderer = RecordingRenderer()
+    run_config = build_run_config(tmp_path, reference_mode="super_resolved", sr_scale=2.0)
+    hparams = build_stage_hparams(patch_size=4, sr_patches_per_view=2, lambda_patch_rgb=0.25)
+    scene = _build_patch_scene(reference_mode="super_resolved", sr_scale=2.0)
+
+    runner = RefinementRunner(
+        scene=scene,
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=renderer,
+    )
+
+    residual_map = torch.zeros(1, 1, 1, 4, 4, dtype=torch.float32)
+    residual_map[0, 0, 0, 0, 0] = 1.0
+    native_weight_map = torch.ones_like(residual_map)
+    sr_selection_map = torch.zeros(1, 1, 1, 8, 8, dtype=torch.float32)
+    sr_selection_map[0, 0, 0, 0:4, 0:4] = 1.0
+    sr_selection_map[0, 0, 0, 4:8, 4:8] = 0.9
+
+    patch_window_sets = runner.sample_sr_patch_window_sets(
+        residual_map,
+        native_weight_map=native_weight_map,
+        sr_selection_map=sr_selection_map,
+    )
+
+    assert patch_window_sets.shape == (2, 1, 1, 4)
+    assert patch_window_sets[0, 0, 0].tolist() == [0, 0, 2, 2]
+    assert patch_window_sets[1, 0, 0].tolist() == [2, 2, 2, 2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA to reproduce mixed-device patch workflow")
+def test_render_patch_prediction_aligns_cpu_patch_windows_with_cuda_scene(tmp_path) -> None:
+    """CPU patch window 遇到 CUDA scene 时, patch intrinsics 也必须自动对齐设备."""
+
+    renderer = RecordingRenderer()
+    run_config = build_run_config(tmp_path, reference_mode="super_resolved", sr_scale=2.0, device="cuda")
+    hparams = build_stage_hparams(patch_size=4, lambda_patch_rgb=0.25)
+    scene = _build_patch_scene(reference_mode="super_resolved", sr_scale=2.0)
+
+    runner = RefinementRunner(
+        scene=scene,
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=renderer,
+    )
+
+    # 这里故意保留 CPU patch windows, 模拟:
+    # `bootstrap_stage2b_from_current_gaussians()` 里 evaluation render 先落到 CPU,
+    # 但 patch scene 仍沿用 CUDA 主场景时的真实混设备路径.
+    patch_windows_native = torch.tensor([[[1, 1, 2, 2]]], dtype=torch.long)
+    pred_patch, reference_patch, patch_intrinsics = runner.render_patch_prediction(patch_windows_native)
+
+    assert pred_patch.device.type == "cuda"
+    assert reference_patch.device.type == "cuda"
+    assert patch_intrinsics.device.type == "cuda"
+    assert torch.allclose(renderer.calls[-1]["intrinsics"], patch_intrinsics)
+
+
+def test_compute_patch_losses_renders_multiple_patch_sets_when_phase_b_enabled(tmp_path) -> None:
+    """当打开多 patch supervision 时, Stage 3SR 应该真的渲染多个 patch set."""
+
+    renderer = RecordingRenderer()
+    run_config = build_run_config(tmp_path, reference_mode="super_resolved", sr_scale=2.0)
+    hparams = build_stage_hparams(patch_size=4, sr_patches_per_view=2, lambda_patch_rgb=0.25)
+    scene = _build_patch_scene(reference_mode="super_resolved", sr_scale=2.0)
+
+    runner = RefinementRunner(
+        scene=scene,
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=renderer,
+    )
+
+    residual_map = torch.zeros(1, 1, 1, 4, 4, dtype=torch.float32)
+    residual_map[0, 0, 0, 0, 0] = 1.0
+    runner.prev_weight_map = torch.ones_like(residual_map)
+    runner.sr_selection_map = torch.zeros(1, 1, 1, 8, 8, dtype=torch.float32)
+    runner.sr_selection_map[0, 0, 0, 0:4, 0:4] = 1.0
+    runner.sr_selection_map[0, 0, 0, 4:8, 4:8] = 0.9
+
+    loss_patch_rgb, loss_patch_perceptual = runner._compute_patch_losses(
+        residual_map,
+        torch.zeros((), dtype=torch.float32),
+    )
+
+    assert float(loss_patch_rgb.item()) >= 0.0
+    assert float(loss_patch_perceptual.item()) >= 0.0
+    assert len(renderer.calls) == 2
+
+
 def test_stage2a_with_patch_supervision_records_patch_losses(tmp_path) -> None:
     """开启 patch supervision 后, Stage 2A 指标里应包含 patch loss."""
 
@@ -253,6 +377,71 @@ def test_stage2a_with_patch_supervision_records_patch_losses(tmp_path) -> None:
     assert (run_config.outdir / "sr_selection_stats.json").exists()
 
 
+def test_stage2a_with_full_frame_hr_supervision_records_phase_c_metrics(tmp_path) -> None:
+    """Phase C 路径跑通后, Stage 3SR 指标里应拆出 HR 主监督和 LR consistency."""
+
+    run_config = build_run_config(tmp_path, reference_mode="super_resolved", sr_scale=2.0, stage2a_mode="enhanced")
+    hparams = build_stage_hparams(
+        iters_stage2a=2,
+        lambda_hr_rgb=0.5,
+        lambda_lr_consistency=1.0,
+        reference_render_shard_views=1,
+    )
+    scene = _build_patch_scene(reference_mode="super_resolved", sr_scale=2.0)
+
+    runner = RefinementRunner(
+        scene=scene,
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=RecordingRenderer(),
+    )
+
+    runner.run_phase0()
+    runner.run_phase1_prepare_weights()
+    final_metrics = runner.run_stage2a()
+    stage3sr_metrics = json.loads((run_config.outdir / "metrics_stage3sr.json").read_text(encoding="utf-8"))
+
+    assert final_metrics["stage3sr_supervision_mode"] == "full_frame_hr"
+    assert "loss_hr_rgb" in final_metrics
+    assert "loss_lr_consistency" in final_metrics
+    assert "psnr_hr" in final_metrics
+    assert runner.diagnostics_state["stage3sr_supervision_mode"] == "full_frame_hr"
+    assert stage3sr_metrics[-1]["stage3sr_supervision_mode"] == "full_frame_hr"
+
+
+def test_stage2a_rejects_patch_and_full_frame_hr_supervision_together(tmp_path) -> None:
+    """patch supervision 和 Phase C 的 full-frame HR supervision 不能同时开启."""
+
+    run_config = build_run_config(tmp_path, reference_mode="super_resolved", sr_scale=2.0, stage2a_mode="enhanced")
+    hparams = build_stage_hparams(
+        iters_stage2a=2,
+        patch_size=4,
+        lambda_patch_rgb=0.5,
+        lambda_hr_rgb=0.5,
+        lambda_lr_consistency=1.0,
+    )
+    scene = _build_patch_scene(reference_mode="super_resolved", sr_scale=2.0)
+
+    runner = RefinementRunner(
+        scene=scene,
+        gaussians=build_gaussian_adapter(),
+        diagnostics=DiagnosticsWriter(run_config.outdir),
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=RecordingRenderer(),
+    )
+
+    assert runner.diagnostics_state["stage3sr_enabled"] is False
+
+    runner.run_phase0()
+    runner.run_phase1_prepare_weights()
+
+    with pytest.raises(RuntimeError, match="cannot enable patch supervision and full-frame HR supervision"):
+        runner.run_stage2a()
+
+
 def test_phase3s_builds_fidelity_summary_from_render_meta(tmp_path) -> None:
     """Phase 3S 应该能消费 render meta 并写出非平凡的 selection map."""
 
@@ -272,8 +461,11 @@ def test_phase3s_builds_fidelity_summary_from_render_meta(tmp_path) -> None:
     runner.run_phase0()
     runner.run_phase1_prepare_weights()
     metrics = runner.run_phase3s_build_sr_selection()
+    fidelity_payload = json.loads((run_config.outdir / "gaussian_fidelity_histogram.json").read_text(encoding="utf-8"))
 
     assert metrics["fidelity_mean"] > 0.0
+    assert "fidelity_rho_mean" in metrics
+    assert "fidelity_num_seen_mean" in metrics
     assert metrics["sr_selection_mean"] > 0.0
     assert runner.diagnostics_state["phase3s_completed"] is True
     assert "warnings" not in runner.diagnostics_state
@@ -282,6 +474,9 @@ def test_phase3s_builds_fidelity_summary_from_render_meta(tmp_path) -> None:
     assert (run_config.outdir / "metrics_phase3s.json").exists()
     assert (run_config.outdir / "gaussian_fidelity_histogram.json").exists()
     assert (run_config.outdir / "sr_selection_stats.json").exists()
+    assert "rho_mean" in fidelity_payload
+    assert "num_times_seen_mean" in fidelity_payload
+    assert "max_view_counts" in fidelity_payload
 
 
 def test_stage3sr_records_sampling_smooth_loss_metric(tmp_path) -> None:

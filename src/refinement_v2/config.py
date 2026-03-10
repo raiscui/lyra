@@ -74,9 +74,21 @@ class StageHyperParams:
     lr_means: float = 1e-4
     lr_pose: float = 3e-5
     patch_size: int = 0
+    sr_patches_per_view: int = 1
+    fidelity_ratio_threshold: float = 1.5
+    fidelity_sigmoid_k: float = 6.0
+    fidelity_min_views: int = 3
+    fidelity_opacity_threshold: float = 1e-4
+    lambda_hr_rgb: float = 0.0
+    lambda_lr_consistency: float = 1.0
+    reference_render_shard_views: int = 1
     lambda_patch_rgb: float = 0.0
     lambda_patch_perceptual: float = 0.0
     lambda_sampling_smooth: float = 5e-4
+    enable_depth_anchor: bool = False
+    lambda_depth_anchor: float = 0.05
+    depth_anchor_alpha_threshold: float = 0.05
+    depth_anchor_source: str = "baseline_render"
     lambda_means_anchor: float = 0.01
     lambda_rotation_reg: float = 0.01
     means_delta_cap: float = 0.02
@@ -304,9 +316,81 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-means", type=float, default=1e-4)
     parser.add_argument("--lr-pose", type=float, default=3e-5)
     parser.add_argument("--patch-size", type=int, default=0)
+    parser.add_argument(
+        "--sr-patches-per-view",
+        type=int,
+        default=1,
+        help="Number of SR patch windows to supervise per view. 1 keeps the legacy single-hotspot path.",
+    )
+    parser.add_argument(
+        "--fidelity-ratio-threshold",
+        type=float,
+        default=1.5,
+        help="Cross-view `rho = r_max / r_min` threshold used by gaussian fidelity gating.",
+    )
+    parser.add_argument(
+        "--fidelity-sigmoid-k",
+        type=float,
+        default=6.0,
+        help="Sigmoid sharpness used when converting cross-view radius ratio into fidelity score.",
+    )
+    parser.add_argument(
+        "--fidelity-min-views",
+        type=int,
+        default=3,
+        help="Minimum visible view count required before a gaussian can receive positive fidelity score.",
+    )
+    parser.add_argument(
+        "--fidelity-opacity-threshold",
+        type=float,
+        default=1e-4,
+        help="Opacity threshold used when deciding whether a gaussian is visible for fidelity statistics.",
+    )
+    parser.add_argument(
+        "--lambda-hr-rgb",
+        type=float,
+        default=0.0,
+        help="Weight for full-frame HR supervision against SR reference images during Phase C style Stage 3SR.",
+    )
+    parser.add_argument(
+        "--lambda-lr-consistency",
+        type=float,
+        default=1.0,
+        help="Weight for downsampled HR-to-native consistency during full-frame Stage 3SR.",
+    )
+    parser.add_argument(
+        "--reference-render-shard-views",
+        type=int,
+        default=1,
+        help="How many views to render per shard when doing full-frame reference-resolution renders on one device.",
+    )
     parser.add_argument("--lambda-patch-rgb", type=float, default=0.0)
     parser.add_argument("--lambda-patch-perceptual", type=float, default=0.0)
     parser.add_argument("--lambda-sampling-smooth", type=float, default=5e-4)
+    parser.add_argument(
+        "--enable-depth-anchor",
+        action="store_true",
+        help="Enable baseline depth anchoring during Stage 2A / Stage 3SR.",
+    )
+    parser.add_argument(
+        "--lambda-depth-anchor",
+        type=float,
+        default=0.05,
+        help="Weight for the normalized depth anchor loss. Only used when --enable-depth-anchor is set.",
+    )
+    parser.add_argument(
+        "--depth-anchor-alpha-threshold",
+        type=float,
+        default=0.05,
+        help="Reference alpha threshold used to filter valid depth anchor pixels.",
+    )
+    parser.add_argument(
+        "--depth-anchor-source",
+        type=str,
+        default="baseline_render",
+        choices=["baseline_render", "dataset", "external"],
+        help="Depth anchor reference source. V1 currently implements baseline_render only.",
+    )
     parser.add_argument("--lambda-means-anchor", type=float, default=0.01)
     parser.add_argument("--lambda-rotation-reg", type=float, default=0.01)
     parser.add_argument("--sampling-radius-threshold", type=float, default=1.5)
@@ -379,9 +463,21 @@ def load_effective_config_from_cli(
         lr_means=args.lr_means,
         lr_pose=args.lr_pose,
         patch_size=args.patch_size,
+        sr_patches_per_view=args.sr_patches_per_view,
+        fidelity_ratio_threshold=args.fidelity_ratio_threshold,
+        fidelity_sigmoid_k=args.fidelity_sigmoid_k,
+        fidelity_min_views=args.fidelity_min_views,
+        fidelity_opacity_threshold=args.fidelity_opacity_threshold,
+        lambda_hr_rgb=args.lambda_hr_rgb,
+        lambda_lr_consistency=args.lambda_lr_consistency,
+        reference_render_shard_views=args.reference_render_shard_views,
         lambda_patch_rgb=args.lambda_patch_rgb,
         lambda_patch_perceptual=args.lambda_patch_perceptual,
         lambda_sampling_smooth=args.lambda_sampling_smooth,
+        enable_depth_anchor=args.enable_depth_anchor,
+        lambda_depth_anchor=args.lambda_depth_anchor,
+        depth_anchor_alpha_threshold=args.depth_anchor_alpha_threshold,
+        depth_anchor_source=args.depth_anchor_source,
         lambda_means_anchor=args.lambda_means_anchor,
         lambda_rotation_reg=args.lambda_rotation_reg,
         sampling_radius_threshold=args.sampling_radius_threshold,

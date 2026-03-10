@@ -8,6 +8,7 @@ from src.refinement_v2.losses import (
     compute_sampling_smooth_loss,
     compute_scale_tail_loss,
     compute_weighted_rgb_loss,
+    downsample_rgb_tensor,
 )
 
 
@@ -58,3 +59,22 @@ def test_sampling_smooth_loss_penalizes_small_scale_low_fidelity_gaussians() -> 
     )
 
     assert float(loss.item()) > 0.0
+
+
+def test_downsample_rgb_tensor_preserves_constant_rgb_values() -> None:
+    """下采样常量图像时, 数值应保持稳定."""
+
+    rgb = torch.full((1, 2, 3, 8, 8), 0.75, dtype=torch.float32)
+    downsampled = downsample_rgb_tensor(rgb, (4, 4))
+
+    assert downsampled.shape == (1, 2, 3, 4, 4)
+    assert torch.allclose(downsampled, torch.full_like(downsampled, 0.75))
+
+
+def test_downsample_rgb_tensor_keeps_tensor_when_shape_is_unchanged() -> None:
+    """目标尺寸不变时, helper 应直接复用原 tensor."""
+
+    rgb = torch.rand(1, 1, 3, 4, 4)
+    downsampled = downsample_rgb_tensor(rgb, (4, 4))
+
+    assert downsampled is rgb

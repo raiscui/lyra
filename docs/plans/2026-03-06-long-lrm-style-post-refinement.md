@@ -82,6 +82,34 @@
 1. 说明哪些增强已经并入 v2 主线
 2. 说明下一轮真正还值得继续的 continuation tasks 是什么
 
+## Reader Guide / Current Backlog Snapshot
+
+如果你现在是为了判断"还有什么没完成"而来, 推荐按下面顺序阅读这份文档:
+
+1. 先看 `Current Continuation Order`
+   - 这是当前真正建议继续推进的顺序
+2. 再看 `Continuation Tasks`
+   - 这里区分了哪些已经完成, 哪些只是还在收尾
+3. 再决定是否进入 `Closest-to-SplatSuRe Track`
+   - 这是高侵入二期路线, 不是当前默认 backlog
+4. 最后如果只是想追溯历史, 再看 `Historical 0-to-1 Tasks`
+   - 那一段是归档, 不是今天的待办
+
+截至 `2026-03-09`, 当前更准确的 backlog 口径是:
+
+- 最明确仍未彻底收口:
+  - `Continuation Task C`
+- 已落地, 但还有继续优化空间:
+  - `Continuation Task B`
+  - `Continuation Task D`
+  - `Continuation Task A`
+- 高侵入未来路线:
+  - `Closest-to-SplatSuRe Track`
+- 不应再当成当前 backlog:
+  - `Task 1 ~ Task 10`
+- 当前已弃用, 不纳入这份计划的 continuation backlog:
+  - `depth anchor`
+
 ## Execution Readiness / Preflight Gate
 
 继续执行这条线时, 需要先区分两类任务:
@@ -208,6 +236,20 @@
   - 即 `96 observations`
   - 会在 full-view `Stage 2A` 上 OOM
 
+**Status (2026-03-09 refresh):**
+
+- 命令和文档的第一轮收口已经完成
+- 当前已经明确写清:
+  - full-view native smoke 是正式 baseline 起点
+  - full-view SR smoke 是同 observation 预算下的增强分支
+  - 当前 48G 主机只推荐 `target_subsample = 16`
+  - 不建议在 baseline 还没固定前直接混入 `Stage 2B`
+- 因此 `Continuation Task B` 当前剩余内容, 已不再是"入口没打通"
+- 更准确地说, 剩下的是:
+  - 更长 smoke
+  - 在当前 `48 observations` 档位下继续比较 native vs SR
+  - 需要时再衔接 `Stage 2B`
+
 **Why:**
 
 - 用户当前真正要的不是“每个 view 单独评估”
@@ -235,6 +277,15 @@
   - `48 observations`
 
 ### Continuation Task C: 收敛 stage 命名与使用文档
+
+**Status (2026-03-09 refresh):**
+
+- 仍未正式收口
+- 当前最需要补的是:
+  - 对外命名统一
+  - usage 示例统一
+  - diagnostics / 产物说明统一
+- 这也是当前 continuation tasks 里最明确的开放项
 
 **Why:**
 
@@ -304,6 +355,25 @@
   - `Stage 2B` 的收益明显大于当前 `native vs SR reference` 的差异
   - `native baseline -> Stage 2B` 是当前正式推荐主线
   - `SR -> Stage 2B` 仍可保留为锐度优先的可选分支
+- `2026-03-09 refresh`:
+  - 在 A800 / full-view / `target_subsample=8` / external SR 口径下:
+    - `stage3sr -> stage2b (run2)`
+      - `PSNR = 25.4044`
+      - `residual_mean = 0.02871`
+      - `sharpness = 0.004525`
+    - 在同一 SR 分支继续追加一段 `Stage 2B` 后:
+      - `stage2b -> stage2b (run3)`
+      - `PSNR = 25.7353`
+      - `residual_mean = 0.02742`
+      - `sharpness = 0.004948`
+  - 这说明:
+    - 当前 SR 分支继续追加 `Stage 2B` 仍有真实收益
+    - 但即使显式打开 `Phase 3 / Phase 4` 的开关, 当前 run 仍停在 `stage2b`
+    - 原因不是流程失效, 而是 gate 已经变成:
+      - `need_geometry = false`
+      - `local_overlap_persistent = false`
+      - `global_shift_detected = false`
+    - 因此 `Phase 3 / Phase 4` 在当前实现里更像“问题兜底阶段”,不是正常健康 run 的默认后续主线
 
 **Done when(当前轮):**
 
@@ -311,7 +381,7 @@
 - 当前正式推荐 workflow 已可明确写成:
   - `native baseline -> Stage 2B`
 
-## Historical 0-to-1 Tasks
+## Historical 0-to-1 Tasks (Archive Only, Not Current Backlog)
 
 下面的 `Task 1 ~ Task 10` 保留为这份文档最初形成时的历史任务拆解.
 它们有的已经落地, 有的已经被当前代码状态覆盖.
@@ -348,6 +418,51 @@
 
 ### Phase A: 真正复刻 Gaussian Fidelity Score
 
+Status (2026-03-10 refresh):
+
+- 已完成第一轮最小落地:
+  - `phase3s` 现在会导出跨视图 fidelity diagnostics:
+    - `r_min`
+    - `r_max`
+    - `rho`
+    - `num_times_seen`
+    - `argmax_view`
+    - `max_view_mask`
+  - `gaussian_fidelity_histogram.json` 现在额外包含:
+    - `rho_*`
+    - `num_times_seen_*`
+    - `max_view_counts`
+  - `build_sr_selection_weight()` 已改成优先把低 fidelity Gaussian 只投到自己的 `max_view_mask`
+- 这意味着:
+  - 当前 `Phase A` 的“fidelity / max-view mask 做真”已经不再只是文档目标
+  - 代码和测试里已经有第一轮可运行闭环
+- 仍未完成:
+  - 已补第一轮 full-view `sub8` 实验:
+    - `outputs/refine_v2/full_view_sr_stage3sr_phaseA_rho_sub8_iter20_20260310`
+    - 相对旧 baseline:
+      - `PSNR +0.00424`
+      - `residual_mean -0.0000945`
+      - `sharpness -0.00000430`
+    - 这说明新 `Phase A` 已显著改变 selection 分布, 但最终收益目前仍接近持平
+  - 已补最小 fidelity calibration:
+    - CLI 已暴露:
+      - `--fidelity-ratio-threshold`
+      - `--fidelity-sigmoid-k`
+      - `--fidelity-min-views`
+      - `--fidelity-opacity-threshold`
+    - `outputs/refine_v2/full_view_sr_stage3sr_phaseA_rho_thr1p1_sub8_iter20_20260310`
+    - 仅把 `fidelity_ratio_threshold: 1.5 -> 1.1`
+    - 相对 `Phase A` rerun:
+      - `PSNR -0.000586`
+      - `residual_mean +0.0000147`
+      - `sharpness -0.000000133`
+      - `selection_mean +0.03125`
+    - 这说明:
+      - selection coverage 确实被明显放大了
+      - 但最终指标仍没有超过当前 `Phase A`
+      - 当前瓶颈已经不再只是 fidelity routing 强度
+  - `Phase B ~ E` 仍然保持待实现
+
 目标:
 
 - 不再只依赖单轮 render meta 的代理量
@@ -377,6 +492,31 @@
 
 ### Phase B: 从单 patch 升级到全图 weighted SR supervision
 
+Status (2026-03-10 refresh):
+
+- 已完成第一轮最小落地:
+  - 新增 `--sr-patches-per-view`
+  - 当前 `Stage 3SR` 已不再被迫只吃单热点 patch
+  - 会按 reference priority 选多个 patch set, 再逐个渲染并平均 patch loss
+- 已完成两轮 full-view `sub8` 验证:
+  1. `multi4`
+     - `outputs/refine_v2/full_view_sr_stage3sr_phaseB_multi4_sub8_iter20_20260310`
+     - `phase3s` 能完成
+     - 但 `stage3sr` 在 reference patch render 时 OOM
+  2. `multi2`
+     - `outputs/refine_v2/full_view_sr_stage3sr_phaseB_multi2_sub8_iter20_20260310`
+     - 可以完整跑完
+     - 相对旧 baseline:
+       - `PSNR +0.00112`
+       - `residual_mean -0.0000843`
+       - `sharpness -0.00000244`
+     - 相对 `Phase A` rerun:
+       - 指标基本持平, 且略弱于 `Phase A`
+- 这说明:
+  - `Phase B` 的多 patch 机制已经代码落地
+  - 但当前最小版 `multi2` 还没有把收益明显拉高
+  - `multi4` 在当前 `patch-size=256` 口径下又太重
+
 目标:
 
 - 去掉“每视角只取一个 residual hotspot patch”的限制
@@ -401,28 +541,173 @@
 
 ### Phase C: 引入真正的 LR-SR 联合目标
 
+Status (2026-03-10 refresh):
+
+- 当前方向已经重新澄清:
+  - 不是继续维持“native LR 主损失 + SR patch 辅助项”
+  - 而是让 6 路 SR 视频正式升格为新的主监督
+  - native LR 只保留为下采样一致性约束
+- 这背后的直接原因是:
+  - 当前代码已确认仍在同时使用:
+    - `gt_images` 作为 native LR 主 RGB 监督
+    - `reference_images` 作为 SR reference 监督
+  - 同时第一轮 fidelity calibration 也说明:
+    - 即便明显放大 selection coverage
+    - 最终指标仍没有超过当前 `Phase A`
+  - 因此当前更值得改的是 supervision objective, 而不只是继续调 routing 强度
+- 当前不采用的版本是:
+  - 直接把 native LR 全部删除
+  - 改成纯 `HR-only supervision`
+- 原因是:
+  - SR 视频虽然和原视频共享同一套相机参数
+  - 但它仍然是后验超分结果
+  - 如果完全去掉 native LR 约束, 更容易把 SR hallucination 直接写进 3D
+- 2026-03-10 implementation update:
+  - `Phase C.1 ~ C.4` 的最小工程闭环已经落地到代码
+  - `Stage 3SR` 现在支持 `full_frame_hr` 监督模式
+  - 真实 full-view external SR + `sub8` 最小 smoke 已通过:
+    - `outputs/refine_v2/full_view_sr_stage3sr_phaseC_smoke_sub8_streamshard_20260310`
+  - 随后的第一轮更长对照也已完成:
+    - `outputs/refine_v2/full_view_sr_stage3sr_phaseC_hr32_lr1_sub8_iter8_20260310`
+    - 结果达到:
+      - `psnr = 22.2530`
+      - `residual_mean = 0.044018`
+      - `psnr_hr = 20.2697`
+  - 第二轮更长对照也已完成:
+    - `outputs/refine_v2/full_view_sr_stage3sr_phaseC_hr32_lr0p5_sub8_iter20_20260310`
+    - 当前最佳结果达到:
+      - `psnr = 23.5465`
+      - `residual_mean = 0.037822`
+      - `sharpness = 0.002699`
+      - `psnr_hr = 21.2458`
+      - `residual_mean_hr = 0.051848`
+    - 与 `Phase A iter20` 相比:
+      - native `psnr` 差距缩到 `-0.4545`
+      - native `residual_mean` 差距缩到 `+0.003393`
+    - 这说明:
+      - `Phase C` 的长程收益已经被真实验证
+      - 当前再继续停留在 `1 iter` sweep 的价值更低
+      - 当时更值得先把 `Phase D` 补完
+  - 第三轮更长对照也已完成:
+    - `outputs/refine_v2/full_view_sr_stage3sr_phaseC_hr32_lr0p5_sub8_iter32_20260310`
+    - 当前最佳结果达到:
+      - `psnr = 24.1546`
+      - `residual_mean = 0.034917`
+      - `sharpness = 0.003191`
+      - `psnr_hr = 21.6160`
+      - `residual_mean_hr = 0.049654`
+    - 与 `Phase C iter20` 相比:
+      - `psnr +0.6081`
+      - `residual_mean -0.002905`
+      - `sharpness +0.000493`
+      - `psnr_hr +0.3702`
+      - `residual_mean_hr -0.002194`
+    - 与 `Phase A iter20` 相比:
+      - native `psnr` 已反超 `+0.1536`
+      - native `sharpness` 已反超 `+0.000236`
+      - native `residual_mean` 仍略高 `+0.000488`
+    - 这说明:
+      - `Phase C` 已经跨过“是否成立”的阶段
+      - `Phase D` 也已经完成, 因而当前主线问题不再是“HR 导出是否缺失”
+      - 后续真正值得继续压的是 native `residual_mean` 能否也一起超过 `Phase A`
+  - 额外确认了一条重要工程规律:
+    - 只做 `serial render` 不够
+    - 必须进一步做 `stream-sharded loss/backward`, 否则后续 full concat 仍会把峰值显存拉回来
+  - 同时也确认了当前实验策略上的一条规律:
+    - `lambda_hr_rgb=8/16/32` 在 `1 iter` smoke 上几乎无差异
+    - 后续参数实验更值得优先拉长 iter, 或开始下调 `lambda_lr_consistency`
+
 目标:
 
-- 像 SplatSuRe 一样:
-  - HR render 对 HR/SR 图像做选择性监督
-  - 同时把 HR render 下采样后,与原 LR/native 图像做全图一致性约束
+- 让 `Stage 3SR` 从当前的“native 主损失 + SR patch 辅助”升级成:
+  - HR render 对 6 路 SR 视频做主监督
+  - HR render 下采样后,再和 native LR 视频做全图一致性约束
+- 换句话说:
+  - SR 6 视频成为新的“主 GT”
+  - native LR 不再是并行主目标,而是 anti-hallucination consistency
 
 要点:
 
 - 新目标应更接近:
-  - `L = gamma * L_sr + (1 - gamma) * L_lr`
-- 这里的 `L_lr` 不该是当前 residual-based robust native loss 的完全替代
-- 更接近论文的版本是:
-  1. 直接从 HR render 下采样到 native 分辨率
-  2. 对 downsampled render 和 native GT 做全图 photometric / SSIM 约束
-  3. HR render 再对 SR reference 做加权损失
+  - `L = gamma * L_hr_sr + (1 - gamma) * L_lr_consistency`
+- 这里的 `L_lr_consistency` 语义已经变了:
+  - 不再是当前那种 native full-frame 主损失的简单延续
+  - 而是“HR 预测必须在降回 LR 后仍然对得上原视频”
+- 更接近当前共识的版本是:
+  1. 在 reference 尺度渲染 full-frame HR output
+  2. 直接对 HR output 和 SR 6 视频做主 photometric supervision
+  3. 把 HR output 下采样回 native 分辨率
+  4. 再对 downsampled output 和 native LR 做全图 consistency loss
+  5. selective weighting 继续保留, 但它服务的是“HR 主监督的权重分布”, 不再只是 patch 旁路
+- 从工程挂点看, 这轮最小实现应优先复用:
+  - 现有 `reference_images / intrinsics_ref`
+  - 现有 `render_scene(...)` 与 renderer cache
+  - 现有 `compute_weighted_rgb_loss(...)`
+  - 然后补:
+    - full-frame HR render helper
+    - HR -> LR downsample consistency helper
+    - 新的 phase/stage diagnostics
 
 完成标志:
 
 - 当前主训练目标不再是“native 主目标 + SR patch 旁路”
-- 而是“HR 主输出 + LR consistency + selective SR”
+- 而是“SR 主监督 + LR consistency + optional selective weighting”
+
+Current agreed implementation tasks:
+
+1. `Phase C.1` 先补 full-frame HR render 路径
+   - 让 runner 能在 reference 分辨率 / `intrinsics_ref` 下直接渲染整图
+   - 不再依赖 patch scene 作为唯一 HR render 入口
+2. `Phase C.2` 再补 HR -> LR consistency 路径
+   - 明确下采样策略
+   - 明确 native LR consistency loss 的计算位置
+3. `Phase C.3` 把 `Stage 3SR` 目标重组为:
+   - HR 对 SR 6 视频主监督
+   - LR consistency 对 native GT
+   - selective weighting 作为 HR supervision 的权重层
+4. `Phase C.4` 补 diagnostics / metrics / tests
+   - 至少拆开:
+     - HR-space metrics
+     - LR consistency metrics
+     - memory / render mode diagnostics
 
 ### Phase D: 让最终输出真的成为 HR 输出
+
+Status (2026-03-10 refresh):
+
+- `Phase D` 的最小闭环已经落地:
+  - 只要当前 scene 真的存在独立的 `reference-space`
+  - runner 就会在 baseline/final 导出时额外补出:
+    - `baseline_render_hr.mp4`
+    - `gt_reference_hr.mp4`
+    - `final_render_hr.mp4`
+- `diagnostics.json` 现在会额外记录:
+  - `native_hw`
+  - `reference_hw`
+  - `baseline_hr`
+  - `final_hr`
+- 对应回归已验证:
+  - `PYTHONPATH="$(pwd)" pixi run pytest -q tests/refinement_v2`
+  - 结果: `113 passed`
+- 真实 smoke 也已成功验证:
+  - `phase0` 级:
+    - `outputs/refine_v2/phaseD_phase0_hr_export_smoke_20260310`
+    - 已确认同时落盘:
+      - native videos / snapshots
+      - hr videos / snapshots
+    - `diagnostics.json` 已确认包含:
+      - `baseline_hr`
+      - `final_hr`
+      - `psnr_gain_hr`
+      - `sharpness_gain_hr`
+      - `residual_mean_hr_drop`
+  - 更重的 `full-view + sub8 + stage2a` 级:
+    - `outputs/refine_v2/full_view_sr_stage3sr_phaseD_export_smoke_sub8_20260310_final`
+    - 已确认:
+      - `phase_reached = stage3sr`
+      - `final_render_hr.mp4` 正常落盘
+      - `psnr_gain_hr = 0.9238`
+      - `residual_mean_hr_drop = 0.013701`
 
 目标:
 
@@ -472,11 +757,17 @@
 
 如果真要做“最接近 SplatSuRe”的版本, 当前推荐顺序是:
 
-1. Phase A: fidelity / max-view mask 先做真
-2. Phase B: 从单 patch 升级到全图 weighted SR
-3. Phase C: 补 `HR render + LR downsample consistency`
-4. Phase D: 让最终导出支持 HR render
-5. Phase E: 最后再评估 geometry / densify 的耦合
+1. Phase C: 先把目标改对
+   - SR 6 视频升格为主监督
+   - native LR 退到 downsample consistency
+2. Phase D: 让最终导出支持 HR render
+   - 否则就算 `Phase C` 生效, 最终交付物也还看不到真正 HR 输出
+3. 再回头补强 Phase B
+   - 如果 `Phase C` 之后仍存在 coverage 不足或显存浪费, 再重做“全图 weighted SR”实现
+4. 最后再评估 Phase E
+   - 是否让 SR 信息有限进入 geometry / densify
+5. Phase A calibration 只保留为低优先级微调
+   - 不是当前主线 blocker
 
 ### Practical Warning
 
@@ -1422,22 +1713,35 @@ git commit -s -m "feat: add dry run validation for post refinement"
 
 ---
 
-## Current Continuation Order
+## Current Continuation Order (Use This As The Current Backlog Order)
 
-如果从今天的代码现实继续往前走, 推荐顺序不再是重跑下面的 `Task 1 ~ Task 10`.
-而是:
+截至 `2026-03-10` 的最新实验刷新, 这个 backlog 顺序已经再次更新。
 
-1. 先把 `Continuation Task B` 收口成当前正式 full-view 使用路径
-   - full-view root mode 已经落地
-   - 当前更值得把 `48 observations` 这档主基线稳定下来
-2. 再在 full-view 口径下继续做 `Continuation Task D`
-   - 评估是否值得进入更长的 `Stage 2B`
-   - 如需更大 observation 密度,迁移到 A100 / 多卡
-3. 然后按需要回到 `Continuation Task A`
-   - 不是再证明“SR 有没有接上”
-   - 而是继续调 selective SR,争取让 full-view SR 真正超过 native
-4. 最后继续推进 `Closest-to-SplatSuRe Track`
-   - 只在 full-view 基线已经稳定之后再做高侵入改造
+原因不再是 baseline 还没稳定, 而是当前已经拿到了四类更强的新证据:
+
+- `Phase D` 不只是 `phase0` 可用, 更重的 `full-view + sub8 + stage2a` HR 导出 smoke 也已经完成
+- `Phase C` 的 `hr=32, lr=0.5, iter32` 已经在 native `psnr` 上超过 `Phase A iter20`
+- 同一轮里, native `sharpness` 也已经超过 `Phase A iter20`
+- 当前剩下的差距只剩 native `residual_mean +0.000488`, 问题已经从“目标是否成立”切换成“最后这点 trade-off 要怎么压过去”
+
+因此如果从今天的代码现实继续往前走, 推荐顺序应改成:
+
+1. 继续压 `Phase C`
+   - 统一保持 `--target-subsample 8`
+   - 优先围绕 `lambda_lr_consistency≈0.5` 做近邻 sweep
+   - 当前最有信息量的点是:
+     - `0.6`
+     - `0.4`
+   - 目标不是再证明 `Phase C` 能不能跑, 而是确认 native `residual_mean` 能否也一起超过 `Phase A`, 同时不牺牲现有 HR 指标
+2. 如果近邻 sweep 后仍然只能在 native `psnr` 和 `residual_mean` 之间二选一, 再评估 `Phase E`
+   - 核心问题会变成:
+     - 是否允许 SR 信息有限影响 geometry / densify
+     - 让最后一点 residual gap 不再只靠 appearance loss 去硬压
+3. `Phase B` 暂时后移
+   - 只有当新的 `Phase C` 目标下又重新暴露出 coverage 不足或显存利用问题时, 才回头重做“全图 weighted SR”
+4. 原来的 `Continuation Task B / D / A`
+   - 现在都不再是主线 blocker
+   - 可以按需要补文档, 但不应再抢占当前主线 GPU 预算
 
 ## Historical Execution Order
 
@@ -1468,10 +1772,13 @@ git commit -s -m "feat: add dry run validation for post refinement"
 - `Mip-Splatting` 的 2D Mip filter(renderer-level 改造)
 - `EDGS-style` local reinitialization
 - `tttLRM` 的 fast-weight memory / LaCT / streaming reconstruction
+- `depth anchor`
+  - 截至 `2026-03-09`, 当前已弃用
+  - 不作为这份计划的 continuation item
 
 ## 一句话继续顺序
 
-先把 full-view joint baseline 固定为当前正式入口, 在 48G 上先用 `target_subsample = 16` 稳定跑通 native / SR, 再视硬件条件继续放大 observation 密度或进入更接近 SplatSuRe 的高侵入改造.
+先按新的 `Phase C` 口径把目标函数层级改对: `SR 主监督 + LR consistency`, 再补 HR 导出, 然后才视结果决定是否还需要回头重做全图 weighted SR 或进一步放开 geometry.
 
 ---
 

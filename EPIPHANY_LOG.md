@@ -1,589 +1,305 @@
-## 2026-03-08 06:50 UTC 主题: 双卡不是充分条件, renderer meta 粒度才是决定因素
+# EPIPHANY_LOG
+
+## [2026-03-10 03:34:14 UTC] 主题: overlay 容器里不要只信顶层 `du -x /`, 要直接打到热点路径
 
 ### 发现来源
-
-- 在双 `RTX 4090` 上重试 `full-view native sub4` 时
-- 第一轮多卡改造已经把 OOM 从 runner 主卡聚合点挪走
-- 第二轮真实 trace 又在 `src/rendering/gs.py::_merge_chunk_meta(...)` 看到新的 OOM
+- 本轮做整机磁盘垃圾排查时, `df` 显示根盘已使用约 `242G`。
+- 但首次运行 `du -xhd1 /` 只看到了几百 MB 的可见目录, 与真实情况严重不符。
 
 ### 核心问题
-
-- “程序能看到两张卡” 不等于 “full-view 大 observation 就一定能跑”
-- 如果 shard 粒度仍然过粗
-- renderer 内部自己的 dense meta 也会把单卡打满
+- 在当前 overlay / snapshotter 环境里, 顶层 `du -x /` 容易被层叠文件系统行为误导。
+- 如果因此直接得出“容器里几乎没东西可清”, 结论会明显失真。
 
 ### 为什么重要
-
-- 这条规律不只影响当前 `refinement_v2`
-- 以后任何依赖 dense per-view render meta 的多卡优化路径
-- 都不能只停留在“按设备数平均切 view”
+- 后续只要再遇到磁盘排查、缓存清理、环境瘦身这类任务, 都可能先被这一步带偏。
+- 更稳的做法是:
+  - 先用 `df` 看总量
+  - 再直接点查 `~/.cache`、`/tmp`、工作区 `.pixi`、`outputs`、`checkpoints` 等热点路径
+  - 必要时再用 `lsof +L1` 排除“已删除但仍占用”的文件
 
 ### 未来风险
-
-- 如果后续继续做:
-  - 更高 observation 密度
-  - `Stage 2B`
-  - `Phase 4`
-  - 或更接近 SplatSuRe 的全图 HR 监督
-- 只要 renderer 仍返回 dense meta
-- 就可能再次遇到“多卡已开启,但单 shard 仍 OOM”的二次显存墙
+- 如果继续按顶层 `du -x /` 判断, 很容易错过真正的大头目录。
+- 如果把多个单独 `du` 结果机械相加, 又可能被共享硬链接反向误导成“总量更大”。
 
 ### 当前结论
-
-- 当前已验证有效的做法是:
-  1. 无 backward 阶段统一 CPU gather
-  2. CUDA 多卡 shard 收成单 `view` 粒度
-  3. patch render 不再套用全局多卡聚合路径
-- 尚未验证的部分:
-  - `Stage 2B / Phase 4` 的双卡训练路径
-  - 更长正式预算下是否还会在别的 renderer meta 字段再触顶
+- overlay 环境中的磁盘排查, 需要用“热点目录逐个核对”的策略。
+- 单目录容量适合做清理优先级判断, 但跨目录求和要保留硬链接重复计数的警惕。
 
 ### 后续讨论入口
+- 下次如果用户要继续清理, 先从:
+  - `~/.cache/huggingface/hub`
+  - `~/.cache/pip`
+  - `/tmp`
+  - 各仓库 `.pixi`
+  开始做逐项确认, 不要再先跑一轮顶层 `du -x /` 就收工。
 
-- 下次如果继续推进双卡 full-view 长跑:
-  - 先看 `outputs/refine_v2/full_view_native_stage2a_dual_gpu_sub4_smoke_20260308_0640`
-  - 再看 `src/refinement_v2/runner.py` 的:
-    - `_build_render_shards(...)`
-    - `_run_appearance_stage_multi_device(...)`
-
-## 2026-03-08 08:48 UTC 主题: 双卡长跑已接近既有最优盆地, 继续堆同类预算未必再有质变
+## [2026-03-10 03:48:00 UTC] 主题: `Phase B` 的多 patch 基础设施已经足够, 但收益瓶颈已经转移到 supervision 强度和目标设计
 
 ### 发现来源
-
-- 在正式长跑:
-  - `outputs/refine_v2/full_view_native_stage2a_dual_gpu_sub4_baseline_v1_20260308_0718`
-  完成后
-- 对照:
-  - `outputs/refine_v2/full_view_native_stage2a_fair_v3_20260308_0630`
-  的最终 `diagnostics.json`
+- 本轮完成了 `Phase B` 的最小多 patch 实现, 并跑了 full-view `sub8` 的 `multi4` / `multi2` 两轮真实实验
 
 ### 核心问题
-
-- 更大显存与真双卡, 解决了“能不能跑”的问题
-- 但没有自动带来“全指标明显跨档更好”
-- 当前看到的是:
-  - `PSNR` 略高
-  - `residual_mean / sharpness` 并没有同步拉开
+- `multi4` 直接 OOM, 说明简单堆 patch 数量会先撞上算力/显存边界
+- `multi2` 虽然完整跑通, 但最终指标只比旧 baseline 略好, 同时略弱于 `Phase A`
+- 这说明当前问题已经不再是“有没有多 patch”, 而是:
+  - 多 patch 之后的监督强度如何分配
+  - 以及当前 `Stage 3SR` 目标是否足够承接更大的 coverage
 
 ### 为什么重要
-
-- 这意味着接下来的瓶颈, 很可能已经不是“算力不够所以跑不动”
-- 而是“当前 objective / stage 设计本身只能收敛到这个水平附近”
-
-### 未来风险
-
-- 如果后面继续只做:
-  - 同类参数
-  - 同类阶段
-  - 只是再加预算
-- 很可能只会得到更贵的近似同水平结果
+- 这会直接改变下一步优先级
+- 如果继续只堆 patch 数量, 很容易先 OOM, 但收益仍然不明显
+- 更值得做的要么是:
+  - fidelity / selection 强度参数校准
+  - 要么直接进入更像论文的 `Phase C`
 
 ### 当前结论
-
-- 当前已验证事实:
-  - 双卡正式 baseline 最终:
-    - `psnr = 24.54589251176849`
-    - `residual_mean = 0.029650945216417313`
-    - `sharpness = 0.003145787864923477`
-  - `fair_v3` 最终:
-    - `psnr = 24.52869587364757`
-    - `residual_mean = 0.029334016144275665`
-    - `sharpness = 0.0034818428102880716`
-  - 两者最终 `num_gaussians` 都是:
-    - `1137966`
-- 目前最合理的判断是:
-  - 这条 native full-view 主线已经接近同一优化盆地
-  - 如果想继续拉开质量差距, 更可能需要:
-    - `Stage 2B`
-    - loss 重新配比
-    - 或更接近 SplatSuRe 的 supervision 形态
+- `Phase B` 的基础设施 blocker 已解除
+- 但“multi-patch = 明显增益”这个命题目前没有被证据支持
 
 ### 后续讨论入口
+- 下一轮优先考虑:
+  1. 暴露 fidelity / selection 强度参数做小范围 calibration
+  2. 直接推进 `Phase C` 的 `HR render + LR consistency`
 
+## [2026-03-10 06:10:00 UTC] 主题: Phase A 的瓶颈已经不再只是 fidelity routing 强度
+
+### 发现来源
+- 本轮先补了 fidelity 参数 CLI 接线, 再做了一轮 full-view external SR + `sub8` 的最小 calibration
+- calibration 只改一项:
+  - `fidelity_ratio_threshold: 1.5 -> 1.1`
+
+### 核心问题
+- 这轮 calibration 明显放大了 selection coverage:
+  - `selection_mean: 0.01574 -> 0.04699`
+- 但最终 `PSNR / residual_mean / sharpness` 仍没有超过当前 `Phase A` rerun
+
+### 为什么重要
+- 这说明当前问题已经不再是“selection 太保守所以没收益”这么简单
+- 即便把 routing 强度明显推高, 收益也没有同步放大
+- 继续只围着 threshold / k / min_views 打转, 很可能会继续得到“coverage 变化明显, final metrics 变化很小”的结果
+
+### 当前结论
+- `Phase A` 现在更像已经完成了“routing 语义校正”
+- 但要把 external SR 真的转成更显著收益, 更关键的下一步应是:
+  - `Phase C: HR render + LR consistency`
+- 换句话说, 当前主瓶颈更像 supervision objective, 而不是 selection routing 本身
+
+### 后续讨论入口
+- 下次如果继续 Closest-to-SplatSuRe Track, 优先从:
+  - `src/refinement_v2/runner.py` 的 `_compute_patch_losses()` / HR render 分支
+  - `Stage 3SR` 目标改成 `HR output + LR downsample consistency`
+  开始, 不要再默认先堆更多 routing calibration
+
+## [2026-03-10 06:35:00 UTC] 主题: 当前真正需要改的已经不是 routing, 而是 supervision hierarchy
+
+### 发现来源
+- 先前的 fidelity calibration 证明, 仅靠放大 selection coverage 并没有把最终指标继续拉高
+- 随后的代码核对又确认, 当前实现仍然是:
+  - native GT 主损失
+  - SR reference 辅助监督
+- 用户随后明确接受新的方向:
+  - SR 6 视频升格为主监督
+  - native LR 退到 consistency
+
+### 核心问题
+- 如果继续沿旧层级推进, 后面做再多 Phase A / Phase B 微调, 都可能只是在旧目标上打转
+- 真正该先修正的是“谁是主监督, 谁是兜底一致性”这个 hierarchy
+
+### 为什么重要
+- 这会直接决定 `Phase C` 的接口设计、loss 结构、metrics 拆法和显存策略
+- 一旦 hierarchy 不改, 后面很多实现细节都会建立在错误目标上
+
+### 当前结论
+- 从今天开始, `Closest-to-SplatSuRe Track` 的主线口径应切到:
+  - SR 主监督
+  - LR consistency
+- 这不是对旧实现的小修小补, 而是目标函数层级的重新对齐
+
+### 后续讨论入口
+- 继续实现时优先从:
+  - full-frame HR render helper
+  - HR -> LR downsample consistency helper
+  开始, 再谈 selective weighting 和导出层
+
+
+## [2026-03-10 06:35:00 UTC] 主题: "serial render" 不是显存优化的终点, 如果后面还会 full concat, 峰值迟早回来
+
+### 发现来源
+- `Phase C` 的 full-frame HR 路径第一次 OOM 在 renderer
+- 把 native render 改成 `no_grad()` 后, 第二次 OOM 又转移到 `combine_sr_weights()`
+- 随后改成真正的 stream-sharded loss/backward 后, 真实 `sub8` smoke 才完整跑通
+
+### 核心问题
+- 很多时候“我已经做了 shard render”会给人一种错误安全感
+- 但如果后续还要把 shard 重新拼成完整大 tensor 再算 loss, 那只是在推迟峰值出现的位置
+
+### 为什么重要
+- 这条规律不只适用于当前的 `Phase C`
+- 以后只要是:
+  - full-frame supervision
+  - 高分辨率 reference
+  - 多视角 view batch
+- 都要警惕这种“前向分片了, loss 还是整块”的假优化
+
+### 当前结论
+- 真正有效的显存优化要落到整个链路:
+  - shard 级 render
+  - shard 级 weight build
+  - shard 级 loss
+  - shard 级 backward
+  - CPU 侧 metrics 汇总
+- 只做前向分片, 不足以保证 full-frame HR 训练能落地
+
+### 后续讨论入口
+- 以后如果还要继续推进 `Phase D` 或更长 `Phase C` 训练, 先复用这套 `stream-sharded` 思路
+- 不要回到“先拼完整 HR tensor, 再统一算 loss”的写法
+
+
+## [2026-03-10 07:05:00 UTC] 主题: 当最小 smoke 已经可跑时, 继续堆更多 1-iter sweep 很可能只是在制造假工作量
+
+### 发现来源
+- 本轮 `Phase C` 的 `lambda_hr_rgb=8/16/32` 三组真实 `sub8` smoke 都已跑通
+- 但三组在 `1 iter` 下几乎没有指标差异
+- 同时 `iter8` 长跑却已经能看到明显变化
+
+### 核心问题
+- 很多时候“我又多跑了几个点”会给人一种在认真探索的错觉
+- 但如果这些点仍停留在 `1 iter`, 它们可能根本没有能力区分配置优劣
+
+### 为什么重要
+- 这会直接影响后续实验预算分配
+- 如果继续在无分辨率的 `1 iter` 区间里堆 sweep, 只会消耗 GPU 时间, 却不提供更强结论
+
+### 当前结论
+- 当前 `Phase C` 已经过了“最小 smoke 排错期”
+- 后续参数实验要么:
+  - 拉长 iter
+  - 要么换更有信息量的维度(例如开始动 `lambda_lr_consistency`)
+- 继续只堆更多 `1 iter` 的 `lambda_hr_rgb` 点, 价值很低
+
+### 后续讨论入口
+- 下次如果继续 `Phase C`, 优先从:
+  - `lambda_lr_consistency`
+  - 或更长 iter
+  进入, 不要默认再扩 `hr=8/16/32/64/...` 的 1-iter sweep
+
+## [2026-03-10 07:47:33 UTC] 主题: 当 Phase C 已经把 native gap 压到较小量级后, 下一个主瓶颈会从 objective validity 转移到 deliverable scale
+
+### 发现来源
+- 本轮完成了 `outputs/refine_v2/full_view_sr_stage3sr_phaseC_hr32_lr0p5_sub8_iter20_20260310` 的真实长跑回收
+- 并与:
+  - `Phase C hr32 lr1 iter8`
+  - `Phase A iter20`
+  做了直接对比
+
+### 核心问题
+- `Phase C` 现在已经不再停留在“能不能跑通”这个层面
+- 它已经把 native 指标 gap 压到接近 `Phase A iter20`
+- 但最终交付物仍主要是 native-space 导出, 这会遮蔽 `HR supervision` 真正带来的收益
+
+### 为什么重要
+- 如果继续只盯着 native `PSNR / residual_mean`, 很容易误判当前主线是否已经值得继续
+- 当目标函数层级已经改对, 下一个最真实的产品缺口往往是:
+  - 你最终能不能把 HR 输出直接交付出来
+  - 而不是永远只在 LR 指标上比较
+
+### 当前结论
+- `Phase C` 的有效性已经被动态证据支持, 但尚未在 native 指标上完全超过 `Phase A`
+- 因此当前推荐 backlog 应优先切到 `Phase D`
+- 若未来还要继续压 `Phase C`, 也应围绕更长 iter 或 `lr≈0.5` 的进一步 sweep, 而不是回到 `1 iter` 点状扫描
+
+### 后续讨论入口
 - 下次继续时优先看:
-  - `outputs/refine_v2/full_view_native_stage2a_dual_gpu_sub4_baseline_v1_20260308_0718/videos/final_render.mp4`
-  - `outputs/refine_v2/full_view_native_stage2a_fair_v3_20260308_0630`
-  - 再决定是推 `Stage 2B`, 还是先做 loss / supervision 调整
+  - `src/refinement_v2/diagnostics.py`
+  - `src/refinement_v2/runner.py`
+  - `docs/plans/2026-03-06-long-lrm-style-post-refinement.md` 中的 `Phase D`
 
-## 2026-03-08 09:40 UTC 主题: README 的 `--multi_trajectory` 不是严格可复现入口
-
-### 发现来源
-
-- 对比:
-  - `assets/demo/static/diffusion_output_generated/0/rgb/00172.mp4`
-  - `assets/demo/static/diffusion_output/0/rgb/00172.mp4`
-- 继续追踪:
-  - `pose/00172.npz`
-  - `intrinsics/00172.npz`
-  - `gen3c_single_image_sdg.py`
-
-### 核心问题
-
-- 用户容易把 README 命令理解为:
-  - “可以一致还原官方 demo 原版视频”
-- 但当前实现里:
-  - `--multi_trajectory` 会先随机采样 `movement_distance`
-  - 之后才设置 `--seed`
-- 结果是:
-  - 连相机轨迹本身都不保证复现
-
-### 为什么重要
-
-- 这不是单纯的“像素随机性”
-- 而是更上游的 camera contract 已经变化
-- 一旦官方 demo 资产又来自不同 `MoGe` / checkpoint / 历史代码环境
-- 用户就会误以为模型或权重本身出了问题
-
-### 未来风险
-
-- 如果不把这个事实写清楚:
-  - 用户会继续把 `diffusion_output` 当作严格回归基线
-  - 但实际上它更像“官方预生成样例”
-- 这会让后续的质量回归判断混入:
-  - 轨迹变化
-  - 内参变化
-  - 生成内容变化
-
-### 当前结论
-
-- 已验证:
-  - README 当前命令生成的 `00172` 第 `0` 轨迹
-  - 与官方 demo 的:
-    - `pose`
-    - `intrinsics`
-    都不一致
-- 已验证的直接原因:
-  - `random.uniform(...)` 先于 `set_random_seed(...)`
-- 尚未完全坐实但很强的候选原因:
-  - demo 资产与当前环境的 `MoGe` 版本 / checkpoint / 预处理链不同
-
-### 后续讨论入口
-
-- 如果后面决定修:
-  - 先看 `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py`
-  - 再补 manifest / README 说明
-
-## 2026-03-08 10:02 UTC 主题: 官方 demo 更接近旧 `MoGe v1`, 当前重新生成更接近 `MoGe v2`
+## [2026-03-10 08:11:59 UTC] 主题: 当训练层已经有 reference-space scene builder 时, Phase D 最好的实现不是再起一套 HR 流程, 而是把 export plane 顺着既有 helper 接出来
 
 ### 发现来源
-
-- 新增 `--moge_version auto|v1|v2` 后
-- 在 `00172.png` 上直接跑 `_predict_moge_depth(...)`
-- 再对照:
-  - `assets/demo/static/diffusion_output/0/intrinsics/00172.npz`
-  - `assets/demo/static/diffusion_output_generated/0/intrinsics/00172.npz`
+- 本轮推进 `Phase D` 时回读了 `runner.py` 里已有的:
+  - `_build_reference_render_scene()`
+  - `_render_reference_scene_for_training()`
+  - `Phase C` 的 `psnr_hr / residual_mean_hr`
+- 随后用最小代码把 HR 导出补到 baseline/final 路径, 并跑通了 `113 passed` 回归
 
 ### 核心问题
-
-- 之前我们只能说:
-  - 官方 demo 与当前结果的 `intrinsics` 不同
-- 现在更进一步看到:
-  - 当前重新生成版几乎贴着 `MoGe v2`
-  - 官方 demo 则明显更贴近 `MoGe v1`
+- 很容易把“我要支持 HR 输出”误解成“我要再写第二套 HR pipeline”
+- 但这往往会把 scene 构造、renderer cache、diagnostics 命名再次分叉, 很快变成两套并行系统
 
 ### 为什么重要
-
-- 这把“demo 差异是不是和 `MoGe` 版本有关”从静态怀疑推进成了动态证据
-- 以后再讨论 demo 不一致时:
-  - 不该只盯 diffusion 随机性
-  - `MoGe` 版本 / checkpoint 也是一等变量
-
-### 未来风险
-
-- 如果 README 继续只给当前命令
-- 但不说明 `MoGe v1 / v2` 会改写初始相机内参
-- 用户会把:
-  - `intrinsics` 差异
-  - `trajectory` 差异
-  - diffusion 内容差异
-  混在一起判断
+- 当前项目已经在训练层证明了 `reference-space` 的可行性
+- 所以下一个正确动作应该是把这条语义延伸到 export layer
+- 而不是把同样的分辨率语义重新发明一遍
 
 ### 当前结论
-
-- 已验证:
-  - `MoGe v1 / v2` 的初始 `w2c` 在该样本上一致
-  - 但初始 `intrinsics` 明显不同
-  - 当前重新生成版第 `0` 帧内参几乎等于 `v2`
-  - 官方 demo 第 `0` 帧内参明显更接近 `v1`
-- 仍未完全确认:
-  - 官方 demo 是否整条链都固定在旧 `v1` 环境
+- `Phase D` 的正确最小切口是:
+  - 复用现有 `reference-space` helper
+  - 单独补一条 evaluation/export 版 HR render
+  - 然后在 diagnostics 里显式拆出 native/hr 摘要
+- 这比新起一套 HR runner 更稳, 也更不容易产生长期分叉
 
 ### 后续讨论入口
+- 下次如果继续扩展 `Phase D`, 优先看:
+  - `src/refinement_v2/runner.py`
+  - `docs/plans/2026-03-06-long-lrm-style-post-refinement.md` 的 `Phase D`
+- 不要默认去新建第二套 HR-only 导出主流程
 
-- 下一轮优先直接生成一版完整 `--moge_version v1` 对照资产
-- 再判断是否还需要继续追别的历史环境差异
-
-## 2026-03-08 12:09 UTC 主题: `MoGe v2` 的空间感异常更像 FOV 变化, 不像 pose 错乱
+## [2026-03-10 08:13:02 UTC] 主题: 当 HR 导出真正成为最终产物后, Phase C 的价值才从“训练内部信号”变成“用户可见信号”
 
 ### 发现来源
-
-- 用户指出:
-  - `MoGe v1` 输出透视正常
-  - `MoGe v2` 输出空间感不正常
-- 随后对照了:
-  - 官方 demo
-  - 当前 `v1` 生成版
-  - 当前 `v2` 生成版
-- 并回读了:
-  - `moge/model/v1.py`
-  - `moge/model/v2.py`
-  - `gen3c_single_image_sdg.py`
+- 本轮完成了 `Phase D` 的 runner 实现、回归验证和真实 full-view `phase0` smoke
+- 真实目录为:
+  - `outputs/refine_v2/phaseD_phase0_hr_export_smoke_20260310`
 
 ### 核心问题
-
-- 当画面空间感明显变弱时, 第一反应很容易怀疑:
-  - 相机轨迹错了
-  - 或 `intrinsics` 契约用错了
-- 但这次更强的证据是:
-  - 姿态差异很小
-  - 焦距和 FOV 差异很大
+- 之前即便 `Phase C` 已经能给出 `psnr_hr` 等训练指标, 最终交付仍主要是 native after 视频
+- 这会导致一个认知偏差:
+  - 训练内部已经开始朝 HR 目标优化
+  - 但用户最后看到的仍主要是 LR 空间结果
 
 ### 为什么重要
-
-- 这意味着后续判断空间感问题时:
-  - 不能只看 `pose`
-  - 也不能只看“视频看起来怪”
-  - 要把 `intrinsics / FOV` 当成一等变量
-- 尤其在:
-  - `MoGe v1 / v2`
-  - 不同 checkpoint
-  - 不同 demo 资产
- 之间切换时
-
-### 未来风险
-
-- 如果后面继续把:
-  - `MoGe` 版本变化
-  - `multi_trajectory` 的随机位移
-  - diffusion 内容差异
-  混在一起讨论
-- 很容易把“视场变化导致的视差变弱”误判成“轨迹错乱”或“代码回退”
+- 这类问题本质上不是 objective 是否正确, 而是 deliverable scale 是否对齐
+- 如果交付尺度和训练尺度错开, 再好的 HR supervision 也会被“最终看不到”所抵消
 
 ### 当前结论
-
-- 已验证:
-  - `v1 / v2` 的姿态非常接近
-  - `v2` 的 `fx / fy` 更小
-  - `v2` 的 `FOV` 更大
-  - `demo` 更接近 `v1`
-- 当前最合理的判断是:
-  - `v2` 输出更扁, 更像是 FOV 变广带来的自然结果
-  - 不是 `pose` 大幅偏了
-  - 也还没有证据表明是 Lyra 把 `v2 intrinsics` 用坏了
+- `Phase D` 已经证明, 一旦把 `baseline_render_hr / final_render_hr` 与 `baseline_hr / final_hr` 一起落盘
+- `Phase C` 的收益就不再只是 optimizer 内部的数字, 而会变成真正可观察的 before / after 产物
 
 ### 后续讨论入口
+- 下次如果继续主线优化, 优先把注意力放回:
+  - `Phase C` 在 HR / native 双空间下的长期收益曲线
+  - 而不是再回到“导出看不到 HR”这类交付层缺口
 
-- 若要再增强证据:
-  - 做一次固定 `trajectory + movement_distance` 的 `v1 / v2` 单轨迹 A/B
-- 若要改用户体验:
-  - README 或命令行应更明确提示:
-    - `auto` 默认会走 `v2`
-    - 若想更接近旧 demo, 优先试 `--moge_version v1`
-
-## 2026-03-08 12:47 UTC 主题: 这次更像“v2 focal calibration”问题, 不是“camera path redesign”问题
+## [2026-03-10 08:53:00 UTC] 主题: 当主线已经跨过 baseline 的关键门槛后, backlog 必须从“成立性证明”切到“frontier 压缩”
 
 ### 发现来源
-
-- 在继续追问“怎样把 `v2` 调回接近 `v1`”时
-- 对比了:
-  - `fx_v1 / fx_v2`
-  - `fy_v1 / fy_v2`
-
-### 核心问题
-
-- 很多时候看到空间感异常, 容易本能去改:
-  - `movement_distance`
-  - 轨迹形状
-  - 相机旋转策略
-- 但这次数值特征更像:
-  - `v2` 的 `fx/fy` 整体偏小一个稳定比例
-
-### 为什么重要
-
-- 如果这是“全局 focal scale”问题
-- 最干净的修法就是:
-  - 只改 `fx/fy`
-  - 不动 `cx/cy`
-  - 不动 pose
-- 这比把路径也卷进来要可控得多
-
-### 当前结论
-
-- 已验证:
-  - `fx_v1 / fx_v2 = 1.0463717534`
-  - `fy_v1 / fy_v2 = 1.0463716675`
-  - 两者几乎完全一致
-- 因此当前最合理的工程化做法是:
-  - 提供显式 `v2 focal correction` 开关
-  - 而不是先改 path
-
-### 后续讨论入口
-
-- 等 `diffusion_output_generated_v2_focalfix` 有首批产物后
-- 优先先看:
-  - “仅改 focal”能否已经把空间感拉回
-- 只有这条还不够时
-- 再讨论 `movement_distance` 补偿或固定轨迹 A/B
-
-## 2026-03-08 13:12 UTC 主题: focal correction 的视觉收益会被随机轨迹幅度直接抵消
-
-### 发现来源
-
-- 用户反馈:
-  - `v2 focal fix` 看起来变化不大
-- 随后对比了现有第 `0` 条轨迹的:
-  - `v2_orig`
-  - `v2_focalfix`
-  - `v1`
+- 本轮重新读取了:
+  - `outputs/refine_v2/full_view_sr_stage3sr_phaseC_hr32_lr0p5_sub8_iter32_20260310/diagnostics.json`
+  - `outputs/refine_v2/full_view_sr_stage3sr_phaseA_rho_sub8_iter20_20260310/diagnostics.json`
+- 并同步更新了 `docs/cmd.md` 与长期计划文档
 
 ### 核心问题
-
-- 只看内参是否拉回, 还不够
-- 如果同一轮的 `movement_distance` 变小了
-- 那么更大的焦距带来的视差增强, 会被更短的路径直接抵消
-
-### 为什么重要
-
-- 这说明:
-  - `focal correction` 和 `trajectory amplitude`
-  - 不是两个可以分开主观评估的独立变量
-- 一旦 `multi_trajectory` 仍在随机采样轨迹强度
-- 视觉 A/B 就会持续被污染
-
-### 当前结论
-
-- 已验证:
-  - `v2_focalfix` 的内参已几乎等于 `v1`
-  - 但它的 `path_len` 更短
-  - 所以 `path * fx` 几乎没变
-- 因而:
-  - “变化不大”目前更像随机轨迹抵消
-  - 不是 focal correction 无效
-
-### 后续讨论入口
-
-- 若要干净验证 `focal correction`:
-  - 必须固定:
-    - `trajectory`
-    - `movement_distance`
-  - 最好先禁用 `multi_trajectory`
-
-## 2026-03-08 13:35 UTC 主题: 放大 movement 但保持固定 `center_depth=1.0` 会把转轴视觉上推到前方
-
-### 发现来源
-
-- 用户对 `v2_move2` 的直接反馈:
-  - “相机的转轴很靠前”
-- 随后回读:
-  - `camera_utils.py`
-  - `gen3c_single_image_sdg.py`
-  并对照 `v1 / v2_move2` 的 pose 数值
-
-### 核心问题
-
-- 当前轨迹生成不是围绕“场景真实中心”旋转
-- 而是围绕一个固定的虚拟盯视点:
-  - `[0, 0, center_depth]`
-- 在当前脚本里:
-  - `center_depth` 被硬编码成 `1.0`
+- 很多 backlog 会在主线已经拿到关键胜利后, 还停留在旧问题上。
+- 现在的真实状态已经不是:
+  - `Phase C` 能不能成立
+  - `Phase D` 有没有 HR 导出
+- 而是:
+  - native `residual_mean` 这最后一点差距, 到底还能不能只靠当前 appearance objective 压过去
 
 ### 为什么重要
-
-- 这意味着:
-  - 一旦只把 `movement_distance` 往上加
-  - 而不同时调整 `center_depth`
-  - 运动会越来越像“绕近处点甩头”
-- 用户感受到的“转轴靠前”
-  - 很可能就是这个固定旋转中心带来的
+- 如果 backlog 不换挡, GPU 预算就会继续浪费在已经回答过的问题上。
+- 这会直接推迟真正值得验证的 frontier:
+  - `lambda_lr_consistency≈0.5` 的近邻 trade-off
+  - 或 `Phase E` 的有限 geometry 自由度
 
 ### 当前结论
-
-- 已验证:
-  - `v2_move2` 的 `path_len` 已达到 `1.80x v1`
-  - 但旋转中心深度仍固定 `1.0`
-- 因而:
-  - `move2` 更像在放大“绕近点转”的程度
-  - 而不是单纯把原来 `v1` 的路径等比例放大
+- `Phase C hr32 lr0.5 sub8 iter32` 已经在 native `psnr` 上超过 `Phase A iter20`。
+- `Phase D` 也已经完成真实 HR 导出验证。
+- 当前最合理的主线问题, 是 native `residual_mean` 能否也一起超过 `Phase A`, 而不是回到旧 objective 继续打转。
 
 ### 后续讨论入口
-
-- 如果下一步要让轨迹更自然:
-  - 不是继续无脑加 `movement_distance`
-  - 而是考虑让 `center_depth` 也可调
-  - 或者直接从 MoGe 深度统计里估计一个更合理的 rotation center depth
-
-## 2026-03-08 14:46 UTC 主题: 固定 `center_depth=1.0` 在 `v2` 尺度下过于靠前
-
-### 发现来源
-
-- 用户指出:
-  - 原始 `v2` 版本也觉得转轴靠前
-- 随后直接对 `00172.png` 运行了:
-  - `MoGe v1`
-  - `MoGe v2`
-  的深度推理
-
-### 核心问题
-
-- 我们之前已经知道:
-  - 轨迹代码固定看向 `z=1.0`
-- 这次新的关键证据是:
-  - `v2` 的场景深度整体比 `v1` 远很多
-
-### 为什么重要
-
-- 这意味着:
-  - 同一个 `center_depth=1.0`
-  - 在 `v1` 和 `v2` 里并不代表“同样相对位置”的旋转中心
-- 所以即使 path 差不多
-- `v2` 也会天然更像在围着前景点转
-
-### 当前结论
-
-- 已验证:
-  - `v1 center_median ≈ 3.16`
-  - `v2 center_median ≈ 13.60`
-  - 固定 `center_depth=1.0` 在 `v2` 中相对场景明显过近
-- 因而:
-  - 原始 `v2` 的“转轴靠前”是结构性问题
-  - `move2` 只是把它继续放大
-
-### 后续讨论入口
-
-- 如果要真正修:
-  - 优先做 `center_depth` 可调
-  - 更进一步则用 MoGe 深度统计自动估计 rotation center depth
-
-## 2026-03-08 13:13 UTC 主题: `Stage 2A` 不是几何修复阶段, baseline 空间厚化要先回到初始化链路看
-
-### 发现来源
-- 用户追问 `sample.py` 导出的 baseline 高斯是否真的考虑了 depth / point cloud / `VIPE`.
-- 本轮顺着 `sample.py -> model_latent_recon -> refinement_v2` 调用链做了静态与最小动态验证.
-
-### 核心问题
-- 很容易把“训练时模型见过 depth loss”误解成“当前这次 baseline 重建会实时吃当前场景 depth”.
-- 也容易把 `Stage 2A` 当成一个会自动修正空间几何的阶段.
-- 这两个理解在当前仓库里都不成立.
-
-### 为什么重要
-- 这决定了后续排查空间拉丝/厚表面/沿视线方向拉长时,第一落点应该在哪里.
-- 如果一开始就把问题归到 `Stage 2A`, 很容易在错误阶段上反复调 appearance loss, 但几何不会真正变好.
-
-### 未来风险
-- 如果团队后面继续把 `Stage 2A` 的视觉提升等同于几何提升, 会在评估时混淆:
-  - baseline 初始化误差
-  - observation 稀疏带来的深度歧义
-  - appearance cleanup 带来的“看起来更干净”
-- 这样会导致参数调优方向跑偏, 花很多算力但仍解决不了空间厚化.
-
-### 当前结论
-- 当前已知事实:
-  1. `sample.py` 用户这条命令运行时 `use_depth = false`
-  2. baseline 高斯中心来自网络预测的沿 ray 深度回投
-  3. `Stage 2A` 冻结 `means` / `rotations`
-  4. `VIPE` 不在 static baseline 路线里
-- 仍未确认的部分:
-  - 具体某个场景里的拉丝主要占比是 baseline 初始化误差, 还是 observation 不足, 还需要对真实 `.ply` 和多角度 render 做专门验证
-
-### 后续讨论入口
-- 如果下一轮要真的解决这类空间错误, 优先看:
-  - `sample.py`
-  - `src/models/recon/model_latent_recon.py`
-  - `src/refinement_v2/gaussian_adapter.py`
-  - `src/refinement_v2/runner.py` 的 `stage2b`
-
-## 2026-03-08 13:29 UTC 主题: 不要把 demo 生成链路里的 `MoGe` 使用自动等同于官方训练 depth 的来源
-
-### 发现来源
-- 用户追问训练数据里的 depth 是否离线由 `MoGe` 生成.
-- 本轮沿 `dataset registry -> Radym dataloader -> README training section -> SDG generator` 做了完整追踪.
-
-### 核心问题
-- 仓库里同时存在两类事实:
-  1. 单图 / SDG 推理链路明确会调用 `MoGe`
-  2. 训练 dataloader 明确会读取现成 `depth/*.zip`
-- 但这两件事之间没有在仓库中被正式连成“训练 depth = MoGe 输出”.
-
-### 为什么重要
-- 这类口径如果说快了, 很容易把“强相关”讲成“已确认因果”.
-- 后续一旦有人根据这句话做复现实验或替换 depth 生成器, 就会踩到证据断层.
-
-### 未来风险
-- 如果不把这条边界记下来:
-  - 团队后续会继续把官方训练集 depth 的 provenance 说得过满
-  - 也会把 demo `generated` 目录没有 depth 的现象误读成“训练其实不用 depth”
-
-### 当前结论
-- 当前已知事实:
-  1. dataloader 读取 `depth/*.zip`
-  2. static SDG 脚本用 `MoGe` 估初始深度/内参
-  3. static SDG 默认不落盘训练 supervision depth
-- 当前未知事实:
-  - 官方 ModelScope 训练集里的 depth 是否由 `MoGe`、`Depth Anything` 或别的内部流程生成
-
-### 后续讨论入口
-- 如果下次还要继续追 provenance,优先看:
-  - ModelScope 数据集页面 / 配套文档
-  - 论文 supplementary / data generation section
-  - 仓库外的数据准备脚本(若后续补到仓库)
-
-## 2026-03-09 03:19 UTC 主题: 相机参数的新默认值, 不应静默改坏旧轨迹语义
-
-### 发现来源
-- 用户要求把 `--translation_reference_depth_scale 0.35` 直接改成默认值.
-- 代码核对发现: 如果机械把默认从 `None` 改成 `0.35`, 会把所有未开启 `auto_center_depth` 的单图轨迹一起改掉.
-
-### 核心问题
-- 相机类参数的“默认值”不只是 CLI 文案.
-- 它会直接改变历史命令在未显式传参时的运动语义.
-
-### 为什么重要
-- 这类回归很隐蔽.
-- 表面上只是“优化了默认参数”, 实际上会把旧命令的相机行为整体漂移.
-
-### 当前结论
-- 对这类新默认值, 更稳的做法是:
-  1. 只在目标工作流中启用新默认
-  2. 保留显式旧参数的覆盖能力
-  3. 用测试锁死优先级
-
-### 后续讨论入口
-- 下次再改单图 / SDG 相机默认参数时, 先看:
-  - `cosmos_predict1/diffusion/inference/inference_utils.py`
-  - `cosmos_predict1/diffusion/inference/gen3c_single_image.py`
-  - `tests/test_camera_trajectory_center_depth.py`
-
-## [2026-03-09 04:20:00 UTC] 主题: baseline_render depth anchor 的本质是 anti-drift,不是 geometry correction
-
-### 发现来源
-- 本轮重新评估 OpenSpec change `add-refinement-v2-depth-anchor`
-- 对照了 `refinement_v2` 的 stage freeze 语义、renderer depth 输出和现有测试
-
-### 核心问题
-- 很容易把“给 refinement_v2 补一个 depth loss”直觉化地理解成“可以修几何”。
-- 但当前 V1 方案的 reference 来自 baseline render 自身,不是 GT / external depth。
-
-### 为什么重要
-- 这会直接影响项目对该 change 的收益预期。
-- 如果口径说成“能修 baseline 厚表面”,实现后很容易被误判为效果不达标。
-
-### 未来风险
-- 若忽略这条边界:
-  - 会把 self-anchor 错当成 geometry correction
-  - 会在 baseline 已经错误时,反而把错误一起锚住
-  - 会低估它与 `loss_opacity_sparse`、pruning、低 alpha expected depth 数值稳定性的耦合
-
-### 当前结论
-- 当前已知事实:
-  1. `Stage 2A / Stage 3SR` 不动 `means/rotations`,只动 `opacity/scales/colors`
-  2. renderer depth 来自 `gsplat` 的 `RGB+ED` expected depth
-  3. `Phase 0 / Phase 1` 已存在可复用的 baseline evaluation render 路径
-- 更准确的定位:
-  - baseline_render depth anchor 适合作为 anti-drift loss
-  - 不适合作为几何纠偏能力来承诺
-
-### 后续讨论入口
-- 下次若决定继续推进,优先先讨论:
-  1. V1 是否先只落在 `Stage 3SR`
-  2. valid mask 是否只看 reference alpha,还是叠加一个极小的 pred alpha 数值稳定裁剪
-  3. baseline reference 是挂在 `Phase 0` 还是 `Phase 1`
+- 下一轮优先看:
+  - `docs/cmd.md` 中的 `6E`
+  - `docs/plans/2026-03-06-long-lrm-style-post-refinement.md` 的 `Current Continuation Order`
+  - 新一轮 `lambda_lr_consistency≈0.5` 近邻 sweep 的真实结果

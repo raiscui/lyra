@@ -140,6 +140,41 @@ refinement 的输入核心是:
   - 再算 `gaussian_fidelity_score`
   - 再做 selective SR patch supervision
 
+### 误区 5: `--stop-after stage2a` 就一定意味着 `phase_reached = stage2a`
+
+也不是。
+
+这里要区分两个概念:
+
+- `stop_after`
+  - 你要求脚本停在哪个"对外主线阶段边界"
+- `phase_reached`
+  - 这次运行最后实际完成到哪个"内部阶段"
+
+在当前实现里:
+
+- `stage2a` 是对外主线阶段
+- 但在 `enhanced` 模式下,它内部可能继续走:
+  - `Stage 3A`
+  - `Phase 3S`
+  - `Stage 3SR`
+
+所以:
+
+- `--stop-after stage2a`
+  - 仍然是正确写法
+- 如果你跑的是:
+  - `--stage2a-mode legacy`
+  - 或者根本没进入 patch supervision
+  - 常见结果是 `phase_reached = stage2a`
+- 如果你跑的是:
+  - `--stage2a-mode enhanced`
+  - 并且 patch supervision 参数齐全
+  - 常见结果会变成 `phase_reached = stage3sr`
+
+这不是脚本跑错了。
+而是因为它已经在 `stage2a` 这个对外阶段内部,把增强子阶段也走完了。
+
 ---
 
 ## 5. 你至少要跑哪几步
@@ -286,6 +321,25 @@ PYTHONPATH="$(pwd)" python3 scripts/refine_robust_v2.py \
 
 所以当前更稳妥的做法不是继续硬顶 observation 密度,而是先把 `48 observations` 这档 full-view native / SR 流程固定成主基线.
 
+当前正式推荐顺序是:
+
+1. 先固定 full-view native smoke
+   - 这是当前 48G 主机上的正式起点
+   - 预期成功信号:
+     - `phase_reached = stage2a`
+2. 如果你要比较 external SR, 再跑 full-view SR smoke
+   - 保持同样的 `target_subsample=16`
+   - 预期成功信号:
+     - `phase_reached = stage3sr`
+3. 先把 native / SR 这两条 smoke 的诊断结果看清楚
+4. 只有在这两条都稳定后, 才继续更长 smoke 或 `Stage 2B`
+
+当前不推荐:
+
+- 在 48G 主机上直接把 observation 提到 `96`
+- 还没固定 full-view native baseline, 就先把 SR 结果当正式主线
+- 还没看清 `stage2a` 内部 enhanced 链路, 就直接把 `Stage 2B` 混进 full-view baseline
+
 如果你要先补齐 all-view `FlashVSR-Pro` reference, 可以直接跑:
 
 ```bash
@@ -312,11 +366,11 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
   --pose-root assets/demo/static/diffusion_output_generated \
   --intrinsics-root assets/demo/static/diffusion_output_generated \
   --rgb-root assets/demo/static/diffusion_output_generated \
-  --target-subsample 16 \
+  --target-subsample 8 \
   --iters-stage2a 2 \
   --save-every 1 \
   --stop-after stage2a \
-  --outdir outputs/refine_v2/full_view_native_stage2a_smoke_sub16
+  --outdir outputs/refine_v2/full_view_native_stage2a_smoke_sub8
 ```
 
 full-view SR smoke:
@@ -333,7 +387,7 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
   --reference-root outputs/flashvsr_reference/full_scale2x \
   --reference-mode super_resolved \
   --sr-scale 2.0 \
-  --target-subsample 16 \
+  --target-subsample 8 \
   --stage2a-mode enhanced \
   --patch-size 256 \
   --lambda-patch-rgb 0.25 \
@@ -342,7 +396,7 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
   --iters-stage2a 1 \
   --save-every 1 \
   --stop-after stage2a \
-  --outdir outputs/refine_v2/full_view_sr_stage3sr_smoke_sub16
+  --outdir outputs/refine_v2/full_view_sr_stage3sr_smoke_sub8
 ```
 
 这两条命令都已经做过真实验证:
@@ -354,8 +408,17 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
 - full-view SR:
   - `phase_reached = stage3sr`
   - `psnr = 19.4572 -> 20.3172`
-  - `residual_mean = 0.063859 -> 0.055581`
+ - `residual_mean = 0.063859 -> 0.055581`
   - `sr_selection_mean = 0.127218`
+
+如果你只是想记住一条最短规则, 当前 full-view baseline 应该这样理解:
+
+- native smoke
+  - 是正式 baseline 起点
+- SR smoke
+  - 是同 observation 预算下的增强分支
+- `Stage 2B`
+  - 不是 full-view baseline 的第一步
 
 ---
 
@@ -381,16 +444,19 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
 
 但如果你开始看输出目录和 metrics, 现在最好按下面这个映射理解:
 
-| 对外主线阶段 | 内部子阶段 | 作用 | 常见产物 |
-| --- | --- | --- | --- |
-| `Stage 2A` | `Stage 3A` | native cleanup | `metrics_stage2a.json`, `gaussians_stage2a.ply` |
-| `Stage 2A` | `Phase 3S` | fidelity / SR selection 诊断 | `metrics_phase3s.json`, `gaussian_fidelity_histogram.json`, `sr_selection_maps/` |
-| `Stage 2A` | `Stage 3SR` | selective SR patch supervision | `metrics_stage3sr.json`, `gaussians_stage3sr.ply` |
+| 对外主线阶段 | 内部子阶段 | 作用 | 常见产物 | 常见 `phase_reached` |
+| --- | --- | --- | --- | --- |
+| `Stage 2A` | `Stage 3A` | native cleanup | `metrics_stage2a.json`, `gaussians_stage2a.ply` | `stage2a` |
+| `Stage 2A` | `Phase 3S` | fidelity / SR selection 诊断 | `metrics_phase3s.json`, `gaussian_fidelity_histogram.json`, `sr_selection_maps/` | `phase3s` |
+| `Stage 2A` | `Stage 3SR` | selective SR patch supervision | `metrics_stage3sr.json`, `gaussians_stage3sr.ply` | `stage3sr` |
 
 最重要的一点是:
 
 - 这 3 个内部名字不是新的程序入口
 - 它们只是当前 `stage2a` 主线被拆开的可观测子阶段
+- `metrics_stage2a.json` 这个文件名保留的是对外阶段名
+  - 它记录的是 `Stage 2A` 这条主线里的 native cleanup 结果
+  - 不是说现在又多了一份独立的 `metrics_stage3a.json`
 
 如果你现在就是想显式对比“以前的 `Stage 2A`”和“现在的 `Stage 2A`”, 当前 CLI 也已经支持直接写死模式:
 
@@ -403,6 +469,29 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
 - `--stage2a-mode enhanced`
   - 强制跑 `Stage 3A -> Phase 3S -> Stage 3SR`
   - 如果没给 patch supervision 所需参数,会直接报错,避免误跑成半套增强
+
+### 6.2 怎么看 `diagnostics.json` 里的 `phase_reached`
+
+最简单的判断规则是:
+
+- 它记录的是"最后真正完成到哪一步"
+- 不是"你最初在命令行里写的外部 stop 名字"
+
+所以常见组合会是:
+
+- `--stop-after stage2a` + `legacy`
+  - `phase_reached = stage2a`
+- `--stop-after stage2a` + `enhanced`
+  - `phase_reached = stage3sr`
+- `--start-stage stage2b`
+  - 成功结束后 `phase_reached = stage2b`
+
+如果你是第一次排查结果,推荐先看:
+
+1. `diagnostics.json`
+2. `metrics_stage2a.json`
+3. 如果有 enhanced 链路,再看 `metrics_phase3s.json`
+4. 最后看 `metrics_stage3sr.json`
 
 ---
 
@@ -837,6 +926,19 @@ outdir/
   - 有没有真的进入 `Stage 2B`
   - 有没有继续进入 `Phase 3 / Phase 4`
 
+更准确地说,常见产物和出现条件可以这样记:
+
+| 文件 / 目录 | 什么时候出现 | 该怎么看 |
+| --- | --- | --- |
+| `diagnostics.json` | 几乎所有正常 run 都会落盘 | 先看 `phase_reached`、warnings、mode 决议 |
+| `metrics_stage2a.json` | 只要真正跑了 `Stage 2A` | 对应对外 `Stage 2A` 的 native cleanup 段 |
+| `metrics_phase3s.json` | 进入 enhanced 链路且跑到 `Phase 3S` | 看 fidelity / SR selection 是否真的生成 |
+| `metrics_stage3sr.json` | enhanced 链路跑到 `Stage 3SR` | 看 selective SR patch supervision 的主指标 |
+| `gaussians/gaussians_stage2a.ply` | 跑过 `Stage 2A` native cleanup | 可作为后续 `Stage 2B` warm start 起点之一 |
+| `gaussians/gaussians_stage3sr.ply` | 跑过 `Stage 3SR` | enhanced 路线常用的 SR 后产物 |
+| `gaussians/gaussians_stage2b.ply` | 进入 `Stage 2B` | geometry-limited 续跑后的结果 |
+| `videos/final_render.mp4` | 正常结束时通常都会有 | 这是当前 run 的最终可视化, 不一定等于 HR 输出 |
+
 你最常会关心的是:
 
 - `gaussians/gaussians_stage2a.ply`
@@ -874,6 +976,8 @@ outdir/
 2. 用 `--scene-stem + --view-ids + --pose-root + --intrinsics-root + --rgb-root` 组装 full-view `SceneBundle`
 3. 如果要接入超分, 先为所有 view 生成 `reference-root`
 4. 当前 48G 主机先固定 `--target-subsample 16`
+5. 先跑 native smoke, 再跑同预算下的 SR smoke
+6. 不要在 baseline 还没固定前直接混入 `Stage 2B`
 
 ### 路线 4: 继续增量细化
 
@@ -943,11 +1047,11 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
   --pose-root assets/demo/static/diffusion_output_generated \
   --intrinsics-root assets/demo/static/diffusion_output_generated \
   --rgb-root assets/demo/static/diffusion_output_generated \
-  --target-subsample 16 \
+  --target-subsample 8 \
   --iters-stage2a 2 \
   --save-every 1 \
   --stop-after stage2a \
-  --outdir outputs/refine_v2/full_view_native_stage2a_smoke_sub16
+  --outdir outputs/refine_v2/full_view_native_stage2a_smoke_sub8
 ```
 
 如果你还要比较 external SR, 再补:
@@ -964,7 +1068,7 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
   --reference-root outputs/flashvsr_reference/full_scale2x \
   --reference-mode super_resolved \
   --sr-scale 2.0 \
-  --target-subsample 16 \
+  --target-subsample 8 \
   --stage2a-mode enhanced \
   --patch-size 256 \
   --lambda-patch-rgb 0.25 \
@@ -973,8 +1077,18 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
   --iters-stage2a 1 \
   --save-every 1 \
   --stop-after stage2a \
-  --outdir outputs/refine_v2/full_view_sr_stage3sr_smoke_sub16
+  --outdir outputs/refine_v2/full_view_sr_stage3sr_smoke_sub8
 ```
+
+这两条命令在当前文档里的职责要这样理解:
+
+- 第一条 native smoke
+  - 是 full-view baseline 的正式起点
+- 第二条 SR smoke
+  - 是同 observation 预算下的增强对照
+- 两条都稳定后
+  - 才值得继续更长 smoke
+  - 或进一步讨论 `Stage 2B`
 
 ---
 

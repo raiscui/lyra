@@ -24,6 +24,15 @@ class LossSummary:
     loss_pose_smooth: torch.Tensor | None = None
 
 
+@dataclass
+class DepthAnchorLossSummary:
+    """承载 depth anchor 的单次计算结果."""
+
+    loss: torch.Tensor
+    valid_ratio: float
+    skip_reason: str | None = None
+
+
 def _canonicalize_screen_radii(radii: torch.Tensor | None) -> torch.Tensor | None:
     """把投影半径统一压成可供损失项消费的标量半径.
 
@@ -60,6 +69,45 @@ def compute_weighted_rgb_loss(
     return weighted.mean()
 
 
+def downsample_rgb_tensor(
+    rgb_tensor: torch.Tensor,
+    output_hw: tuple[int, int],
+    *,
+    mode: str = "bilinear",
+    antialias: bool = True,
+) -> torch.Tensor:
+    """把 `[B, V, C, H, W]` RGB tensor 可微地下采样到目标分辨率.
+
+    这里默认使用 `bilinear + align_corners=False + antialias=True`.
+    这和 PyTorch 官方文档推荐的 downsampling 语义一致, 更接近常见图像库的结果.
+    """
+
+    if rgb_tensor.ndim != 5:
+        raise ValueError(f"Expected rgb_tensor with shape [B, V, C, H, W], got {tuple(rgb_tensor.shape)}.")
+
+    target_height, target_width = int(output_hw[0]), int(output_hw[1])
+    if min(target_height, target_width) <= 0:
+        raise ValueError(f"output_hw must be positive, got {output_hw}.")
+
+    batch_size, num_views, num_channels, height, width = rgb_tensor.shape
+    if (height, width) == (target_height, target_width):
+        return rgb_tensor
+
+    resize_kwargs: dict[str, object] = {}
+    if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
+        resize_kwargs["align_corners"] = False
+    if mode in {"bilinear", "bicubic"}:
+        resize_kwargs["antialias"] = antialias and (target_height < height or target_width < width)
+
+    resized = F.interpolate(
+        rgb_tensor.reshape(batch_size * num_views, num_channels, height, width),
+        size=(target_height, target_width),
+        mode=mode,
+        **resize_kwargs,
+    )
+    return resized.reshape(batch_size, num_views, num_channels, target_height, target_width)
+
+
 def compute_scale_tail_loss(scales: torch.Tensor, threshold: float = 0.25) -> torch.Tensor:
     """惩罚过大的高斯尺度尾部."""
 
@@ -71,6 +119,81 @@ def compute_opacity_sparse_loss(opacity: torch.Tensor) -> torch.Tensor:
     """轻微压制整体透明度均值,减少雾状叠层."""
 
     return opacity.mean()
+
+
+def _flatten_depth_tensor(depth: torch.Tensor) -> torch.Tensor:
+    """把 `[B, V, 1, H, W]` depth/mask 压平成 `[B, V, H*W]`."""
+
+    if depth.ndim != 5 or depth.shape[2] != 1:
+        raise ValueError(f"Expected depth tensor with shape [B, V, 1, H, W], got {tuple(depth.shape)}.")
+    return depth.reshape(depth.shape[0], depth.shape[1], -1)
+
+
+def build_depth_anchor_valid_mask(
+    reference_depth: torch.Tensor,
+    reference_alpha: torch.Tensor | None = None,
+    *,
+    alpha_threshold: float = 0.0,
+) -> torch.Tensor:
+    """构造 depth anchor 的有效像素掩码.
+
+    规则保持保守:
+    1. 参考深度必须大于 0 且是有限值
+    2. 如果 renderer 同时给了 alpha,再叠加一次可见性阈值
+    """
+
+    if reference_alpha is not None and reference_alpha.shape != reference_depth.shape:
+        raise ValueError("reference_alpha must have the same shape as reference_depth.")
+
+    valid_mask = (reference_depth > 0) & torch.isfinite(reference_depth)
+    if reference_alpha is not None:
+        valid_mask = valid_mask & torch.isfinite(reference_alpha) & (reference_alpha > alpha_threshold)
+    return valid_mask
+
+
+def normalize_depth(depth: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    """按训练期同语义做尺度不变 depth 归一化."""
+
+    depth_flat = _flatten_depth_tensor(depth)
+    valid_mask_flat = _flatten_depth_tensor(valid_mask.to(dtype=depth.dtype))
+
+    # 这里故意保持和训练期一致的“先乘 mask 再求 median”的语义.
+    # 这样 refinement 与训练侧的尺度不变 depth 监督口径不会漂移.
+    valid_count = valid_mask_flat.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    depth_valid = depth_flat * valid_mask_flat
+    depth_median = torch.median(depth_valid, dim=-1, keepdim=True).values
+    depth_centered = (depth_valid - depth_median) * valid_mask_flat
+    depth_var = depth_centered.abs().sum(dim=-1, keepdim=True) / valid_count
+    depth_var = depth_var.clamp(min=1e-3, max=1e3)
+    return depth_centered / depth_var
+
+
+def compute_depth_anchor_loss(
+    pred_depth: torch.Tensor,
+    reference_depth: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> DepthAnchorLossSummary:
+    """计算 refinement_v2 使用的 depth anchor loss."""
+
+    zero_loss = pred_depth.new_zeros(())
+    if pred_depth.shape != reference_depth.shape:
+        return DepthAnchorLossSummary(loss=zero_loss, valid_ratio=0.0, skip_reason="shape_mismatch")
+    if valid_mask.shape != reference_depth.shape:
+        return DepthAnchorLossSummary(loss=zero_loss, valid_ratio=0.0, skip_reason="mask_shape_mismatch")
+
+    effective_mask = valid_mask.bool() & torch.isfinite(pred_depth) & torch.isfinite(reference_depth)
+    valid_ratio = float(effective_mask.float().mean().item())
+    if valid_ratio <= 0.0:
+        return DepthAnchorLossSummary(loss=zero_loss, valid_ratio=0.0, skip_reason="empty_valid_mask")
+
+    pred_depth_norm = normalize_depth(pred_depth, effective_mask)
+    reference_depth_norm = normalize_depth(reference_depth, effective_mask)
+    valid_mask_flat = _flatten_depth_tensor(effective_mask.to(dtype=pred_depth.dtype))
+    loss_depth = F.smooth_l1_loss(
+        pred_depth_norm * valid_mask_flat,
+        reference_depth_norm * valid_mask_flat,
+    )
+    return DepthAnchorLossSummary(loss=loss_depth, valid_ratio=valid_ratio)
 
 
 def compute_sampling_smooth_loss(

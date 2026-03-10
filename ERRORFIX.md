@@ -1,278 +1,185 @@
 # ERRORFIX
 
-## 2026-03-04 00:00 UTC: `scripts/test_environment.py` 报 `megatron.core` 导入失败
+## [2026-03-10 03:30:00 UTC] 问题: 续档六文件时 Markdown 中的反引号导致 shell 写入内容被截断
 
-### 问题
-
-执行 `scripts/test_environment.py` 时出现:
-
-- `[ERROR] Package not successfully imported: megatron.core`
-
-### 根因
-
-- 环境里安装了 `transformer_engine` / `transformer_engine_cu12`,但缺少 `transformer_engine_torch`(PyTorch 扩展 `.so`).
-- 导致 `import transformer_engine.pytorch` 在加载 `.so` 文件时抛 `StopIteration`.
-- Megatron Core 在探测 TE 的 `Float8Tensor` 时只捕获 `ImportError/ModuleNotFoundError`,没有捕获 `StopIteration`.
-- 结果: `StopIteration` 泄漏,`import megatron.core` 直接失败.
-
-### 修复
-
-- 补齐 TE 的 PyTorch 扩展:
-  - 安装/编译 `transformer_engine_torch==1.12.0`,并确保与 `transformer_engine==1.12.0` / `transformer_engine_cu12==1.12.0` 版本一致.
-
-### 验证
-
-- 验证命令:
-  - `CUDA_HOME=/usr/local/cuda PYTHONPATH="$(pwd)" .pixi/envs/default/bin/python scripts/test_environment.py`
-- 预期结果:
-  - 全部关键包导入成功,并输出 "Cosmos environment setup is successful!".
-
-## 2026-03-04 08:45 UTC: `download_gen3c_checkpoints.py` 因缺少 `huggingface_hub` 直接崩溃
-
-### 问题
-
-在某些 Python 环境中(例如仅安装了 ModelScope 相关依赖),执行:
-
-`CUDA_HOME="$CONDA_PREFIX" PYTHONPATH="$(pwd)" python scripts/download_gen3c_checkpoints.py --checkpoint_dir checkpoints`
-
-会在启动阶段直接报错:
-
-- `ModuleNotFoundError: No module named 'huggingface_hub'`
+### 现象
+- 续档命令已经成功完成了文件重命名和归档。
+- 但新生成的 `task_plan.md`、`notes.md` 中, 含反引号的段落出现了内容丢失。
+- 终端同时出现了 `command not found`、`Is a directory` 等与 Markdown 文本本身无关的报错。
 
 ### 根因
-
-- `scripts/download_gen3c_checkpoints.py` 以及相关下载脚本,在顶层 import 了 `huggingface_hub`.
-- 即使用户的目标只是从 ModelScope 下载 GEN3C 与 T5,也会在 import 阶段被强制要求安装 `huggingface_hub`.
-- 另外,`scripts/download_tokenizer_checkpoints.py` 也会在顶层 import guardrail 下载模块,导致相同的传递依赖问题.
+- 外层命令使用了 `bash -lc '... '` 这一类单引号整体包裹脚本的写法。
+- 脚本内部的 Markdown 正文又包含了单引号和反引号。
+- 结果导致 shell 提前结束字符串, 后续文本被当作命令片段执行。
 
 ### 修复
-
-- 把 Hugging Face 相关依赖改为"按需导入":
-  - 仅在确实需要从 Hugging Face 下载权重时(例如 Pixtral 转换,或 guardrail 的 Llama-Guard),才惰性导入 `huggingface_hub`.
-- 移除无用的顶层 import:
-  - `download_gen3c_checkpoints.py` / `download_lyra_checkpoints.py` 不再顶层 import guardrail 下载逻辑.
-- 对于 tokenizer 下载脚本:
-  - 只有在 `--download_guardrail` 打开时才 import guardrail 下载模块.
+- 不再用单引号整体包裹长段 Markdown 写入脚本。
+- 改用 `python3` 直接重写六文件内容, 避免 shell 对正文做额外解释。
+- 重新检查新文件内容, 确认反引号与路径均完整保留。
 
 ### 验证
+- 重新查看 `task_plan.md` 与 `notes.md`, 反引号路径和文件名已经完整存在。
+- 新文件不再出现被截断的 `archive/`、`/root`、`/workspace` 等字段。
 
-- 在不预装 `huggingface_hub` 的前提下,脚本应能至少正常启动并打印帮助信息:
-  - `PYTHONPATH="$(pwd)" python scripts/download_gen3c_checkpoints.py --help`
-  - `PYTHONPATH="$(pwd)" python scripts/download_tokenizer_checkpoints.py --help`
+## [2026-03-10 06:10:00 UTC] 问题: fidelity 超参数写在 `WeightBuilder` 里, 但 CLI 和 runner 实际没有接通
 
-## 2026-03-04 10:44 UTC: 推理加载了错误的 T5 模型目录(需要还原为 Hugging Face `google-t5/t5-11b`)
-
-### 问题
-
-运行:
-
-`torchrun ... cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py --checkpoint_dir checkpoints ...`
-
-会在加载 T5 prompt encoder 时崩溃,典型报错为:
-
-- `OSError: Error no file named pytorch_model.bin, model.safetensors ... found in directory checkpoints/mindnlp/t5-11b.`
+### 现象
+- `WeightBuilder` 已有 `fidelity_ratio_threshold`、`fidelity_sigmoid_k`、`fidelity_min_views`、`fidelity_opacity_threshold`。
+- 但之前从 CLI 无法设置这些值。
+- 即使外部以为自己在做 `Phase A` calibration, 实际运行时仍然一直吃默认值。
 
 ### 根因
-
-- `mindnlp/t5-11b` 与 Hugging Face 的 `google-t5/t5-11b` 不是同一个东西.
-- 当前落盘的 `checkpoints/mindnlp/t5-11b` 目录也不是 `transformers` 的 HF 目录结构,因此无法被 `T5EncoderModel.from_pretrained(<local_dir>)` 直接加载.
-- 如果继续做"自动回退",非常容易在无感知的情况下用错模型,导致效果不可控.
+- `src/refinement_v2/config.py` 的 `StageHyperParams` 与 CLI parser 没有对应字段。
+- `src/refinement_v2/runner.py` 初始化 `WeightBuilder(...)` 时也没有透传这些参数。
+- 导致 fidelity 参数虽然在类定义里存在, 但在主流程里始终是隐形常量。
 
 ### 修复
-
-- 运行时固定从本地目录加载 Hugging Face 的 T5 prompt encoder:
-  - 默认路径: `/model/HuggingFace/google-t5/t5-11b`.
-- 当目录不存在或不完整时:
-  - 直接抛出明确的 RuntimeError,提示用户从 Hugging Face 准备该目录.
-  - 不再尝试回退到其它模型目录或在线下载.
-- 同步修改:
-  - `scripts/download_gen3c_checkpoints.py` 不再下载任何 T5 权重.
-  - `INSTALL.md` 更新为"需要用户自行准备 HF 的 `google-t5/t5-11b`".
+- 在 `StageHyperParams` 中补齐 4 个 fidelity 字段。
+- 在 CLI 中新增对应参数。
+- 在 `RefinementRunner` 初始化 `WeightBuilder(...)` 时完整透传。
+- 补测试覆盖:
+  - CLI 默认值与显式映射
+  - runner 初始化后的真实注入值
 
 ### 验证
+- 定向回归:
+  - `58 passed`
+- 真实 calibration:
+  - `outputs/refine_v2/full_view_sr_stage3sr_phaseA_rho_thr1p1_sub8_iter20_20260310`
+- 动态证据证明新参数已经真实生效:
+  - 只改 `fidelity_ratio_threshold: 1.5 -> 1.1`
+  - `selection_mean` 从 `0.01574` 提升到 `0.04699`
 
-- 语法检查:
-  - `PYTHONPATH="$(pwd)" .pixi/envs/default/bin/python -m py_compile cosmos_predict1/utils/base_world_generation_pipeline.py cosmos_predict1/auxiliary/t5_text_encoder.py scripts/download_gen3c_checkpoints.py`
-- 行为验证(目录缺失时应提示):
-  - `CosmosT5TextEncoder(cache_dir="/this/path/should/not/exist")` 抛出的错误信息包含:
-    - 目标路径
-    - Hugging Face 模型名与参考页面
+## [2026-03-10 06:36:00 UTC] 问题: `bash -lc` 的提示文本里直接包含反引号, 触发命令替换报 `command not found`
 
-## 2026-03-04 13:42 UTC: 从源码安装 `flash-attn==2.6.3` 报 `cicc: not found`
-
-### 问题
-
-在 `.pixi/envs/default` 环境中执行 `pip install flash-attn==2.6.3` 时,会在 nvcc 编译阶段报错:
-
-- `sh: 1: cicc: not found`
+### 现象
+- 一条单纯用于向用户报备的 `printf` 命令输出了:
+  - `bash: line 1: Phase: command not found`
+- 业务逻辑没有受影响, 但终端确实出现了错误输出。
 
 ### 根因
+- 提示文本里直接包含了反引号包裹的 `` `Phase C` ``。
+- 外层又走了 `bash -lc printf
 
-- `flash-attn==2.6.3` 对 `torch==2.6.*` 没有对应的预编译 wheel,因此会触发源码编译.
-- Pixi/Conda 的 CUDA 工具链里 `cicc` 位于 `$CONDA_PREFIX/nvvm/bin/cicc`,但该目录默认不在 `PATH`.
 
-### 修复
+## [2026-03-10 06:37:00 UTC] 更正: 上一条关于 shell 反引号的 ERRORFIX 记录被 shell 再次截断, 现补完整版本
 
-- 在编译安装时显式注入:
-  - `PATH="$CONDA_PREFIX/nvvm/bin:$PATH"`
-  - `CUDA_HOME="$CONDA_PREFIX/targets/x86_64-linux"`
-- 然后重新安装:
-  - `python -m pip install --no-build-isolation flash-attn==2.6.3`
-
-### 验证
-
-- `python -c "import importlib.metadata as m; print(m.version('flash-attn'))"` 输出 `2.6.3`.
-- `python -c "import transformer_engine; from transformer_engine.pytorch import attention as a; print(a.flash_attn_func is None)"` 输出 `False`.
-
-## 2026-03-04 15:40 UTC: `moge-2-vitl` 加载时报 `getattr(): attribute name must be string`
-
-### 问题
-
-运行 SDG 单图推理(例如 `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py`)时,在加载 MoGe 阶段崩溃:
-
-- `TypeError: getattr(): attribute name must be string`
+### 现象
+- 上一条 ERRORFIX 追加时, 因为正文里再次出现反引号, shell heredoc 写入又被截断。
+- `ERRORFIX.md` 里留下了一条不完整记录, 结尾停在 `bash -lc printf`。
 
 ### 根因
-
-- 脚本固定使用 `moge.model.v1.MoGeModel`.
-- 但 `Ruicheng/moge-2-vitl` 的 checkpoint 属于 MoGe v2 结构,其 `model_config["encoder"]` 是 dict.
-- v1 的实现中存在 `getattr(..., encoder)` 并假设 `encoder` 为 string,因此直接触发 `TypeError`.
+- 我虽然意识到问题来自反引号命令替换, 但这次追加 ERRORFIX 时仍然用了 shell heredoc。
+- 正文继续包含反引号示例, 导致同类问题再次发生。
 
 ### 修复
-
-- 在 `cosmos_predict1/diffusion/inference/inference_utils.py` 新增 `load_moge_model(...)`:
-  - 读取 checkpoint 的 `model_config["encoder"]` 类型,自动选择 `moge.model.v1` 或 `moge.model.v2`.
-  - 同时支持:
-    - `--moge_model_id`
-    - `--moge_checkpoint_path`
-    - `--hf_local_files_only`
-- 三个入口脚本统一改为使用 `load_moge_model(...)` 加载 MoGe:
-  - `cosmos_predict1/diffusion/inference/gen3c_single_image.py`
-  - `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py`
-  - `cosmos_predict1/diffusion/inference/gen3c_persistent.py`
+- 这次改用 `python3` 直接追加文本, 不再让 shell 解释正文。
+- 正确结论如下:
+  - `bash -lc` 的提示文本里如果直接包含反引号包裹的 `Phase C`, shell 会把其中内容当成命令替换。
+  - 后续 shell 提示文本不再直接放这类反引号片段。
 
 ### 验证
+- 本次使用 `python3` 追加后, 文件内容已完整落盘。
+- 后续如需记录含反引号的长文本, 应优先继续使用 `python3` 或真正安全的单引号 heredoc。
 
-- 语法检查:
-  - `python -m py_compile cosmos_predict1/diffusion/inference/inference_utils.py cosmos_predict1/diffusion/inference/gen3c_single_image.py cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py cosmos_predict1/diffusion/inference/gen3c_persistent.py`
-- 最小加载验证:
-  - `load_moge_model(moge_model_id="Ruicheng/moge-2-vitl", hf_local_files_only=True, device=cpu)` 返回 `moge_version == "v2"`.
-  - `load_moge_model(moge_model_id="Ruicheng/moge-vitl", hf_local_files_only=True, device=cpu)` 返回 `moge_version == "v1"`.
 
-## 2026-03-06 07:28 UTC: `refinement_v2` 落地过程中的结构性修复
+## [2026-03-10 06:35:00 UTC] 问题: `Phase C` full-frame HR 路径在真实 `sub8` 上连续两层 OOM
 
-### 问题1: `Stage 2A` 第二轮开始报 `Trying to backward through the graph a second time`
+### 现象
+- 第一轮真实 smoke 会在 `gsplat.rasterization()` OOM。
+- 修正 native render 的 autograd 后, 第二轮 OOM 被推迟到 `WeightBuilder.combine_sr_weights()`。
+- 这说明之前的第一假设只解释了第一层峰值, 不能解释全部问题。
 
-#### 根因
+### 根因
+- 第一层显存峰值来自:
+  - full-frame HR 路径里 native render 其实并不参与主损失反传
+  - 但实现仍保留了它的 autograd 图
+- 第二层显存峰值来自:
+  - `_render_scene_serial_view_shards()` 只是串行渲染
+  - 后续又把所有 HR shard 重新 `torch.cat(...)` 成整块 tensor
+  - full-frame 权重图和 LR consistency 也继续按全量张量一次性构造
+- 所以旧实现本质上是“串行前向 + 整块 loss”, 不是真正的流式执行。
 
-- `WeightBuilder.build_weight_map()` 会把上一轮的 `prev_weight_map` 通过 EMA 带入下一轮.
-- 但旧实现没有 `detach`,导致 loss 权重图携带上一轮 autograd graph.
+### 修复
+- 先在 `depth anchor` 关闭时, 让 native render 走 `torch.no_grad()`。
+- 再新增 `_iter_scene_single_device_view_shards()`。
+- 把 `_run_stage3sr_full_frame_hr()` 重构成:
+  - native residual / weight 先准备
+  - HR render 按 shard 逐块前向
+  - `L_hr_rgb` / `L_lr_consistency` 按 shard 逐块 backward
+  - 指标只在 detach 到 CPU 后再汇总
 
-#### 修复
+### 验证
+- 编译验证:
+  - `python3 -m py_compile src/refinement_v2/config.py src/refinement_v2/losses.py src/refinement_v2/runner.py tests/refinement_v2/test_config.py tests/refinement_v2/test_losses.py tests/refinement_v2/test_runner_stage2a.py tests/refinement_v2/test_patch_supervision.py tests/refinement_v2/test_runner_phase0.py tests/refinement_v2/test_runner_stage2b.py tests/refinement_v2/test_depth_anchor.py`
+- 回归验证:
+  - `61 passed`
+- 真实验证:
+  - `outputs/refine_v2/full_view_sr_stage3sr_phaseC_smoke_sub8_streamshard_20260310`
+  - `phase_reached = stage3sr`
+  - `stage3sr_supervision_mode = full_frame_hr`
+  - `metrics_stage3sr.json` / `diagnostics.json` / `gaussians_stage3sr.ply` / `final_render.mp4` 均已生成
 
-- 在 `src/refinement_v2/weight_builder.py` 中:
-  - 对 `residual_map` 先 `detach`.
-  - 对 `prev_weight_map` 参与 EMA 前 `detach`.
-  - 返回的 `weight_map` 也保持 detached.
+## [2026-03-10 07:48:08 UTC] 问题: 追加 Markdown 时未加引号 heredoc 导致反引号内容被 shell 吞掉
 
-#### 验证
+### 问题
+- 在向 `task_plan.md` 追加 Markdown 时, 使用了未加引号的 heredoc.
+- 文本里包含反引号包裹的 `session_id=46472`, shell 把它当成 command substitution 处理, 结果正文被吞掉了一部分。
 
-- `PYTHONPATH="$(pwd)" pytest -q tests/refinement_v2/test_runner_stage2a.py tests/refinement_v2/test_runner_stage2b.py tests/refinement_v2/test_runner_phase3_phase4.py`
-- 通过,且后续全量 `tests/refinement_v2` 也通过.
+### 原因
+- shell 中 `cat <<EOF` 会对正文做参数展开和命令替换.
+- 只要正文里有反引号, 就有机会误触发执行或丢字.
 
-### 问题2: 真实 dataloader 构建时报 `Missing key data_mode`
+### 修复
+- 后续凡是正文里可能出现反引号的 Markdown 追加, 统一改成:
+  - `cat <<'EOF'`
+- 如果还需要插入时间戳等变量, 用外层 `printf` 打标题, heredoc 正文保持单引号保护.
 
-#### 根因
+### 验证
+- 本次修正后已重新追加说明记录, 保留了原意并没有再触发反引号替换.
+- 当前可见证据:
+  - `task_plan.md` 末尾新增了本条修正说明
+  - `ERRORFIX.md` 记录了原因与处理方式
 
-- `build_scene_bundle()` 之前只 `OmegaConf.load()` demo 顶层 YAML.
-- 但真实数据契约在 demo YAML 的 `config_path` 指向的训练配置链里,单读顶层文件会缺关键字段.
+## [2026-03-10 08:11:59 UTC] 问题: `refinement_v2` 测试命令需要同时满足 `PYTHONPATH` 与 `pixi` 环境
 
-#### 修复
+### 问题
+- 直接跑 `pytest -q tests/refinement_v2` 时, 会因为基础环境缺少 `omegaconf` 等依赖而失败。
+- 直接跑 `pixi run pytest -q tests/refinement_v2` 时, 又会因为没有 `PYTHONPATH` 而报 `ModuleNotFoundError: src`。
 
-- 在 `src/refinement_v2/data_loader.py` 中:
-  - 新增 demo config 链解析逻辑.
-  - 正确合并 `config_path` 中的训练配置.
-  - 再叠加 refinement 专用覆盖项.
+### 原因
+- 仓库代码按 `src/...` 绝对导入组织, 因此测试运行时必须把仓库根目录放进 `PYTHONPATH`。
+- 同时依赖又装在 `pixi` 环境里, 不能只用系统 Python。
 
-#### 验证
+### 修复
+- `refinement_v2` 当前稳定的测试命令应统一写成:
+  - `PYTHONPATH="$(pwd)" pixi run pytest -q tests/refinement_v2`
 
-- provider 级复现已能成功拿到真实样本:
-  - `images_output shape = (31, 3, 704, 1280)`
-  - `cam_view shape = (31, 4, 4)`
-  - `intrinsics shape = (31, 4)`
+### 验证
+- 使用上述命令后, 本轮回归结果为:
+  - `113 passed`
 
-### 问题3: 真实运行被 demo 数据资产差异和无关依赖拖住
+## [2026-03-10 08:13:02 UTC] 问题: Python / pixi 两种测试口径都会因为环境不全而给出假失败
 
-#### 根因
+### 问题
+- 直接运行:
+  - `PYTHONPATH="$(pwd)" pytest -q tests/refinement_v2`
+  会在部分全量测试上报:
+  - `ModuleNotFoundError: No module named omegaconf`
+- 直接运行:
+  - `pixi run pytest -q tests/refinement_v2`
+  又会在 collection 阶段报:
+  - `ModuleNotFoundError: No module named src`
 
-- 当前本机资产存在 `lyra_static_demo_generated`, 但 demo YAML 默认指向 `lyra_static_demo_generated_one`.
-- provider 默认还会尝试读取 `depth` / `latents`,而 refinement 实际只需要 RGB 与相机参数.
-- provider 推理路径还直接访问 `target_index_manual`,但训练配置链里不一定定义该键.
+### 原因
+- 前者用了宿主 Python, 缺少项目依赖环境。
+- 后者虽然进了 pixi env, 但没有把仓库根目录注入 `PYTHONPATH`.
 
-#### 修复
+### 修复
+- 当前仓库里跑全量 refinement 回归的正确口径应固定为:
+  - `PYTHONPATH="$(pwd)" pixi run pytest -q tests/refinement_v2`
 
-- `src/refinement_v2/config.py` 新增 `--dataset-name` 覆盖.
-- `src/refinement_v2/data_loader.py` 新增 refinement 专用覆盖项:
-  - `use_depth = False`
-  - `load_latents = False`
-  - `target_index_manual = None`
-- 当 dataset root 缺失时,会给出更明确的 `--dataset-name` 提示.
-
-#### 验证
-
-- 真实 dry-run 成功落盘:
-  - `outputs/refine_v2/view3_phase0_subset/diagnostics.json`
-- 真实 Stage 2A subset 成功落盘:
-  - `outputs/refine_v2/view3_stage2a_subset/diagnostics.json`
-  - `outputs/refine_v2/view5_stage2a_subset/diagnostics.json`
-
-## 2026-03-06 07:48 UTC: before/after 渲染导出在测试环境中的依赖与编码器问题
-
-### 问题1: 新增视频导出后,测试环境 import 直接报 `ModuleNotFoundError: No module named 'imageio'`
-
-#### 根因
-
-- 仓库 `.pixi` 环境里有 `imageio`,但当前系统 `python3` 跑测试时没有.
-- 之前把 `imageio` 放在 `diagnostics.py` 顶层 import,导致测试在收集阶段就直接失败.
-
-#### 修复
-
-- 改成在视频写出函数里惰性导入 `imageio`.
-- 如果当前解释器没有 `imageio`,就自动回退到系统 `ffmpeg`.
-
-#### 验证
-
-- `PYTHONPATH="$(pwd)" pytest -q tests/refinement_v2/test_diagnostics.py tests/refinement_v2/test_runner_phase0.py tests/refinement_v2/test_runner_stage2a.py`
-- 通过.
-
-### 问题2: 系统 `ffmpeg` 不支持 `libx264`
-
-#### 根因
-
-- 当前机器上的系统 `ffmpeg` 存在,但没有编译 `libx264` encoder.
-- 初版 fallback 固定使用 `libx264`,因此视频写出仍然失败.
-
-#### 修复
-
-- `diagnostics.py` 中的 `ffmpeg` fallback 改为按顺序尝试:
-  - `libx264`
-  - `mpeg4`
-- 只要任意一种编码器可用,就继续产出 mp4.
-
-#### 验证
-
-- 同样的测试集已通过.
-- 真实运行已成功产出:
-  - `outputs/refine_v2/view3_stage2a_full/videos/final_render.mp4`
-  - `outputs/refine_v2/view5_stage2a_full/videos/final_render.mp4`
-
-## 2026-03-06 真实验证被环境阻塞
-- 问题: `flash_attn` 缺失导致 `refine_robust_v2.py` 无法进入真实数据加载。
-- 影响: 本轮真实 Stage 2B 还没有拿到真实指标。
-- 处置: 先查可复用环境,不贸然改主干。
-
-## 2026-03-06 门控过保守修正
-- 现象: `view 5` 真实 run 停在 `stage2a`,因为 `residual_mean=0.0478` 未跨过原 `0.05` 阈值。
-- 原因: 指标阈值比当前数据分布更保守。
-- 修复: 放宽 `local_overlap_persistent` 到 `0.045`。
-- 验证: 继续跑全量回归与新的真实验证。
+### 验证
+- 本轮按上面口径重跑后, 实际结果为:
+  - `113 passed`
+- 这说明前两种报错都属于环境口径错误, 不是本次代码回归.

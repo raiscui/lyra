@@ -107,6 +107,34 @@ def test_run_phase0_only_outputs_diagnostics(tmp_path) -> None:
     assert "final_render_video" in summary["artifacts"]
 
 
+def test_run_phase0_only_with_super_resolved_reference_exports_hr_artifacts(tmp_path) -> None:
+    """当 scene 真的存在 HR reference 时, Phase D 应补出 HR before/after 导出."""
+
+    run_config = build_run_config(tmp_path, dry_run=True, reference_mode="super_resolved", sr_scale=2.0)
+    hparams = build_stage_hparams(reference_render_shard_views=1)
+    diagnostics = DiagnosticsWriter(run_config.outdir)
+    runner = RefinementRunner(
+        scene=build_scene_bundle(reference_mode="super_resolved", sr_scale=2.0),
+        gaussians=build_gaussian_adapter(),
+        diagnostics=diagnostics,
+        controller=StageController(run_config, hparams),
+        hparams=hparams,
+        renderer=FakeRenderer(),
+    )
+
+    summary = runner.run_phase0_only()
+
+    assert (run_config.outdir / "videos" / "baseline_render_hr.mp4").exists()
+    assert (run_config.outdir / "videos" / "gt_reference_hr.mp4").exists()
+    assert (run_config.outdir / "videos" / "final_render_hr.mp4").exists()
+    assert (run_config.outdir / "renders_before_after" / "final_render_hr_frame_0000.png").exists()
+    assert "baseline_hr" in summary
+    assert "final_hr" in summary
+    assert summary["reference_hw"] == [12, 12]
+    assert "baseline_render_hr_video" in summary["artifacts"]
+    assert "final_render_hr_video" in summary["artifacts"]
+
+
 def test_render_scene_splits_view_shards_across_render_devices(tmp_path) -> None:
     """多设备渲染应按 view 维切 shard,再按原顺序拼回结果."""
 

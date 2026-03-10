@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,6 +15,8 @@ from .data_loader import SceneBundle
 from .diagnostics import DiagnosticsWriter
 from .gaussian_adapter import GaussianAdapter
 from .losses import (
+    build_depth_anchor_valid_mask,
+    compute_depth_anchor_loss,
     compute_means_anchor_loss,
     compute_opacity_sparse_loss,
     compute_patch_perceptual_loss,
@@ -22,6 +25,7 @@ from .losses import (
     compute_sampling_smooth_loss,
     compute_scale_tail_loss,
     compute_weighted_rgb_loss,
+    downsample_rgb_tensor,
 )
 from .stage_controller import StageController
 from .state_io import load_latest_state, save_state
@@ -49,6 +53,17 @@ class GaussianSceneRenderer:
         """渲染当前高斯场景."""
 
         return self.renderer.render(gaussians, scene.cam_view, intrinsics=scene.intrinsics)
+
+
+@dataclass
+class DepthAnchorReference:
+    """缓存一份不可变的 baseline depth anchor."""
+
+    depth: torch.Tensor
+    valid_mask: torch.Tensor
+    valid_ratio: float
+    source: str
+    alpha: torch.Tensor | None = None
 
 
 class RefinementRunner:
@@ -81,6 +96,10 @@ class RefinementRunner:
             weight_tau=hparams.weight_tau,
             weight_floor=hparams.weight_floor,
             ema_decay=hparams.ema_decay,
+            fidelity_ratio_threshold=hparams.fidelity_ratio_threshold,
+            fidelity_sigmoid_k=hparams.fidelity_sigmoid_k,
+            fidelity_min_views=hparams.fidelity_min_views,
+            fidelity_opacity_threshold=hparams.fidelity_opacity_threshold,
         )
 
         self.current_stage = "init"
@@ -88,7 +107,11 @@ class RefinementRunner:
         self.pose_delta: torch.Tensor | None = None
         self.latest_render_meta: dict[str, Any] | None = None
         self.gaussian_fidelity_score: torch.Tensor | None = None
+        self.gaussian_fidelity_diagnostics: dict[str, torch.Tensor] | None = None
         self.sr_selection_map: torch.Tensor | None = None
+        self.last_sr_patch_sets_used = 0
+        self.depth_anchor_reference: DepthAnchorReference | None = None
+        self.depth_anchor_capture_attempted = False
         self.renderer_cache: dict[tuple[int, int], GaussianSceneRenderer] = {}
         self.scene_shard_cache: dict[tuple[Any, ...], SceneBundle] = {}
         self.diagnostics_state: dict[str, Any] = {
@@ -98,6 +121,15 @@ class RefinementRunner:
             "stage2a_mode_requested": self.run_config.stage2a_mode,
             "stage3sr_enabled": self._stage2a_should_run_stage3sr(),
             "render_devices": [str(device) for device in self.render_devices],
+            "depth_anchor_enabled": bool(self.hparams.enable_depth_anchor and self.hparams.lambda_depth_anchor > 0.0),
+            "depth_anchor_weight": self.hparams.lambda_depth_anchor,
+            "depth_anchor_source": self.hparams.depth_anchor_source,
+            "depth_anchor_reference_ready": False,
+            "depth_anchor_reference_valid_ratio": 0.0,
+            "depth_anchor_reference_skip_reason": None,
+            "depth_anchor_last_skip_reason": None,
+            "depth_anchor_last_valid_ratio": 0.0,
+            "depth_anchor_last_loss": 0.0,
         }
         self.visual_artifacts: dict[str, str] = {}
 
@@ -450,6 +482,144 @@ class RefinementRunner:
             output_cpu["render_meta"] = render_meta
         return output_cpu  # type: ignore[return-value]
 
+    def _render_scene_serial_view_shards(
+        self,
+        scene: SceneBundle,
+        *,
+        views_per_shard: int,
+        gather_device: torch.device | None = None,
+        detach_outputs: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """在单设备上沿 view 维串行分片渲染一个 scene.
+
+        `Phase C` 的 full-frame HR render 很容易在单次前向里撞上 renderer 的显存峰值.
+        这里主动把 reference-resolution scene 切成多个 view shard 串行跑,
+        用更多前向次数换更低的单次峰值.
+        """
+
+        views_per_shard = max(1, int(views_per_shard))
+        if scene.gt_images.shape[0] != 1 or scene.gt_images.shape[1] <= views_per_shard:
+            if gather_device is None and not detach_outputs:
+                return self._render_scene_single_device(scene)
+
+            render_output = self._render_scene_single_device(scene)
+            target_device = self._get_scene_device(scene) if gather_device is None else gather_device
+            moved_output: dict[str, torch.Tensor | dict[str, Any]] = {
+                "images_pred": (render_output["images_pred"].detach() if detach_outputs else render_output["images_pred"]).to(target_device)
+            }
+            if isinstance(render_output.get("alphas_pred"), torch.Tensor):
+                alpha_tensor = render_output["alphas_pred"].detach() if detach_outputs else render_output["alphas_pred"]
+                moved_output["alphas_pred"] = alpha_tensor.to(target_device)
+            if isinstance(render_output.get("depths_pred"), torch.Tensor):
+                depth_tensor = render_output["depths_pred"].detach() if detach_outputs else render_output["depths_pred"]
+                moved_output["depths_pred"] = depth_tensor.to(target_device)
+            render_meta = self._move_render_meta_to_device(
+                render_output.get("render_meta"),
+                target_device,
+                detach_tensors=detach_outputs,
+            )
+            if render_meta is not None:
+                moved_output["render_meta"] = render_meta
+            return moved_output  # type: ignore[return-value]
+
+        active_device = self._get_scene_device(scene)
+        target_device = active_device if gather_device is None else gather_device
+        gaussians_primary = self.gaussians.to_tensor()
+        image_shards: list[torch.Tensor] = []
+        alpha_shards: list[torch.Tensor] = []
+        depth_shards: list[torch.Tensor] = []
+        render_meta_shards: list[dict[str, Any] | None] = []
+
+        for start_index in range(0, scene.gt_images.shape[1], views_per_shard):
+            end_index = min(scene.gt_images.shape[1], start_index + views_per_shard)
+            shard_scene = self._get_scene_shard(scene, active_device, start_index, end_index)
+            renderer = self._get_renderer_for_scene(shard_scene)
+            shard_output = renderer.render(
+                self._get_gaussians_for_device(active_device, gaussians_primary),
+                shard_scene,
+            )
+            if "images_pred" not in shard_output:
+                raise KeyError("Renderer output must contain `images_pred`.")
+
+            image_tensor = shard_output["images_pred"].detach() if detach_outputs else shard_output["images_pred"]
+            image_shards.append(image_tensor.to(target_device))
+            if isinstance(shard_output.get("alphas_pred"), torch.Tensor):
+                alpha_tensor = shard_output["alphas_pred"].detach() if detach_outputs else shard_output["alphas_pred"]
+                alpha_shards.append(alpha_tensor.to(target_device))
+            if isinstance(shard_output.get("depths_pred"), torch.Tensor):
+                depth_tensor = shard_output["depths_pred"].detach() if detach_outputs else shard_output["depths_pred"]
+                depth_shards.append(depth_tensor.to(target_device))
+            render_meta_shards.append(
+                self._move_render_meta_to_device(
+                    shard_output.get("render_meta"),
+                    target_device,
+                    detach_tensors=detach_outputs,
+                )
+            )
+
+        merged_output: dict[str, torch.Tensor | dict[str, Any]] = {
+            "images_pred": torch.cat(image_shards, dim=1),
+        }
+        if alpha_shards:
+            merged_output["alphas_pred"] = torch.cat(alpha_shards, dim=1)
+        if depth_shards:
+            merged_output["depths_pred"] = torch.cat(depth_shards, dim=1)
+
+        merged_meta = self._merge_render_meta_shards(render_meta_shards)
+        if merged_meta is not None:
+            merged_output["render_meta"] = merged_meta
+        return merged_output  # type: ignore[return-value]
+
+
+    def _iter_scene_single_device_view_shards(
+        self,
+        scene: SceneBundle,
+        *,
+        views_per_shard: int,
+    ):
+        """在单设备上按 view shard 逐块渲染.
+
+        这个 helper 不会把所有 shard 再拼回一个大张量.
+        适合 `Phase C` 这类 full-frame HR loss 需要边渲染边反传的路径.
+        """
+
+        views_per_shard = max(1, int(views_per_shard))
+        active_device = self._get_scene_device(scene)
+        gaussians_primary = self.gaussians.to_tensor()
+
+        if scene.gt_images.shape[0] != 1:
+            renderer = self._get_renderer_for_scene(scene)
+            shard_output = renderer.render(
+                self._get_gaussians_for_device(active_device, gaussians_primary),
+                scene,
+            )
+            if "images_pred" not in shard_output:
+                raise KeyError("Renderer output must contain `images_pred`.")
+            yield {
+                "start_index": 0,
+                "end_index": scene.gt_images.shape[1],
+                "scene": scene,
+                "output": shard_output,
+            }
+            return
+
+        for start_index in range(0, scene.gt_images.shape[1], views_per_shard):
+            end_index = min(scene.gt_images.shape[1], start_index + views_per_shard)
+            shard_scene = self._get_scene_shard(scene, active_device, start_index, end_index)
+            renderer = self._get_renderer_for_scene(shard_scene)
+            shard_output = renderer.render(
+                self._get_gaussians_for_device(active_device, gaussians_primary),
+                shard_scene,
+            )
+            if "images_pred" not in shard_output:
+                raise KeyError("Renderer output must contain `images_pred`.")
+            yield {
+                "start_index": start_index,
+                "end_index": end_index,
+                "scene": shard_scene,
+                "output": shard_output,
+            }
+
     def _get_renderer_for_scene(self, scene: SceneBundle) -> Any:
         """按目标分辨率选择可复用的 renderer."""
 
@@ -486,6 +656,167 @@ class RefinementRunner:
             return render_meta
         return None
 
+    def _append_warning_once(self, warning: str) -> None:
+        """只追加一次 warning,避免同类降级在每轮循环刷屏."""
+
+        warnings = self.diagnostics_state.setdefault("warnings", [])
+        if warning not in warnings:
+            warnings.append(warning)
+
+    def _depth_anchor_requested(self) -> bool:
+        """判断这次运行是否真的请求了 depth anchor."""
+
+        return bool(self.hparams.enable_depth_anchor and self.hparams.lambda_depth_anchor > 0.0)
+
+    def _stage_uses_depth_anchor(self, stage_name: str) -> bool:
+        """V1 只让 appearance 阶段启用 depth anchor."""
+
+        return self._depth_anchor_requested() and stage_name in {"stage2a", "stage3sr"}
+
+    def _set_depth_anchor_reference_status(
+        self,
+        *,
+        ready: bool,
+        valid_ratio: float = 0.0,
+        skip_reason: str | None = None,
+    ) -> None:
+        """同步更新 reference 级别的 depth anchor 状态."""
+
+        self.diagnostics_state["depth_anchor_reference_ready"] = ready
+        self.diagnostics_state["depth_anchor_reference_valid_ratio"] = valid_ratio
+        self.diagnostics_state["depth_anchor_reference_skip_reason"] = skip_reason
+
+    def _capture_depth_anchor_reference(self) -> None:
+        """捕获一份 immutable baseline depth anchor."""
+
+        self.depth_anchor_capture_attempted = True
+        source = self.hparams.depth_anchor_source
+        self.diagnostics_state["depth_anchor_source"] = source
+
+        # V1 只实现 baseline_render.
+        # 其它来源先保留参数面,但不偷偷伪装成已经支持.
+        if source != "baseline_render":
+            reason = f"unsupported_source:{source}"
+            self.depth_anchor_reference = None
+            self._set_depth_anchor_reference_status(ready=False, skip_reason=reason)
+            self._append_warning_once(f"depth_anchor_skipped:{reason}")
+            return
+
+        render_output = self._render_scene_for_evaluation(self.scene)
+        reference_depth = render_output.get("depths_pred")
+        reference_alpha = render_output.get("alphas_pred")
+        if not isinstance(reference_depth, torch.Tensor):
+            reason = "reference_depth_missing"
+            self.depth_anchor_reference = None
+            self._set_depth_anchor_reference_status(ready=False, skip_reason=reason)
+            self._append_warning_once(f"depth_anchor_skipped:{reason}")
+            return
+        if reference_alpha is not None and not isinstance(reference_alpha, torch.Tensor):
+            reference_alpha = None
+
+        try:
+            valid_mask = build_depth_anchor_valid_mask(
+                reference_depth,
+                reference_alpha,
+                alpha_threshold=self.hparams.depth_anchor_alpha_threshold,
+            )
+        except ValueError as exc:
+            reason = f"reference_invalid:{exc}"
+            self.depth_anchor_reference = None
+            self._set_depth_anchor_reference_status(ready=False, skip_reason=reason)
+            self._append_warning_once(f"depth_anchor_skipped:{reason}")
+            return
+
+        valid_ratio = float(valid_mask.float().mean().item())
+        if valid_ratio <= 0.0:
+            reason = "empty_reference_mask"
+            self.depth_anchor_reference = None
+            self._set_depth_anchor_reference_status(ready=False, skip_reason=reason)
+            self._append_warning_once(f"depth_anchor_skipped:{reason}")
+            return
+
+        self.depth_anchor_reference = DepthAnchorReference(
+            depth=reference_depth.detach().cpu(),
+            alpha=reference_alpha.detach().cpu() if isinstance(reference_alpha, torch.Tensor) else None,
+            valid_mask=valid_mask.detach().cpu(),
+            valid_ratio=valid_ratio,
+            source=source,
+        )
+        self._set_depth_anchor_reference_status(ready=True, valid_ratio=valid_ratio, skip_reason=None)
+
+    def _ensure_depth_anchor_reference(self, stage_name: str) -> None:
+        """在进入 appearance loop 前按需捕获 baseline reference."""
+
+        if not self._stage_uses_depth_anchor(stage_name):
+            return
+        if self.depth_anchor_reference is not None or self.depth_anchor_capture_attempted:
+            return
+        self._capture_depth_anchor_reference()
+
+    def _compute_depth_anchor_loss_for_view_range(
+        self,
+        pred_depth: torch.Tensor | None,
+        *,
+        start_index: int,
+        end_index: int,
+    ) -> tuple[torch.Tensor, float, str | None]:
+        """对某个 view 范围计算 depth anchor loss."""
+
+        if not isinstance(pred_depth, torch.Tensor):
+            zero_loss = self.gaussians.opacity.new_zeros(())
+            return zero_loss, 0.0, "pred_depth_missing"
+
+        if self.depth_anchor_reference is None:
+            zero_loss = pred_depth.new_zeros(())
+            skip_reason = self.diagnostics_state.get("depth_anchor_reference_skip_reason") or "reference_unavailable"
+            return zero_loss, 0.0, skip_reason
+
+        reference_depth = self._slice_view_tensor(
+            self.depth_anchor_reference.depth,
+            start_index,
+            end_index,
+            device=pred_depth.device,
+            dtype=pred_depth.dtype,
+        )
+        reference_valid_mask = self._slice_view_tensor(
+            self.depth_anchor_reference.valid_mask,
+            start_index,
+            end_index,
+            device=pred_depth.device,
+            dtype=torch.bool,
+        )
+        if reference_depth is None or reference_valid_mask is None:
+            zero_loss = pred_depth.new_zeros(())
+            return zero_loss, 0.0, "reference_slice_missing"
+
+        loss_summary = compute_depth_anchor_loss(pred_depth, reference_depth, reference_valid_mask)
+        return loss_summary.loss, loss_summary.valid_ratio, loss_summary.skip_reason
+
+    def _build_depth_anchor_metrics(
+        self,
+        *,
+        stage_name: str,
+        loss_value: float,
+        valid_ratio: float,
+        skip_reason: str | None,
+    ) -> dict[str, Any]:
+        """把当前轮 depth anchor 的诊断项整理成 metrics."""
+
+        if skip_reason is not None:
+            self._append_warning_once(f"{stage_name}_depth_anchor_skipped:{skip_reason}")
+
+        self.diagnostics_state["depth_anchor_last_skip_reason"] = skip_reason
+        self.diagnostics_state["depth_anchor_last_valid_ratio"] = valid_ratio
+        self.diagnostics_state["depth_anchor_last_loss"] = loss_value
+        return {
+            "loss_depth_anchor": loss_value,
+            "depth_anchor_active": skip_reason is None,
+            "depth_anchor_valid_ratio": valid_ratio,
+            "depth_anchor_source": self.hparams.depth_anchor_source,
+            "depth_anchor_reference_ready": self.depth_anchor_reference is not None,
+            "depth_anchor_skip_reason": skip_reason,
+        }
+
     def _build_default_fidelity_score(self) -> torch.Tensor:
         """在 renderer 不提供 meta 时回退到全 1 fidelity."""
 
@@ -515,10 +846,14 @@ class RefinementRunner:
         stage_name: str,
         fidelity_score: torch.Tensor,
         sr_selection_map: torch.Tensor,
+        fidelity_diagnostics: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """把 Phase 3S 的诊断产物落盘."""
 
-        self.diagnostics.write_gaussian_fidelity_summary(fidelity_score)
+        self.diagnostics.write_gaussian_fidelity_summary(
+            fidelity_score,
+            fidelity_diagnostics=fidelity_diagnostics,
+        )
         self.diagnostics.write_sr_selection_stats(sr_selection_map)
         for frame_id in range(sr_selection_map.shape[1]):
             self.diagnostics.save_sr_selection_map(stage_name, frame_id, sr_selection_map[:, frame_id])
@@ -530,12 +865,47 @@ class RefinementRunner:
             self.hparams.lambda_patch_rgb > 0.0 or self.hparams.lambda_patch_perceptual > 0.0
         )
 
+    def _full_frame_hr_supervision_configured(self, scene: SceneBundle | None = None) -> bool:
+        """判断当前是否打开了 `Phase C` 风格的 full-frame HR supervision."""
+
+        active_scene = self.scene if scene is None else scene
+        if self.hparams.lambda_hr_rgb <= 0.0:
+            return False
+        if not isinstance(active_scene.reference_images, torch.Tensor):
+            return False
+        return active_scene.reference_images.shape[-2:] != active_scene.gt_images.shape[-2:]
+
+    def _stage3sr_supervision_configured(self, scene: SceneBundle | None = None) -> bool:
+        """判断 Stage 3SR 是否至少有一种监督模式可用."""
+
+        return self._patch_supervision_configured() or self._full_frame_hr_supervision_configured(scene)
+
+    def _resolve_stage3sr_supervision_mode(self, scene: SceneBundle | None = None) -> str:
+        """解析当前 Stage 3SR 真正要走的监督模式."""
+
+        active_scene = self.scene if scene is None else scene
+        uses_patch = self._patch_supervision_configured()
+        uses_full_frame_hr = self._full_frame_hr_supervision_configured(active_scene)
+        if uses_patch and uses_full_frame_hr:
+            raise RuntimeError(
+                "Stage 3SR cannot enable patch supervision and full-frame HR supervision at the same time. "
+                "Please choose one supervision mode."
+            )
+        if uses_full_frame_hr:
+            return "full_frame_hr"
+        if uses_patch:
+            return "patch"
+        return "none"
+
     def _stage2a_should_run_stage3sr(self) -> bool:
         """根据当前模式和参数,判断 Stage 2A 是否应进入增强链路."""
 
         if self.run_config.stage2a_mode == "legacy":
             return False
-        return self._patch_supervision_configured()
+        try:
+            return self._resolve_stage3sr_supervision_mode() != "none"
+        except RuntimeError:
+            return False
 
     def _resolve_stage2a_mode(self) -> str:
         """把 `auto/legacy/enhanced` 解析成本轮真正执行的模式."""
@@ -544,23 +914,37 @@ class RefinementRunner:
         if requested_mode == "legacy":
             return "legacy"
         if requested_mode == "enhanced":
-            if not self._patch_supervision_configured():
+            if not self._stage3sr_supervision_configured():
                 raise RuntimeError(
-                    "stage2a_mode=enhanced requires patch supervision. "
-                    "Please set --patch-size > 0 and enable at least one patch loss weight."
+                    "stage2a_mode=enhanced requires Stage 3SR supervision. "
+                    "Please enable either patch supervision, or full-frame HR supervision."
                 )
+            self._resolve_stage3sr_supervision_mode()
             return "enhanced"
-        if self._patch_supervision_configured():
+        if self._stage3sr_supervision_configured():
+            self._resolve_stage3sr_supervision_mode()
             return "enhanced"
         return "legacy"
 
-    def _get_reference_images(self, scene: SceneBundle | None = None) -> torch.Tensor:
-        """统一解析当前 reference 图像张量."""
+    def _get_reference_images(
+        self,
+        scene: SceneBundle | None = None,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """统一拿到当前 scene 的 reference 图像,并按需要对齐设备/类型."""
 
         active_scene = self.scene if scene is None else scene
-        if isinstance(active_scene.reference_images, torch.Tensor):
-            return active_scene.reference_images
-        return active_scene.gt_images
+        reference_images = active_scene.reference_images if isinstance(active_scene.reference_images, torch.Tensor) else active_scene.gt_images
+        if device is None and dtype is None:
+            return reference_images
+
+        target_device = reference_images.device if device is None else device
+        target_dtype = reference_images.dtype if dtype is None else dtype
+        if reference_images.device == target_device and reference_images.dtype == target_dtype:
+            return reference_images
+        return reference_images.to(device=target_device, dtype=target_dtype)
 
     def _get_gt_images(
         self,
@@ -581,6 +965,85 @@ class RefinementRunner:
         if gt_images.device == target_device and gt_images.dtype == target_dtype:
             return gt_images
         return gt_images.to(device=target_device, dtype=target_dtype)
+
+    def _reference_space_enabled(self, scene: SceneBundle | None = None) -> bool:
+        """判断当前 scene 是否真的存在独立的 HR reference 空间.
+
+        `Phase D` 的关键不是“永远再导一份视频”.
+        而是只在 reference 分辨率真的高于 native 时, 才补出 HR 导出与指标.
+        """
+
+        active_scene = self.scene if scene is None else scene
+        reference_images = self._get_reference_images(active_scene)
+        return tuple(reference_images.shape[-2:]) != tuple(active_scene.gt_images.shape[-2:])
+
+    def _build_reference_render_scene(self, scene: SceneBundle | None = None) -> SceneBundle:
+        """构造一个 reference 分辨率的整图渲染 scene.
+
+        这里不再额外分配一份同尺寸零张量.
+        直接复用 `reference_images` 作为 shape carrier 即可.
+        renderer 只关心分辨率与 intrinsics, 不会把它当成监督目标去消费.
+        """
+
+        active_scene = self.scene if scene is None else scene
+        reference_images = self._get_reference_images(active_scene)
+        reference_intrinsics = (
+            active_scene.intrinsics_ref if isinstance(active_scene.intrinsics_ref, torch.Tensor) else active_scene.intrinsics
+        )
+        reference_hw = (
+            active_scene.reference_hw
+            if active_scene.reference_hw is not None
+            else (int(reference_images.shape[-2]), int(reference_images.shape[-1]))
+        )
+        return SceneBundle(
+            gt_images=reference_images,
+            cam_view=active_scene.cam_view,
+            intrinsics=reference_intrinsics,
+            frame_indices=active_scene.frame_indices,
+            scene_index=active_scene.scene_index,
+            view_id=active_scene.view_id,
+            view_ids=active_scene.view_ids,
+            target_index=active_scene.target_index,
+            file_name=active_scene.file_name,
+            reference_images=reference_images,
+            intrinsics_ref=reference_intrinsics,
+            native_hw=active_scene.native_hw,
+            reference_hw=reference_hw,
+            reference_mode=active_scene.reference_mode,
+            sr_scale=active_scene.sr_scale,
+        )
+
+    def _render_reference_scene_for_training(self, scene: SceneBundle | None = None) -> dict[str, torch.Tensor]:
+        """在 reference 分辨率渲染整图 HR output.
+
+        默认会按 `reference_render_shard_views` 串行切 view,
+        避免 full-frame HR render 一次性把显存峰值拉爆.
+        """
+
+        reference_scene = self._build_reference_render_scene(scene)
+        if self._use_multi_device_render(reference_scene):
+            return self.render_scene(reference_scene)
+        return self._render_scene_serial_view_shards(
+            reference_scene,
+            views_per_shard=self.hparams.reference_render_shard_views,
+        )
+
+    def _render_reference_scene_for_evaluation(self, scene: SceneBundle | None = None) -> dict[str, torch.Tensor]:
+        """在 reference 分辨率渲染一个只用于导出/指标的 HR scene.
+
+        训练路径已经有了 `reference-space` scene builder.
+        `Phase D` 这里补的是 evaluation/export 版本, 让最终产物也能直接落到 HR 空间.
+        """
+
+        reference_scene = self._build_reference_render_scene(scene)
+        if self._use_multi_device_render(reference_scene):
+            return self._render_scene_multi_device(reference_scene, gather_device=torch.device("cpu"), detach_outputs=True)
+        return self._render_scene_serial_view_shards(
+            reference_scene,
+            views_per_shard=self.hparams.reference_render_shard_views,
+            gather_device=torch.device("cpu"),
+            detach_outputs=True,
+        )
 
     def _resolve_patch_sizes(self, scene: SceneBundle | None = None) -> tuple[int, int, int]:
         """解析 native/reference patch 尺寸和缩放倍率."""
@@ -634,6 +1097,129 @@ class RefinementRunner:
                     device=residual_map.device,
                 )
         return patch_windows
+
+    def _build_reference_supervision_weight_map(
+        self,
+        residual_map: torch.Tensor,
+        *,
+        native_weight_map: torch.Tensor | None = None,
+        sr_selection_map: torch.Tensor | None = None,
+        scene: SceneBundle | None = None,
+    ) -> torch.Tensor | None:
+        """把 native robust 权重与 reference selection 组合成 reference 尺度监督权重."""
+
+        active_scene = self.scene if scene is None else scene
+        active_sr_selection = self.sr_selection_map if sr_selection_map is None else sr_selection_map
+
+        active_weight_map = self.prev_weight_map if native_weight_map is None else native_weight_map
+        if active_weight_map is None:
+            active_weight_map = torch.ones_like(residual_map)
+        if active_weight_map.device != residual_map.device or active_weight_map.dtype != residual_map.dtype:
+            active_weight_map = active_weight_map.to(device=residual_map.device, dtype=residual_map.dtype)
+
+        reference_hw = self._get_reference_images(active_scene).shape[-2:]
+        robust_weight_ref = self._resize_patch_tensor(active_weight_map, reference_hw)
+        if active_sr_selection is None:
+            return robust_weight_ref.detach()
+        if active_sr_selection.device != robust_weight_ref.device or active_sr_selection.dtype != robust_weight_ref.dtype:
+            active_sr_selection = active_sr_selection.to(device=robust_weight_ref.device, dtype=robust_weight_ref.dtype)
+        return self.weight_builder.combine_sr_weights(robust_weight_ref, active_sr_selection).detach()
+
+    def _build_sr_patch_priority_map(
+        self,
+        residual_map: torch.Tensor,
+        *,
+        native_weight_map: torch.Tensor | None = None,
+        sr_selection_map: torch.Tensor | None = None,
+        scene: SceneBundle | None = None,
+    ) -> torch.Tensor | None:
+        """把 reference 尺度监督权重复用成 patch 选窗优先级图."""
+
+        return self._build_reference_supervision_weight_map(
+            residual_map,
+            native_weight_map=native_weight_map,
+            sr_selection_map=sr_selection_map,
+            scene=scene,
+        )
+
+    def sample_sr_patch_window_sets(
+        self,
+        residual_map: torch.Tensor,
+        *,
+        native_weight_map: torch.Tensor | None = None,
+        sr_selection_map: torch.Tensor | None = None,
+        scene: SceneBundle | None = None,
+    ) -> torch.Tensor:
+        """按 selection priority 选出多个 patch window.
+
+        `Phase B` 的最小版先不直接上整图 HR render.
+        而是把“单热点 residual patch”升级成“按 reference priority 选多个 patch”.
+        这样可以复用现有 patch render 路径,同时明显扩大 SR supervision 覆盖面.
+        """
+
+        active_scene = self.scene if scene is None else scene
+        fallback_windows = self.sample_patch_windows(residual_map, scene=active_scene)
+        patch_sets_per_view = max(1, int(self.hparams.sr_patches_per_view))
+        if patch_sets_per_view <= 1:
+            return fallback_windows.unsqueeze(0)
+
+        priority_map = self._build_sr_patch_priority_map(
+            residual_map,
+            native_weight_map=native_weight_map,
+            sr_selection_map=sr_selection_map,
+            scene=active_scene,
+        )
+        if priority_map is None:
+            return fallback_windows.unsqueeze(0)
+
+        native_patch_size, reference_patch_size, scale_int = self._resolve_patch_sizes(active_scene)
+        batch_size, num_views, _, _, _ = priority_map.shape
+        pooled_scores = F.avg_pool2d(
+            priority_map.detach().mean(dim=2, keepdim=True).reshape(batch_size * num_views, 1, *priority_map.shape[-2:]),
+            kernel_size=reference_patch_size,
+            stride=scale_int,
+        )
+        score_height, score_width = pooled_scores.shape[-2:]
+        if min(score_height, score_width) <= 0:
+            return fallback_windows.unsqueeze(0)
+
+        patch_window_sets = fallback_windows.unsqueeze(0).repeat(patch_sets_per_view, 1, 1, 1)
+        score_map = pooled_scores.view(batch_size, num_views, score_height, score_width).clone()
+
+        for batch_index in range(batch_size):
+            for view_index in range(num_views):
+                view_scores = score_map[batch_index, view_index]
+                fallback_window = fallback_windows[batch_index, view_index]
+                for patch_set_index in range(patch_sets_per_view):
+                    flat_scores = view_scores.reshape(-1)
+                    flat_index = int(torch.argmax(flat_scores).item())
+                    best_score = float(flat_scores[flat_index].item())
+                    if best_score <= 0.0:
+                        if patch_set_index > 0:
+                            patch_window_sets[patch_set_index, batch_index, view_index] = patch_window_sets[
+                                patch_set_index - 1,
+                                batch_index,
+                                view_index,
+                            ]
+                        else:
+                            patch_window_sets[patch_set_index, batch_index, view_index] = fallback_window
+                        continue
+
+                    top_native = flat_index // score_width
+                    left_native = flat_index % score_width
+                    patch_window_sets[patch_set_index, batch_index, view_index] = torch.tensor(
+                        [top_native, left_native, native_patch_size, native_patch_size],
+                        dtype=torch.long,
+                        device=residual_map.device,
+                    )
+
+                    suppress_top = max(0, top_native - native_patch_size + 1)
+                    suppress_bottom = min(score_height, top_native + native_patch_size)
+                    suppress_left = max(0, left_native - native_patch_size + 1)
+                    suppress_right = min(score_width, left_native + native_patch_size)
+                    view_scores[suppress_top:suppress_bottom, suppress_left:suppress_right] = -1.0
+
+        return patch_window_sets
 
     def map_patch_windows_to_reference(
         self,
@@ -696,8 +1282,12 @@ class RefinementRunner:
         active_scene = self.scene if scene is None else scene
         base_intrinsics = active_scene.intrinsics_ref if isinstance(active_scene.intrinsics_ref, torch.Tensor) else active_scene.intrinsics
         patch_intrinsics = base_intrinsics.detach().clone()
-        patch_intrinsics[..., 2] -= patch_windows_ref[..., 1].to(dtype=patch_intrinsics.dtype)
-        patch_intrinsics[..., 3] -= patch_windows_ref[..., 0].to(dtype=patch_intrinsics.dtype)
+        # `patch_windows_ref` 可能来自 CPU diagnostics 路径.
+        # 这里必须显式对齐到 intrinsics 所在设备,否则 warm-start 的
+        # `Stage 2B` 在 CUDA scene 下会因为跨设备减法直接报错.
+        patch_offsets = patch_windows_ref.to(device=patch_intrinsics.device, dtype=patch_intrinsics.dtype)
+        patch_intrinsics[..., 2] -= patch_offsets[..., 1]
+        patch_intrinsics[..., 3] -= patch_offsets[..., 0]
         return patch_intrinsics
 
     def render_patch_prediction(
@@ -772,40 +1362,314 @@ class RefinementRunner:
 
         loss_patch_rgb = torch.zeros((), dtype=reference_tensor.dtype, device=reference_tensor.device)
         loss_patch_perceptual = torch.zeros((), dtype=reference_tensor.dtype, device=reference_tensor.device)
+        self.last_sr_patch_sets_used = 0
         if not self._patch_supervision_configured():
             return loss_patch_rgb, loss_patch_perceptual
 
         active_scene = self.scene if scene is None else scene
-        patch_windows_native = self.sample_patch_windows(residual_map, scene=active_scene)
-        pred_patch, reference_patch, _ = self.render_patch_prediction(patch_windows_native, scene=active_scene)
-        patch_windows_ref = self.map_patch_windows_to_reference(patch_windows_native, scene=active_scene)
-
         active_weight_map = self.prev_weight_map if native_weight_map is None else native_weight_map
         if active_weight_map is None:
             active_weight_map = torch.ones_like(residual_map)
         elif active_weight_map.device != residual_map.device or active_weight_map.dtype != residual_map.dtype:
             active_weight_map = active_weight_map.to(device=residual_map.device, dtype=residual_map.dtype)
-        robust_patch_native = self._gather_tensor_patch(active_weight_map, patch_windows_native)
-        robust_patch = self._resize_patch_tensor(robust_patch_native, pred_patch.shape[-2:])
 
         active_sr_selection = self.sr_selection_map if sr_selection_map is None else sr_selection_map
-        if active_sr_selection is None:
-            sr_selection_patch = torch.ones_like(robust_patch)
-        else:
-            if active_sr_selection.device != pred_patch.device or active_sr_selection.dtype != pred_patch.dtype:
-                active_sr_selection = active_sr_selection.to(device=pred_patch.device, dtype=pred_patch.dtype)
-            sr_selection_patch = self._gather_tensor_patch(active_sr_selection, patch_windows_ref).to(
+        patch_window_sets = self.sample_sr_patch_window_sets(
+            residual_map,
+            native_weight_map=active_weight_map,
+            sr_selection_map=active_sr_selection,
+            scene=active_scene,
+        )
+        self.last_sr_patch_sets_used = int(patch_window_sets.shape[0])
+
+        for patch_windows_native in patch_window_sets:
+            pred_patch, reference_patch, _ = self.render_patch_prediction(patch_windows_native, scene=active_scene)
+            patch_windows_ref = self.map_patch_windows_to_reference(patch_windows_native, scene=active_scene)
+
+            robust_patch_native = self._gather_tensor_patch(active_weight_map, patch_windows_native)
+            robust_patch = self._resize_patch_tensor(robust_patch_native, pred_patch.shape[-2:]).to(
                 device=pred_patch.device,
                 dtype=pred_patch.dtype,
             )
 
-        patch_weights = self.weight_builder.combine_sr_weights(
-            robust_patch.to(device=pred_patch.device, dtype=pred_patch.dtype),
-            sr_selection_patch,
-        )
-        loss_patch_rgb = compute_weighted_rgb_loss(pred_patch, reference_patch, patch_weights)
-        loss_patch_perceptual = compute_patch_perceptual_loss(pred_patch, reference_patch)
+            if active_sr_selection is None:
+                # warm-start resume 可能还没有恢复 `sr_selection_map`.
+                # fallback 权重也必须落在 patch render 的设备上,否则后续组合权重会再次跨设备报错.
+                sr_selection_patch = torch.ones_like(robust_patch, device=pred_patch.device, dtype=pred_patch.dtype)
+            else:
+                if active_sr_selection.device != pred_patch.device or active_sr_selection.dtype != pred_patch.dtype:
+                    active_sr_selection = active_sr_selection.to(device=pred_patch.device, dtype=pred_patch.dtype)
+                sr_selection_patch = self._gather_tensor_patch(active_sr_selection, patch_windows_ref).to(
+                    device=pred_patch.device,
+                    dtype=pred_patch.dtype,
+                )
+
+            patch_weights = self.weight_builder.combine_sr_weights(
+                robust_patch,
+                sr_selection_patch,
+            )
+            loss_patch_rgb = loss_patch_rgb + compute_weighted_rgb_loss(pred_patch, reference_patch, patch_weights)
+            loss_patch_perceptual = loss_patch_perceptual + compute_patch_perceptual_loss(pred_patch, reference_patch)
+
+        patch_set_denominator = max(1, int(patch_window_sets.shape[0]))
+        loss_patch_rgb = loss_patch_rgb / patch_set_denominator
+        loss_patch_perceptual = loss_patch_perceptual / patch_set_denominator
         return loss_patch_rgb, loss_patch_perceptual
+
+    def _run_stage3sr_full_frame_hr(
+        self,
+        *,
+        stage_name: str,
+        export_file_name: str,
+    ) -> dict[str, Any]:
+        """运行 `Phase C` 风格的 full-frame HR supervision.
+
+        当前最小版坚持两层语义:
+        1. SR 6 视频是 reference 分辨率主监督
+        2. native LR 退成 HR output 的下采样一致性约束
+        """
+
+        self._ensure_depth_anchor_reference(stage_name)
+        self.current_stage = stage_name
+        self.gaussians.freeze_for_stage("stage3sr")
+        optimizer = self.gaussians.build_optimizer("stage3sr", self.hparams)
+        self.last_sr_patch_sets_used = 0
+
+        final_metrics: dict[str, Any] = {}
+        use_depth_anchor = self._stage_uses_depth_anchor(stage_name)
+        for iter_idx in range(self.hparams.iters_stage2a):
+            optimizer.zero_grad(set_to_none=True)
+
+            # Phase C 的 native render 只负责:
+            # 1. 构造 residual / robust weight
+            # 2. 提供 sampling-smooth 的可见性统计
+            # 如果当前没有启用 depth anchor, 这条分支本身不需要参与反传.
+            # 提前关掉 autograd, 可以避免 native 图和 HR 图同时常驻显存.
+            if use_depth_anchor:
+                render_output = self.render_current_scene()
+            else:
+                with torch.no_grad():
+                    render_output = self.render_current_scene()
+            pred_rgb_native = render_output["images_pred"]
+            render_meta = self._extract_render_meta(render_output)
+            self.latest_render_meta = render_meta
+
+            gt_rgb = self._get_gt_images(device=pred_rgb_native.device, dtype=pred_rgb_native.dtype)
+            gt_rgb_cpu = gt_rgb.detach().cpu()
+            residual_map_native = self.weight_builder.build_residual_map(pred_rgb_native, gt_rgb)
+            previous_weight_map = self.prev_weight_map
+            if isinstance(previous_weight_map, torch.Tensor):
+                previous_weight_map = previous_weight_map.to(device=pred_rgb_native.device, dtype=pred_rgb_native.dtype)
+            self.prev_weight_map = self.weight_builder.build_weight_map(residual_map_native, previous_weight_map)
+
+            loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
+            loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
+            if use_depth_anchor:
+                loss_depth_anchor, depth_anchor_valid_ratio, depth_anchor_skip_reason = self._compute_depth_anchor_loss_for_view_range(
+                    render_output.get("depths_pred"),
+                    start_index=0,
+                    end_index=self.scene.gt_images.shape[1],
+                )
+            else:
+                loss_depth_anchor = torch.zeros((), dtype=pred_rgb_native.dtype, device=pred_rgb_native.device)
+                depth_anchor_valid_ratio = 0.0
+                depth_anchor_skip_reason = None
+
+            native_metrics = self._summarize_prediction(
+                pred_rgb_native,
+                residual_map=residual_map_native,
+                weight_map=self.prev_weight_map,
+                gt_rgb=gt_rgb,
+            )
+            loss_sampling_smooth = compute_sampling_smooth_loss(
+                scales=self.gaussians.scales,
+                fidelity_score=self.gaussian_fidelity_score,
+                render_meta=render_meta,
+                radius_threshold=self.hparams.sampling_radius_threshold,
+            )
+            base_loss = (
+                self.hparams.lambda_scale_tail * loss_scale
+                + self.hparams.lambda_opacity_sparse * loss_opacity
+                + self.hparams.lambda_depth_anchor * loss_depth_anchor
+                + self.hparams.lambda_sampling_smooth * loss_sampling_smooth
+            )
+            base_loss.backward()
+
+            del render_output
+            if not use_depth_anchor:
+                del pred_rgb_native
+
+            reference_scene = self._build_reference_render_scene()
+            total_views = max(1, int(reference_scene.gt_images.shape[1]))
+            loss_hr_rgb_value = 0.0
+            loss_lr_consistency_value = 0.0
+            pred_rgb_hr_cpu_shards: list[torch.Tensor] = []
+            pred_rgb_lr_cpu_shards: list[torch.Tensor] = []
+            reference_rgb_cpu_shards: list[torch.Tensor] = []
+            hr_residual_cpu_shards: list[torch.Tensor] = []
+            lr_residual_cpu_shards: list[torch.Tensor] = []
+            hr_weight_cpu_shards: list[torch.Tensor] = []
+
+            for shard_payload in self._iter_scene_single_device_view_shards(
+                reference_scene,
+                views_per_shard=self.hparams.reference_render_shard_views,
+            ):
+                start_index = int(shard_payload["start_index"])
+                end_index = int(shard_payload["end_index"])
+                shard_scene = shard_payload["scene"]
+                shard_output = shard_payload["output"]
+                pred_rgb_hr_shard = shard_output["images_pred"]
+                reference_rgb_shard = self._get_reference_images(
+                    shard_scene,
+                    device=pred_rgb_hr_shard.device,
+                    dtype=pred_rgb_hr_shard.dtype,
+                )
+                residual_map_native_shard = self._slice_view_tensor(
+                    residual_map_native,
+                    start_index,
+                    end_index,
+                    device=pred_rgb_hr_shard.device,
+                    dtype=pred_rgb_hr_shard.dtype,
+                )
+                lr_weight_map_shard = self._slice_view_tensor(
+                    self.prev_weight_map,
+                    start_index,
+                    end_index,
+                    device=pred_rgb_hr_shard.device,
+                    dtype=pred_rgb_hr_shard.dtype,
+                )
+                sr_selection_map_shard = self._slice_view_tensor(
+                    self.sr_selection_map,
+                    start_index,
+                    end_index,
+                    device=pred_rgb_hr_shard.device,
+                    dtype=pred_rgb_hr_shard.dtype,
+                )
+                gt_rgb_shard = self._slice_view_tensor(
+                    gt_rgb,
+                    start_index,
+                    end_index,
+                    device=pred_rgb_hr_shard.device,
+                    dtype=pred_rgb_hr_shard.dtype,
+                )
+                if residual_map_native_shard is None or lr_weight_map_shard is None or gt_rgb_shard is None:
+                    raise RuntimeError("Phase C full-frame HR shard preparation should never return None tensors.")
+
+                hr_weight_map_shard = self._build_reference_supervision_weight_map(
+                    residual_map_native_shard,
+                    native_weight_map=lr_weight_map_shard,
+                    sr_selection_map=sr_selection_map_shard,
+                    scene=shard_scene,
+                )
+                if hr_weight_map_shard is None:
+                    hr_weight_map_shard = torch.ones(
+                        reference_rgb_shard.shape[0],
+                        reference_rgb_shard.shape[1],
+                        1,
+                        reference_rgb_shard.shape[-2],
+                        reference_rgb_shard.shape[-1],
+                        device=pred_rgb_hr_shard.device,
+                        dtype=pred_rgb_hr_shard.dtype,
+                    )
+                else:
+                    hr_weight_map_shard = hr_weight_map_shard.to(device=pred_rgb_hr_shard.device, dtype=pred_rgb_hr_shard.dtype)
+
+                loss_hr_rgb_shard = compute_weighted_rgb_loss(pred_rgb_hr_shard, reference_rgb_shard, hr_weight_map_shard)
+                pred_rgb_lr_shard = downsample_rgb_tensor(pred_rgb_hr_shard, gt_rgb_shard.shape[-2:])
+                loss_lr_consistency_shard = compute_weighted_rgb_loss(pred_rgb_lr_shard, gt_rgb_shard, lr_weight_map_shard)
+
+                shard_view_fraction = float(end_index - start_index) / float(total_views)
+                shard_loss_total = shard_view_fraction * (
+                    self.hparams.lambda_hr_rgb * loss_hr_rgb_shard
+                    + self.hparams.lambda_lr_consistency * loss_lr_consistency_shard
+                )
+                shard_loss_total.backward()
+
+                loss_hr_rgb_value += float(loss_hr_rgb_shard.item()) * shard_view_fraction
+                loss_lr_consistency_value += float(loss_lr_consistency_shard.item()) * shard_view_fraction
+                pred_rgb_hr_cpu_shards.append(pred_rgb_hr_shard.detach().cpu())
+                pred_rgb_lr_cpu_shards.append(pred_rgb_lr_shard.detach().cpu())
+                reference_rgb_cpu_shards.append(reference_rgb_shard.detach().cpu())
+                hr_residual_cpu_shards.append(
+                    self.weight_builder.build_residual_map(pred_rgb_hr_shard, reference_rgb_shard).detach().cpu()
+                )
+                lr_residual_cpu_shards.append(
+                    self.weight_builder.build_residual_map(pred_rgb_lr_shard, gt_rgb_shard).detach().cpu()
+                )
+                hr_weight_cpu_shards.append(hr_weight_map_shard.detach().cpu())
+
+                del shard_output
+                del pred_rgb_hr_shard
+                del reference_rgb_shard
+                del hr_weight_map_shard
+                del pred_rgb_lr_shard
+                del gt_rgb_shard
+
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            self.gaussians.clamp_stage_constraints("stage3sr", self.hparams)
+
+            pred_rgb_hr_cpu = torch.cat(pred_rgb_hr_cpu_shards, dim=1)
+            pred_rgb_lr_cpu = torch.cat(pred_rgb_lr_cpu_shards, dim=1)
+            reference_rgb_cpu = torch.cat(reference_rgb_cpu_shards, dim=1)
+            hr_residual_map = torch.cat(hr_residual_cpu_shards, dim=1)
+            lr_residual_map = torch.cat(lr_residual_cpu_shards, dim=1)
+            hr_weight_map = torch.cat(hr_weight_cpu_shards, dim=1)
+            loss_total_value = (
+                self.hparams.lambda_hr_rgb * loss_hr_rgb_value
+                + self.hparams.lambda_lr_consistency * loss_lr_consistency_value
+                + self.hparams.lambda_scale_tail * float(loss_scale.item())
+                + self.hparams.lambda_opacity_sparse * float(loss_opacity.item())
+                + self.hparams.lambda_depth_anchor * float(loss_depth_anchor.item())
+                + self.hparams.lambda_sampling_smooth * float(loss_sampling_smooth.item())
+            )
+            final_metrics = self._summarize_prediction(
+                pred_rgb_lr_cpu,
+                residual_map=lr_residual_map,
+                weight_map=self.prev_weight_map,
+                gt_rgb=gt_rgb_cpu,
+            )
+            final_metrics.update(
+                {
+                    "loss_total": loss_total_value,
+                    "loss_hr_rgb": loss_hr_rgb_value,
+                    "loss_lr_consistency": loss_lr_consistency_value,
+                    "loss_scale_tail": float(loss_scale.item()),
+                    "loss_opacity_sparse": float(loss_opacity.item()),
+                    "loss_sampling_smooth": float(loss_sampling_smooth.item()),
+                    "stage3sr_supervision_mode": "full_frame_hr",
+                    "psnr_hr": self._compute_psnr(pred_rgb_hr_cpu, reference_rgb_cpu),
+                    "sharpness_hr": self._compute_sharpness(pred_rgb_hr_cpu),
+                    "residual_mean_hr": float(hr_residual_map.mean().item()),
+                    "weight_mean_hr": float(hr_weight_map.mean().item()),
+                    "psnr_native_render": native_metrics["psnr"],
+                    "sharpness_native_render": native_metrics["sharpness"],
+                    "residual_mean_native_render": native_metrics.get("residual_mean", 0.0),
+                }
+            )
+            if use_depth_anchor:
+                final_metrics.update(
+                    self._build_depth_anchor_metrics(
+                        stage_name=stage_name,
+                        loss_value=float(loss_depth_anchor.item()),
+                        valid_ratio=depth_anchor_valid_ratio,
+                        skip_reason=depth_anchor_skip_reason,
+                    )
+                )
+
+            self._log_and_maybe_save(stage_name, final_metrics, lr_residual_map, self.prev_weight_map, iter_idx=iter_idx)
+
+            stage_history = self.diagnostics.stage_history.get(stage_name, [])
+            if self.controller.should_stop_stage(stage_name, stage_history):
+                break
+
+        self._safe_export_ply(export_file_name)
+        self.diagnostics_state["stage3sr_completed"] = True
+        self.diagnostics_state["stage3sr_supervision_mode"] = "full_frame_hr"
+        self.diagnostics_state["phase_reached"] = stage_name
+        self.diagnostics_state["global_shift_detected"] = False
+        self._update_stage2b_diagnostics(final_metrics)
+        return final_metrics
 
     def _summarize_prediction(
         self,
@@ -829,6 +1693,25 @@ class RefinementRunner:
         if weight_map is not None:
             summary.update(self.weight_builder.summarize_weight_stats(weight_map))
         return summary
+
+    def _summarize_reference_prediction(
+        self,
+        pred_rgb_hr: torch.Tensor,
+        scene: SceneBundle | None = None,
+    ) -> dict[str, Any]:
+        """汇总 reference-space 的 HR 指标.
+
+        这里故意不复用 native 命名.
+        这样最终 diagnostics 能直接把 `native-space` 和 `hr-space` 区分开.
+        """
+
+        reference_rgb = self._get_reference_images(scene, device=pred_rgb_hr.device, dtype=pred_rgb_hr.dtype)
+        hr_residual_map = self.weight_builder.build_residual_map(pred_rgb_hr, reference_rgb)
+        return {
+            "psnr_hr": self._compute_psnr(pred_rgb_hr, reference_rgb),
+            "sharpness_hr": self._compute_sharpness(pred_rgb_hr),
+            "residual_mean_hr": float(hr_residual_map.mean().item()),
+        }
 
     def _update_stage2b_diagnostics(self, final_metrics: dict[str, Any]) -> None:
         """把 Stage 2A 的结束状态压成是否进入 Stage 2B 的证据."""
@@ -945,6 +1828,7 @@ class RefinementRunner:
                         "end_index": shard_payload["end_index"],
                         "scene": shard_scene,
                         "pred_rgb": pred_rgb_shard,
+                        "pred_depth": shard_output.get("depths_pred"),
                         "residual_map": residual_map_shard,
                         "render_meta": render_meta_shard,
                     }
@@ -958,9 +1842,13 @@ class RefinementRunner:
             self.latest_render_meta = self._merge_render_meta_shards(render_meta_cpu_shards)
 
             loss_rgb_value = 0.0
+            loss_depth_anchor_value = 0.0
             loss_patch_rgb_value = 0.0
             loss_patch_perceptual_value = 0.0
             loss_sampling_smooth_value = 0.0
+            depth_anchor_valid_ratio_value = 0.0
+            depth_anchor_any_active = False
+            depth_anchor_skip_reasons: set[str] = set()
 
             for shard_record in shard_records:
                 start_index = int(shard_record["start_index"])
@@ -969,6 +1857,7 @@ class RefinementRunner:
                 pred_rgb_shard = shard_record["pred_rgb"]
                 residual_map_shard = shard_record["residual_map"]
                 render_meta_shard = shard_record["render_meta"]
+                pred_depth_shard = shard_record.get("pred_depth")
                 shard_view_fraction = float(end_index - start_index) / float(total_views)
 
                 weight_map_shard = self._slice_view_tensor(
@@ -984,6 +1873,20 @@ class RefinementRunner:
                 loss_rgb = compute_weighted_rgb_loss(pred_rgb_shard, shard_scene.gt_images, weight_map_shard)
                 shard_loss_total = shard_view_fraction * loss_rgb
                 loss_rgb_value += float(loss_rgb.item()) * shard_view_fraction
+
+                if self._stage_uses_depth_anchor(stage_name):
+                    loss_depth_anchor, depth_valid_ratio, depth_skip_reason = self._compute_depth_anchor_loss_for_view_range(
+                        pred_depth_shard,
+                        start_index=start_index,
+                        end_index=end_index,
+                    )
+                    shard_loss_total = shard_loss_total + shard_view_fraction * self.hparams.lambda_depth_anchor * loss_depth_anchor
+                    loss_depth_anchor_value += float(loss_depth_anchor.item()) * shard_view_fraction
+                    depth_anchor_valid_ratio_value += depth_valid_ratio * shard_view_fraction
+                    if depth_skip_reason is None:
+                        depth_anchor_any_active = True
+                    else:
+                        depth_anchor_skip_reasons.add(depth_skip_reason)
 
                 if include_patch_supervision:
                     sr_selection_map_shard = self._slice_view_tensor(
@@ -1044,6 +1947,7 @@ class RefinementRunner:
                         loss_rgb_value
                         + self.hparams.lambda_scale_tail * float(loss_scale.item())
                         + self.hparams.lambda_opacity_sparse * float(loss_opacity.item())
+                        + self.hparams.lambda_depth_anchor * loss_depth_anchor_value
                         + self.hparams.lambda_patch_rgb * loss_patch_rgb_value
                         + self.hparams.lambda_patch_perceptual * loss_patch_perceptual_value
                         + self.hparams.lambda_sampling_smooth * loss_sampling_smooth_value
@@ -1051,14 +1955,25 @@ class RefinementRunner:
                     "loss_rgb_weighted": loss_rgb_value,
                     "loss_scale_tail": float(loss_scale.item()),
                     "loss_opacity_sparse": float(loss_opacity.item()),
-                }
-            )
+                    }
+                )
+            if self._stage_uses_depth_anchor(stage_name):
+                depth_skip_reason = None if depth_anchor_any_active else ",".join(sorted(depth_anchor_skip_reasons)) or "reference_unavailable"
+                final_metrics.update(
+                    self._build_depth_anchor_metrics(
+                        stage_name=stage_name,
+                        loss_value=loss_depth_anchor_value,
+                        valid_ratio=depth_anchor_valid_ratio_value,
+                        skip_reason=depth_skip_reason,
+                    )
+                )
             if include_patch_supervision:
                 final_metrics.update(
                     {
                         "loss_patch_rgb": loss_patch_rgb_value,
                         "loss_patch_perceptual": loss_patch_perceptual_value,
                         "loss_sampling_smooth": loss_sampling_smooth_value,
+                        "sr_patch_sets_used": int(self.last_sr_patch_sets_used),
                     }
                 )
 
@@ -1100,6 +2015,7 @@ class RefinementRunner:
         - 是否允许 pruning
         """
 
+        self._ensure_depth_anchor_reference(stage_name)
         if self._use_multi_device_render(self.scene):
             return self._run_appearance_stage_multi_device(
                 stage_name=stage_name,
@@ -1128,6 +2044,16 @@ class RefinementRunner:
             loss_rgb = compute_weighted_rgb_loss(pred_rgb, gt_rgb, self.prev_weight_map)
             loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
             loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
+            if self._stage_uses_depth_anchor(stage_name):
+                loss_depth_anchor, depth_anchor_valid_ratio, depth_anchor_skip_reason = self._compute_depth_anchor_loss_for_view_range(
+                    render_output.get("depths_pred"),
+                    start_index=0,
+                    end_index=self.scene.gt_images.shape[1],
+                )
+            else:
+                loss_depth_anchor = torch.zeros((), dtype=loss_rgb.dtype, device=loss_rgb.device)
+                depth_anchor_valid_ratio = 0.0
+                depth_anchor_skip_reason = None
             if include_patch_supervision:
                 loss_patch_rgb, loss_patch_perceptual = self._compute_patch_losses(residual_map, loss_rgb)
                 loss_sampling_smooth = compute_sampling_smooth_loss(
@@ -1141,7 +2067,12 @@ class RefinementRunner:
                 loss_patch_perceptual = torch.zeros((), dtype=loss_rgb.dtype, device=loss_rgb.device)
                 loss_sampling_smooth = torch.zeros((), dtype=loss_rgb.dtype, device=loss_rgb.device)
 
-            loss_total = loss_rgb + self.hparams.lambda_scale_tail * loss_scale + self.hparams.lambda_opacity_sparse * loss_opacity
+            loss_total = (
+                loss_rgb
+                + self.hparams.lambda_scale_tail * loss_scale
+                + self.hparams.lambda_opacity_sparse * loss_opacity
+                + self.hparams.lambda_depth_anchor * loss_depth_anchor
+            )
             if include_patch_supervision:
                 loss_total = (
                     loss_total
@@ -1169,12 +2100,22 @@ class RefinementRunner:
                     "loss_opacity_sparse": float(loss_opacity.item()),
                 }
             )
+            if self._stage_uses_depth_anchor(stage_name):
+                final_metrics.update(
+                    self._build_depth_anchor_metrics(
+                        stage_name=stage_name,
+                        loss_value=float(loss_depth_anchor.item()),
+                        valid_ratio=depth_anchor_valid_ratio,
+                        skip_reason=depth_anchor_skip_reason,
+                    )
+                )
             if include_patch_supervision:
                 final_metrics.update(
                     {
                         "loss_patch_rgb": float(loss_patch_rgb.item()),
                         "loss_patch_perceptual": float(loss_patch_perceptual.item()),
                         "loss_sampling_smooth": float(loss_sampling_smooth.item()),
+                        "sr_patch_sets_used": int(self.last_sr_patch_sets_used),
                     }
                 )
 
@@ -1234,14 +2175,23 @@ class RefinementRunner:
         residual_map = self.weight_builder.build_residual_map(pred_rgb, gt_rgb)
         render_meta = self._extract_render_meta(render_output)
 
-        fidelity_score = self.weight_builder.compute_gaussian_fidelity_score(render_meta)
-        if fidelity_score is None:
+        fidelity_diagnostics = self.weight_builder.compute_gaussian_fidelity_diagnostics(render_meta)
+        if fidelity_diagnostics is None:
             fidelity_score = self._build_default_fidelity_score()
             self.diagnostics_state.setdefault("warnings", []).append("phase3s_missing_render_meta")
+            self.gaussian_fidelity_diagnostics = None
+        else:
+            fidelity_score = fidelity_diagnostics["fidelity_score"]
+            self.gaussian_fidelity_diagnostics = {
+                key: value.detach().cpu()
+                for key, value in fidelity_diagnostics.items()
+                if isinstance(value, torch.Tensor)
+            }
 
         sr_selection_map = self.weight_builder.build_sr_selection_weight(
             render_meta=render_meta,
             fidelity_score=fidelity_score,
+            fidelity_diagnostics=fidelity_diagnostics,
             native_hw=self.scene.gt_images.shape[-2:],
             output_hw=self._get_reference_images().shape[-2:],
         )
@@ -1254,9 +2204,15 @@ class RefinementRunner:
 
         metrics = self._summarize_prediction(pred_rgb, residual_map=residual_map, weight_map=self.prev_weight_map, gt_rgb=gt_rgb)
         metrics.update(self.weight_builder.summarize_fidelity_stats(fidelity_score))
+        metrics.update(self.weight_builder.summarize_fidelity_diagnostics(fidelity_diagnostics))
         metrics["sr_selection_mean"] = float(sr_selection_map.mean().item())
         self._log_and_maybe_save("phase3s", metrics, residual_map, self.prev_weight_map, iter_idx=0)
-        self._write_phase3s_artifacts("phase3s", fidelity_score, sr_selection_map)
+        self._write_phase3s_artifacts(
+            "phase3s",
+            fidelity_score,
+            sr_selection_map,
+            fidelity_diagnostics=fidelity_diagnostics,
+        )
 
         self.diagnostics_state["phase3s_completed"] = True
         self.diagnostics_state["phase_reached"] = "phase3s"
@@ -1268,12 +2224,22 @@ class RefinementRunner:
         stage_name: str = "stage3sr",
         export_file_name: str = "gaussians_stage3sr.ply",
     ) -> dict[str, Any]:
-        """运行 selective SR patch supervision 的最小闭环."""
+        """运行 Stage 3SR.
 
-        if not self._patch_supervision_configured():
-            raise RuntimeError("Stage 3SR requires patch supervision to be enabled.")
+        当前这里会在 patch 模式和 `Phase C` full-frame HR 模式之间择一.
+        """
+
+        supervision_mode = self._resolve_stage3sr_supervision_mode()
+        if supervision_mode == "none":
+            raise RuntimeError("Stage 3SR requires either patch supervision or full-frame HR supervision.")
         if not self.diagnostics_state.get("phase3s_completed", False):
             self.run_phase3s_build_sr_selection()
+
+        if supervision_mode == "full_frame_hr":
+            return self._run_stage3sr_full_frame_hr(
+                stage_name=stage_name,
+                export_file_name=export_file_name,
+            )
 
         final_metrics = self._run_appearance_stage(
             stage_name=stage_name,
@@ -1283,6 +2249,7 @@ class RefinementRunner:
         )
         self._safe_export_ply(export_file_name)
         self.diagnostics_state["stage3sr_completed"] = True
+        self.diagnostics_state["stage3sr_supervision_mode"] = "patch"
         self.diagnostics_state["phase_reached"] = stage_name
         self.diagnostics_state["global_shift_detected"] = False
         self._update_stage2b_diagnostics(final_metrics)
@@ -1325,6 +2292,7 @@ class RefinementRunner:
                 "loss_opacity_sparse": float(loss_opacity.item()),
                 "loss_patch_rgb": float(loss_patch_rgb.item()),
                 "loss_patch_perceptual": float(loss_patch_perceptual.item()),
+                "sr_patch_sets_used": int(self.last_sr_patch_sets_used),
             }
         )
 
@@ -1376,6 +2344,17 @@ class RefinementRunner:
         # 在 Phase 0 就立刻落盘,后面无论 stop 在哪一阶段都能拿到 before 结果.
         self._export_rgb_artifacts("baseline_render", pred_rgb)
         self._export_rgb_artifacts("gt_reference", self._get_gt_images().detach().cpu())
+
+        # 只有 reference 分辨率真的高于 native 时, 才补 `Phase D` 的 HR 产物.
+        # 这样不会把 native-reference 场景的人为塞进一套重复导出.
+        if not self._reference_space_enabled():
+            return
+
+        baseline_hr_render_output = self._render_reference_scene_for_evaluation()
+        baseline_pred_rgb_hr = baseline_hr_render_output["images_pred"]
+        self._export_rgb_artifacts("baseline_render_hr", baseline_pred_rgb_hr)
+        self._export_rgb_artifacts("gt_reference_hr", self._get_reference_images(device=torch.device("cpu")))
+        self.diagnostics_state["baseline_hr"] = self._summarize_reference_prediction(baseline_pred_rgb_hr)
 
     def _log_and_maybe_save(
         self,
@@ -1454,8 +2433,8 @@ class RefinementRunner:
         现在它内部会按新的边界拆成:
         1. native cleanup
         2. Phase 3S
-        3. selective SR patch
-        如果当前没有启用 patch supervision,则只执行 native cleanup.
+        3. Stage 3SR supervision
+        如果当前没有启用任何 Stage 3SR supervision,则只执行 native cleanup.
         """
 
         resolved_mode = self._resolve_stage2a_mode()
@@ -1466,8 +2445,8 @@ class RefinementRunner:
             export_file_name="gaussians_stage2a.ply",
         )
         if resolved_mode == "legacy":
-            if self.run_config.stage2a_mode == "legacy" and self._patch_supervision_configured():
-                self.diagnostics_state.setdefault("warnings", []).append("stage2a_mode_legacy_skipped_patch_supervision")
+            if self.run_config.stage2a_mode == "legacy" and self._stage3sr_supervision_configured():
+                self.diagnostics_state.setdefault("warnings", []).append("stage2a_mode_legacy_skipped_stage3sr_supervision")
             self._update_stage2b_diagnostics(final_metrics)
             return final_metrics
 
@@ -1531,6 +2510,7 @@ class RefinementRunner:
                     "loss_patch_perceptual": float(loss_patch_perceptual.item()),
                     "loss_means_anchor": float(loss_means_anchor.item()),
                     "loss_rotation_reg": float(loss_rotation_reg.item()),
+                    "sr_patch_sets_used": int(self.last_sr_patch_sets_used),
                 }
             )
             self._log_and_maybe_save("stage2b", final_metrics, residual_map, self.prev_weight_map, iter_idx=iter_idx)
@@ -1649,16 +2629,21 @@ class RefinementRunner:
     def _build_final_summary(
         self,
         final_metrics: dict[str, Any],
+        *,
+        final_hr_metrics: dict[str, Any] | None = None,
         override_stop_reason: str | None = None,
     ) -> dict[str, Any]:
         """构建最终 diagnostics 摘要."""
 
         baseline = self.diagnostics_state.get("baseline", {})
-        return {
+        baseline_hr = self.diagnostics_state.get("baseline_hr")
+        summary = {
             "scene_id": self.scene.scene_index,
             "view_id": self.scene.view_id,
             "view_ids": list(self.scene.view_ids) if self.scene.view_ids is not None else None,
             "start_stage": self.run_config.start_stage,
+            "native_hw": list(self.scene.native_hw),
+            "reference_hw": list(self.scene.reference_hw) if self.scene.reference_hw is not None else None,
             "phase_reached": self.diagnostics_state.get("phase_reached", self.current_stage),
             "stopped_reason": override_stop_reason or self.controller.summarize_stop_reason(self.diagnostics_state),
             "used_pose_refinement": self.diagnostics_state.get("used_pose_refinement", False),
@@ -1667,12 +2652,40 @@ class RefinementRunner:
             "baseline": baseline,
             "final": final_metrics,
             "artifacts": dict(self.visual_artifacts),
+            "depth_anchor": {
+                "enabled": self.diagnostics_state.get("depth_anchor_enabled", False),
+                "weight": self.diagnostics_state.get("depth_anchor_weight", 0.0),
+                "source": self.diagnostics_state.get("depth_anchor_source"),
+                "reference_ready": self.diagnostics_state.get("depth_anchor_reference_ready", False),
+                "reference_valid_ratio": self.diagnostics_state.get("depth_anchor_reference_valid_ratio", 0.0),
+                "reference_skip_reason": self.diagnostics_state.get("depth_anchor_reference_skip_reason"),
+                "last_skip_reason": self.diagnostics_state.get("depth_anchor_last_skip_reason"),
+                "last_valid_ratio": self.diagnostics_state.get("depth_anchor_last_valid_ratio", 0.0),
+                "last_loss": self.diagnostics_state.get("depth_anchor_last_loss", 0.0),
+            },
             "deltas": {
                 "psnr_gain": float(final_metrics.get("psnr", 0.0) - baseline.get("psnr", 0.0)),
                 "sharpness_gain": float(final_metrics.get("sharpness", 0.0) - baseline.get("sharpness", 0.0)),
                 "scale_tail_drop": float(baseline.get("scale_tail_ratio", 0.0) - final_metrics.get("scale_tail_ratio", 0.0)),
             },
         }
+        if isinstance(baseline_hr, dict):
+            summary["baseline_hr"] = baseline_hr
+        if isinstance(final_hr_metrics, dict):
+            summary["final_hr"] = final_hr_metrics
+        if isinstance(baseline_hr, dict) and isinstance(final_hr_metrics, dict):
+            summary["deltas"].update(
+                {
+                    "psnr_gain_hr": float(final_hr_metrics.get("psnr_hr", 0.0) - baseline_hr.get("psnr_hr", 0.0)),
+                    "sharpness_gain_hr": float(
+                        final_hr_metrics.get("sharpness_hr", 0.0) - baseline_hr.get("sharpness_hr", 0.0)
+                    ),
+                    "residual_mean_hr_drop": float(
+                        baseline_hr.get("residual_mean_hr", 0.0) - final_hr_metrics.get("residual_mean_hr", 0.0)
+                    ),
+                }
+            )
+        return summary
 
     def export_final_outputs(
         self,
@@ -1686,6 +2699,16 @@ class RefinementRunner:
         final_render_output = self._render_scene_for_evaluation(self.scene)
         final_pred_rgb = final_render_output["images_pred"]
         self._export_rgb_artifacts("final_render", final_pred_rgb)
+        final_hr_metrics: dict[str, Any] | None = None
+
+        # `Phase D` 的最小交付是:
+        # native after 继续保留
+        # reference-space after 额外补出
+        if self._reference_space_enabled():
+            final_hr_render_output = self._render_reference_scene_for_evaluation()
+            final_pred_rgb_hr = final_hr_render_output["images_pred"]
+            self._export_rgb_artifacts("final_render_hr", final_pred_rgb_hr)
+            final_hr_metrics = self._summarize_reference_prediction(final_pred_rgb_hr)
 
         save_state(
             self.diagnostics.state_dir,
@@ -1695,7 +2718,11 @@ class RefinementRunner:
             diagnostics_state=self.diagnostics_state,
             pose_delta=self.pose_delta,
         )
-        summary = self._build_final_summary(final_metrics, override_stop_reason=override_stop_reason)
+        summary = self._build_final_summary(
+            final_metrics,
+            final_hr_metrics=final_hr_metrics,
+            override_stop_reason=override_stop_reason,
+        )
         self.diagnostics.finalize(summary)
         return summary
 

@@ -18,6 +18,10 @@ class WeightBuilder:
         weight_tau: float = 0.45,
         weight_floor: float = 0.20,
         ema_decay: float = 0.90,
+        fidelity_ratio_threshold: float = 1.5,
+        fidelity_sigmoid_k: float = 6.0,
+        fidelity_min_views: int = 3,
+        fidelity_opacity_threshold: float = 1e-4,
     ) -> None:
         self.alpha_rgb = alpha_rgb
         self.alpha_perc = alpha_perc
@@ -26,6 +30,10 @@ class WeightBuilder:
         self.weight_tau = weight_tau
         self.weight_floor = weight_floor
         self.ema_decay = ema_decay
+        self.fidelity_ratio_threshold = fidelity_ratio_threshold
+        self.fidelity_sigmoid_k = fidelity_sigmoid_k
+        self.fidelity_min_views = fidelity_min_views
+        self.fidelity_opacity_threshold = fidelity_opacity_threshold
 
     def build_residual_map(self, pred_rgb: torch.Tensor, gt_rgb: torch.Tensor) -> torch.Tensor:
         """从 RGB 预测和 GT 构造逐像素 residual 图."""
@@ -105,53 +113,107 @@ class WeightBuilder:
             return radii.squeeze(-1)
         return radii
 
-    def compute_gaussian_fidelity_score(
+    def _prepare_fidelity_inputs(
         self,
         render_meta: dict[str, torch.Tensor] | None,
-    ) -> torch.Tensor | None:
-        """根据 renderer meta 估计第一版 per-Gaussian fidelity.
-
-        第一版只做最保守的 native support sufficiency:
-        - `radii > 0` 说明当前 view 可见
-        - `tiles_per_gauss` 近似说明投影支撑面积
-        - `opacities` 过滤掉几乎透明的高斯
-        最终按 `max_view` 聚合,优先保护“已经在某个 native view 中被充分支持”的高斯.
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """把 fidelity 需要的 meta 字段整理成统一 shape."""
 
         if render_meta is None:
             return None
 
-        radii = render_meta.get("radii")
+        radii = self._canonicalize_screen_radii(render_meta.get("radii"))
         opacities = render_meta.get("opacities")
-        tiles_per_gauss = render_meta.get("tiles_per_gauss")
-        if not all(isinstance(item, torch.Tensor) for item in [radii, opacities, tiles_per_gauss]):
+        if not isinstance(radii, torch.Tensor) or not isinstance(opacities, torch.Tensor):
             return None
 
-        radii = self._canonicalize_screen_radii(radii)
-        if radii is None:
-            return None
+        radii = radii.detach().float()
         opacities = opacities.detach().float()
-        tiles_per_gauss = tiles_per_gauss.detach().float()
 
         if radii.ndim == 2:
             radii = radii.unsqueeze(0)
         if opacities.ndim == 2:
             opacities = opacities.unsqueeze(0)
-        if tiles_per_gauss.ndim == 2:
-            tiles_per_gauss = tiles_per_gauss.unsqueeze(0)
 
-        if radii.ndim != 3:
+        if radii.ndim != 3 or opacities.shape != radii.shape:
             return None
-        if opacities.shape != radii.shape or tiles_per_gauss.shape != radii.shape:
+        return radii, opacities
+
+    def compute_gaussian_fidelity_diagnostics(
+        self,
+        render_meta: dict[str, torch.Tensor] | None,
+        eps: float = 1e-6,
+    ) -> dict[str, torch.Tensor] | None:
+        """基于跨视图半径统计构造更接近 SplatSuRe 的 fidelity 诊断.
+
+        当前最小实现保留三件核心语义:
+        1. 只统计真正可见的 view
+        2. fidelity 由 `rho = r_max / r_min` 决定
+        3. `num_times_seen < fidelity_min_views` 时直接记为低 fidelity
+        """
+
+        prepared = self._prepare_fidelity_inputs(render_meta)
+        if prepared is None:
             return None
+        radii, opacities = prepared
 
-        visible_mask = (radii > 0).to(dtype=radii.dtype)
-        tile_peak = tiles_per_gauss.amax(dim=1, keepdim=True).clamp(min=1.0)
-        tile_support = (tiles_per_gauss / tile_peak).clamp(0.0, 1.0)
-        opacity_gate = opacities.clamp(0.0, 1.0)
+        finite_mask = torch.isfinite(radii) & torch.isfinite(opacities)
+        visible_mask = finite_mask & (radii > 0) & (opacities > self.fidelity_opacity_threshold)
+        num_times_seen = visible_mask.sum(dim=1)
+        has_support = num_times_seen > 0
 
-        support_view = visible_mask * tile_support * opacity_gate
-        return support_view.amax(dim=1)
+        positive_inf = torch.full_like(radii, float("inf"))
+        negative_inf = torch.full_like(radii, float("-inf"))
+        radii_for_min = torch.where(visible_mask, radii, positive_inf)
+        radii_for_max = torch.where(visible_mask, radii, negative_inf)
+
+        r_min = radii_for_min.amin(dim=1)
+        r_max = radii_for_max.amax(dim=1)
+        r_min = torch.where(has_support, r_min, torch.zeros_like(r_min))
+        r_max = torch.where(has_support, r_max, torch.zeros_like(r_max))
+
+        rho = torch.where(
+            has_support,
+            r_max / r_min.clamp_min(eps),
+            torch.zeros_like(r_max),
+        )
+        fidelity_score = torch.sigmoid((self.fidelity_ratio_threshold - rho) * self.fidelity_sigmoid_k)
+        enough_views = num_times_seen >= self.fidelity_min_views
+        fidelity_score = fidelity_score * enough_views.to(dtype=fidelity_score.dtype)
+
+        argmax_view = radii_for_max.argmax(dim=1)
+        argmax_view = torch.where(has_support, argmax_view, torch.full_like(argmax_view, -1))
+        max_view_mask = visible_mask & torch.isclose(
+            radii,
+            r_max[:, None, :],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+        return {
+            "fidelity_score": fidelity_score.detach(),
+            "r_min": r_min.detach(),
+            "r_max": r_max.detach(),
+            "rho": rho.detach(),
+            "num_times_seen": num_times_seen.detach(),
+            "argmax_view": argmax_view.detach(),
+            "max_view_mask": max_view_mask.detach(),
+        }
+
+    def compute_gaussian_fidelity_score(
+        self,
+        render_meta: dict[str, torch.Tensor] | None,
+    ) -> torch.Tensor | None:
+        """返回 per-Gaussian fidelity score.
+
+        这里保留旧接口,方便 `Stage 3SR` / `L_sampling_smooth` 继续直接消费 tensor.
+        更完整的 `Phase A` 诊断请走 `compute_gaussian_fidelity_diagnostics()`.
+        """
+
+        diagnostics = self.compute_gaussian_fidelity_diagnostics(render_meta)
+        if diagnostics is None:
+            return None
+        return diagnostics["fidelity_score"]
 
     def summarize_fidelity_stats(self, fidelity_score: torch.Tensor | None) -> dict[str, float]:
         """输出 fidelity score 的基础统计."""
@@ -166,12 +228,40 @@ class WeightBuilder:
             "fidelity_std": float(fidelity_score.std(unbiased=False).item()),
         }
 
+    def summarize_fidelity_diagnostics(
+        self,
+        fidelity_diagnostics: dict[str, torch.Tensor] | None,
+    ) -> dict[str, float]:
+        """输出 Phase A 额外需要的跨视图统计."""
+
+        if fidelity_diagnostics is None:
+            return {}
+
+        rho = fidelity_diagnostics.get("rho")
+        num_times_seen = fidelity_diagnostics.get("num_times_seen")
+        max_view_mask = fidelity_diagnostics.get("max_view_mask")
+        if not all(isinstance(item, torch.Tensor) for item in [rho, num_times_seen, max_view_mask]):
+            return {}
+
+        rho = rho.float()
+        num_times_seen = num_times_seen.float()
+        max_view_mask = max_view_mask.float()
+        return {
+            "fidelity_rho_mean": float(rho.mean().item()),
+            "fidelity_rho_max": float(rho.max().item()),
+            "fidelity_num_seen_mean": float(num_times_seen.mean().item()),
+            "fidelity_num_seen_min": float(num_times_seen.min().item()),
+            "fidelity_num_seen_max": float(num_times_seen.max().item()),
+            "fidelity_max_view_ties_mean": float(max_view_mask.sum(dim=1).mean().item()),
+        }
+
     def build_sr_selection_weight(
         self,
         render_meta: dict[str, torch.Tensor] | None,
         fidelity_score: torch.Tensor | None,
         native_hw: tuple[int, int],
         output_hw: tuple[int, int] | None = None,
+        fidelity_diagnostics: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor | None:
         """把 per-Gaussian fidelity 投影成 reference 尺度的选择图.
 
@@ -226,11 +316,20 @@ class WeightBuilder:
         scale_y = float(output_height) / float(native_height)
 
         # 低 fidelity 区域更该吃 SR.
-        # 第一版先用 opacity 进一步压掉几乎透明的投影.
+        # 当前实现优先把低 fidelity Gaussian 投到自己的 max-view 上.
+        # 这样 selection 不会再对所有可见视角平均撒开.
         low_fidelity = (1.0 - fidelity_score).clamp(0.0, 1.0)
         visible_mask = radii > 0
         finite_mask = torch.isfinite(means2d).all(dim=-1)
-        scatter_weight = low_fidelity[:, None, :] * opacities.clamp(0.0, 1.0) * visible_mask.to(dtype=means2d.dtype)
+        scatter_mask = visible_mask
+        if isinstance(fidelity_diagnostics, dict):
+            max_view_mask = fidelity_diagnostics.get("max_view_mask")
+            if isinstance(max_view_mask, torch.Tensor):
+                if max_view_mask.ndim == 2:
+                    max_view_mask = max_view_mask.unsqueeze(0)
+                if max_view_mask.shape == (batch_size, num_views, num_gaussians):
+                    scatter_mask = scatter_mask & max_view_mask.to(device=means2d.device).bool()
+        scatter_weight = low_fidelity[:, None, :] * opacities.clamp(0.0, 1.0) * scatter_mask.to(dtype=means2d.dtype)
         scatter_weight = scatter_weight * finite_mask.to(dtype=means2d.dtype)
 
         means_x = torch.round(means2d[..., 0] * scale_x).long().clamp(0, output_width - 1)

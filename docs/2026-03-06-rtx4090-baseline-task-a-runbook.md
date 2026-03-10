@@ -48,6 +48,44 @@
   - `sr_selection_maps/`
   - `gaussians/gaussians_stage3sr.ply`
 
+### 2.4 阶段命名与成功信号约定
+
+这份手册里最容易让人误会的一点是:
+
+- 命令里会写 `--stop-after stage2a`
+- 但成功后的 `diagnostics.json` 里,常见却是:
+  - `phase_reached = stage3sr`
+
+这不是矛盾。
+
+当前约定是:
+
+- `stage2a`
+  - 对外主线阶段名
+- `Stage 3A -> Phase 3S -> Stage 3SR`
+  - `stage2a` 内部的增强子阶段
+
+因此在本手册这条 `Task A` 路线上:
+
+- `--stop-after stage2a`
+  - 表示先不要继续 `Stage 2B`
+  - 但仍然允许 `stage2a` 内部把 enhanced 链路跑完
+- 如果你启用了:
+  - `--stage2a-mode enhanced`
+  - patch supervision
+  - SR reference
+- 那么成功信号更应理解为:
+  - `phase_reached = stage3sr`
+  - 而不是强行要求 `phase_reached = stage2a`
+
+这轮最该检查的产物也因此是:
+
+- `metrics_stage2a.json`
+- `metrics_phase3s.json`
+- `metrics_stage3sr.json`
+- `gaussians/gaussians_stage3sr.ply`
+- `diagnostics.json`
+
 ## 3. 输入约定
 
 ### 3.1 必需输入
@@ -339,7 +377,8 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
 ### 7.6 为什么先这样跑
 
 - `--stop-after stage2a`
-  - 先只看 `Stage 3SR`
+  - 先把观察范围限制在 `stage2a` 这条对外主线内部
+  - 在当前 enhanced 口径下, 重点其实是看 `Stage 3A -> Phase 3S -> Stage 3SR`
   - 不让 `Stage 2B` 把问题搅混
 - `--frame-indices ...`
   - 先跑稀疏子集
@@ -379,6 +418,8 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
 这版命令已经验证成功, 关键结果为:
 
 - `phase_reached = stage3sr`
+  - 这是符合当前命名约定的正常结果
+  - 因为 `stage2a` 的 enhanced 内部链路已经一路跑到了 `Stage 3SR`
 - `stopped_reason = metrics_plateau`
 - `PSNR: 15.9834 -> 18.4991`
 - `residual_mean: 0.09453 -> 0.05571`
