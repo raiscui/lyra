@@ -297,6 +297,23 @@ def compute_rotation_regularization_loss(
     return (1.0 - cosine_similarity).mean()
 
 
+def compute_stage3b_losses(
+    means: torch.Tensor,
+    initial_means: torch.Tensor,
+    rotations: torch.Tensor,
+    initial_rotations: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """汇总 `Stage 3B` 的几何正则项.
+
+    这里把位置锚定和旋转正则集中到一个 helper.
+    这样 `stage2b` / `stage3b` 两条 geometry 路径可以共用同一套语义.
+    """
+
+    loss_means_anchor = compute_means_anchor_loss(means, initial_means)
+    loss_rotation_reg = compute_rotation_regularization_loss(rotations, initial_rotations)
+    return loss_means_anchor, loss_rotation_reg
+
+
 def compute_pose_regularization(
     pose_delta: torch.Tensor,
     smooth_weight: float = 1.0,

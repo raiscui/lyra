@@ -35,12 +35,18 @@ def test_cli_mapping_uses_defaults() -> None:
     assert run_config.start_stage == "stage2a"
     assert run_config.stage2a_mode == "auto"
     assert run_config.render_devices is None
+    assert run_config.enable_stage3b is False
     assert run_config.enable_stage2b is False
     assert run_config.dry_run is False
     assert hparams.weight_floor == 0.20
     assert hparams.iters_stage2a == 600
+    assert hparams.iters_stage3b == 300
     assert hparams.lambda_means_anchor == 0.01
+    assert hparams.lambda_means_anchor_stage3b == 0.01
     assert hparams.lambda_rotation_reg == 0.01
+    assert hparams.lambda_rotation_reg_stage3b == 0.01
+    assert hparams.means_delta_cap == 0.02
+    assert hparams.means_delta_cap_stage3b == 0.02
     assert hparams.lambda_sampling_smooth == 5e-4
     assert hparams.sampling_radius_threshold == 1.5
     assert hparams.fidelity_ratio_threshold == 1.5
@@ -70,6 +76,7 @@ def test_cli_mapping_reads_bool_flags_and_frame_indices() -> None:
             "stage2b",
             "--stage2a-mode",
             "enhanced",
+            "--enable-stage3b",
             "--enable-stage2b",
             "--enable-pose-diagnostic",
             "--enable-joint-fallback",
@@ -88,6 +95,7 @@ def test_cli_mapping_reads_bool_flags_and_frame_indices() -> None:
     assert run_config.frame_indices == [1, 3, 7]
     assert run_config.start_stage == "stage2b"
     assert run_config.stage2a_mode == "enhanced"
+    assert run_config.enable_stage3b is True
     assert run_config.enable_stage2b is True
     assert run_config.enable_pose_diagnostic is True
     assert run_config.enable_joint_fallback is True
@@ -95,6 +103,27 @@ def test_cli_mapping_reads_bool_flags_and_frame_indices() -> None:
     assert run_config.dry_run is True
     assert hparams.weight_floor == 0.3
     assert hparams.iters_stage2a == 111
+
+
+def test_cli_mapping_reads_start_stage_stage3b() -> None:
+    """确认 `start_stage=stage3b` 能稳定映射到配置对象."""
+
+    run_config, _ = load_effective_config_from_cli(
+        [
+            "--config",
+            "configs/demo/lyra_static.yaml",
+            "--gaussians",
+            "outputs/demo/gaussians_0.ply",
+            "--outdir",
+            "outputs/refine_v2/test",
+            "--start-stage",
+            "stage3b",
+            "--enable-stage3b",
+        ]
+    )
+
+    assert run_config.start_stage == "stage3b"
+    assert run_config.enable_stage3b is True
 
 
 def test_cli_mapping_reads_render_devices() -> None:
@@ -337,11 +366,54 @@ def test_cli_mapping_reads_stage2b_regularizer_flags() -> None:
             "0.2",
             "--lambda-rotation-reg",
             "0.05",
+            "--means-delta-cap",
+            "0.03",
         ]
     )
 
     assert hparams.lambda_means_anchor == 0.2
     assert hparams.lambda_rotation_reg == 0.05
+    assert hparams.means_delta_cap == 0.03
+
+
+def test_cli_mapping_reads_stage3b_dedicated_geometry_flags() -> None:
+    """确认 `stage3b` 可以覆盖 Stage 2B 的共享 geometry 配置."""
+
+    _, hparams = load_effective_config_from_cli(
+        [
+            "--config",
+            "configs/demo/lyra_static.yaml",
+            "--gaussians",
+            "outputs/demo/gaussians_0.ply",
+            "--outdir",
+            "outputs/refine_v2/test",
+            "--iters-stage2b",
+            "7",
+            "--iters-stage3b",
+            "11",
+            "--lambda-means-anchor",
+            "0.2",
+            "--lambda-means-anchor-stage3b",
+            "0.6",
+            "--lambda-rotation-reg",
+            "0.05",
+            "--lambda-rotation-reg-stage3b",
+            "0.12",
+            "--means-delta-cap",
+            "0.03",
+            "--means-delta-cap-stage3b",
+            "0.09",
+        ]
+    )
+
+    assert hparams.iters_stage2b == 7
+    assert hparams.iters_stage3b == 11
+    assert hparams.lambda_means_anchor == 0.2
+    assert hparams.lambda_means_anchor_stage3b == 0.6
+    assert hparams.lambda_rotation_reg == 0.05
+    assert hparams.lambda_rotation_reg_stage3b == 0.12
+    assert hparams.means_delta_cap == 0.03
+    assert hparams.means_delta_cap_stage3b == 0.09
 
 
 def test_cli_mapping_reads_sampling_smooth_flags() -> None:

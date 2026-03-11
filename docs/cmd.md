@@ -460,6 +460,221 @@ PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py \
   2. native `residual_mean` 是否也能一起超过 `Phase A`
   3. 如果这条线开始平台化, 再评估 `Phase E`
 
+## 6F. Phase E `stage3b` 真实 smoke
+
+```bash
+PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py   --config configs/demo/lyra_static.yaml   --gaussians outputs/demo/lyra_static/static_view_indices_fixed_5_0_1_2_3_4/lyra_static_demo_generated/gaussians_orig/gaussians_0.ply   --scene-stem 00172   --view-ids 5,0,1,2,3,4   --pose-root assets/demo/static/diffusion_output_generated   --intrinsics-root assets/demo/static/diffusion_output_generated   --rgb-root assets/demo/static/diffusion_output_generated   --reference-root outputs/flashvsr_reference/full_scale2x   --reference-mode super_resolved   --sr-scale 2.0   --target-subsample 8   --stage2a-mode enhanced   --enable-stage3b   --lambda-hr-rgb 32   --lambda-lr-consistency 0.5   --reference-render-shard-views 1   --iters-stage2a 2   --iters-stage2b 2   --save-every 1   --stop-after stage3b   --outdir outputs/refine_v2/phaseE_stage3b_smoke_sub8_20260310
+```
+
+已验证结果:
+
+- `phase_reached = stage3b`
+- `stopped_reason = metrics_plateau`
+- `diagnostics.json` 已落盘
+- `metrics_stage3sr.json` 与 `metrics_stage3b.json` 已同时落盘
+
+同一条 run 内部对比:
+
+- `stage3sr` 最后一点:
+  - `psnr = 19.6287`
+  - `residual_mean = 0.064013`
+  - `psnr_hr = 18.4758`
+  - `residual_mean_hr = 0.075014`
+- `stage3b` 最后一点:
+  - `psnr = 20.4356`
+  - `residual_mean = 0.056794`
+  - `psnr_hr = 19.0136`
+  - `residual_mean_hr = 0.069601`
+
+当前判断:
+
+- `Phase E` 的最小版已经不是纸面设计, 而是能在真实 full-view `sub8` 资产上进入的阶段。
+- 这条最小 smoke 里, `stage3b` 已经相对同 run 的 `stage3sr` 带来正向改进:
+  - `psnr +0.8069`
+  - `residual_mean -0.007219`
+  - `psnr_hr +0.5378`
+  - `residual_mean_hr -0.005412`
+- 但它还只是最小版:
+  - 仍复用了 `iters_stage2b` 与现有 geometry regularizer 超参数
+  - 还没有拆出 `stage3b` 专属超参数面
+
+## 6G. Phase E `stage3b` 独立超参数面 smoke
+
+```bash
+PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py   --config configs/demo/lyra_static.yaml   --gaussians outputs/demo/lyra_static/static_view_indices_fixed_5_0_1_2_3_4/lyra_static_demo_generated/gaussians_orig/gaussians_0.ply   --scene-stem 00172   --view-ids 5,0,1,2,3,4   --pose-root assets/demo/static/diffusion_output_generated   --intrinsics-root assets/demo/static/diffusion_output_generated   --rgb-root assets/demo/static/diffusion_output_generated   --reference-root outputs/flashvsr_reference/full_scale2x   --reference-mode super_resolved   --sr-scale 2.0   --target-subsample 8   --stage2a-mode enhanced   --enable-stage3b   --lambda-hr-rgb 32   --lambda-lr-consistency 0.5   --reference-render-shard-views 1   --iters-stage2a 2   --iters-stage2b 1   --iters-stage3b 2   --lambda-means-anchor 0.0   --lambda-means-anchor-stage3b 0.02   --lambda-rotation-reg 0.0   --lambda-rotation-reg-stage3b 0.02   --means-delta-cap 0.03   --means-delta-cap-stage3b 0.01   --save-every 1   --stop-after stage3b   --outdir outputs/refine_v2/phaseE_stage3b_hparams_smoke_sub8_20260310
+```
+
+已验证结果:
+
+- `nvidia-smi` 启动前显示:
+  - `0 MiB / 81920 MiB`
+- 真实目录:
+  - `outputs/refine_v2/phaseE_stage3b_hparams_smoke_sub8_20260310`
+- `diagnostics.json` 已确认:
+  - `phase_reached = stage3b`
+  - `stopped_reason = metrics_plateau`
+- 已同时落盘:
+  - `gaussians_stage3sr.ply`
+  - `gaussians_stage3b.ply`
+  - `final_render.mp4`
+  - `final_render_hr.mp4`
+
+关键动态证据:
+
+- `metrics_stage3b.json` 最后一点已明确记录:
+  - `iters_budget = 2`
+  - `lambda_means_anchor_active = 0.02`
+  - `lambda_rotation_reg_active = 0.02`
+  - `means_delta_cap_active = 0.01`
+- 这说明新的 `stage3b` 专属参数不只是“能解析”, 而是已经真实进入运行时路径。
+- 这条 smoke 里, `stage3b` 相对同 run 的 `stage3sr` 仍然保持正向:
+  - `psnr 19.6287 -> 20.4356`
+  - `residual_mean 0.064013 -> 0.056794`
+  - `psnr_hr 18.4758 -> 19.0136`
+  - `residual_mean_hr 0.075014 -> 0.069601`
+
+当前判断:
+
+- `Phase E` 现在已经不再只是“最小版 `stage3b`”.
+- `stage3b` 的独立超参数面已经真正落地:
+  - `--iters-stage3b`
+  - `--lambda-means-anchor-stage3b`
+  - `--lambda-rotation-reg-stage3b`
+  - `--means-delta-cap-stage3b`
+- 下一步更有信息量的工作, 不再是补配置层, 而是拿这套新超参数面去跑更长的 apples-to-apples 对照。
+
+## 6H. 更长 `Phase E` auto-gate run 停在 `stage3sr`
+
+```bash
+PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py   --config configs/demo/lyra_static.yaml   --gaussians outputs/demo/lyra_static/static_view_indices_fixed_5_0_1_2_3_4/lyra_static_demo_generated/gaussians_orig/gaussians_0.ply   --scene-stem 00172   --view-ids 5,0,1,2,3,4   --pose-root assets/demo/static/diffusion_output_generated   --intrinsics-root assets/demo/static/diffusion_output_generated   --rgb-root assets/demo/static/diffusion_output_generated   --reference-root outputs/flashvsr_reference/full_scale2x   --reference-mode super_resolved   --sr-scale 2.0   --target-subsample 8   --stage2a-mode enhanced   --enable-stage3b   --lambda-hr-rgb 32   --lambda-lr-consistency 0.5   --reference-render-shard-views 1   --iters-stage2a 32   --iters-stage3b 32   --lambda-means-anchor-stage3b 0.02   --lambda-rotation-reg-stage3b 0.02   --means-delta-cap-stage3b 0.01   --save-every 4   --stop-after stage3b   --outdir outputs/refine_v2/full_view_sr_stage3b_phaseE_hr32_lr0p5_sub8_iter32_20260310
+```
+
+已验证结果:
+
+- 真实目录:
+  - `outputs/refine_v2/full_view_sr_stage3b_phaseE_hr32_lr0p5_sub8_iter32_20260310`
+- 最终不是报错退出, 而是:
+  - `phase_reached = stage3sr`
+  - `stopped_reason = metrics_plateau`
+- 最终点几乎和 `Phase C hr32 lr0.5 iter32` 一致:
+  - `psnr = 24.154513879928512`
+  - `residual_mean = 0.034917574375867844`
+  - `psnr_hr = 21.62737934559564`
+  - `residual_mean_hr = 0.04957122728228569`
+
+为什么没进 `stage3b`:
+
+- 这是一个 gate 没放行的现象, 不是 `stage3b` 自己跑挂了。
+- 静态证据:
+  - `src/refinement_v2/runner.py:1803` 用 `residual_mean > 0.045` 判定 `local_overlap_persistent`
+- 动态证据:
+  - 这条 run 的 `stage3sr` 最终 `residual_mean = 0.034917574375867844`
+- 所以这轮 auto path 的结论应写成:
+  - `stage3sr` 已经把 overlap 压到当前 geometry gate 以下
+  - 不能把这轮结果误写成“`stage3b` 跑了但没收益”
+
+## 6I. 从 `stage3sr` 末态继续接 `stage3b`
+
+手工 continuation 目录:
+
+- `outputs/refine_v2/full_view_sr_stage3b_phaseE_resume_from_stage3sr_hr32_lr0p5_sub8_iter32_20260310`
+
+正式 CLI continuation 命令:
+
+```bash
+outdir=outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter32_20260310
+srcdir=outputs/refine_v2/full_view_sr_stage3b_phaseE_hr32_lr0p5_sub8_iter32_20260310
+mkdir -p "$outdir/state"
+cp "$srcdir/state/latest.pt" "$outdir/state/latest.pt"
+PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py   --config configs/demo/lyra_static.yaml   --gaussians outputs/demo/lyra_static/static_view_indices_fixed_5_0_1_2_3_4/lyra_static_demo_generated/gaussians_orig/gaussians_0.ply   --scene-stem 00172   --view-ids 5,0,1,2,3,4   --pose-root assets/demo/static/diffusion_output_generated   --intrinsics-root assets/demo/static/diffusion_output_generated   --rgb-root assets/demo/static/diffusion_output_generated   --reference-root outputs/flashvsr_reference/full_scale2x   --reference-mode super_resolved   --sr-scale 2.0   --target-subsample 8   --stage2a-mode enhanced   --enable-stage3b   --start-stage stage3b   --resume   --lambda-hr-rgb 32   --lambda-lr-consistency 0.5   --reference-render-shard-views 1   --iters-stage2a 32   --iters-stage3b 32   --lambda-means-anchor-stage3b 0.02   --lambda-rotation-reg-stage3b 0.02   --means-delta-cap-stage3b 0.01   --save-every 4   --stop-after stage3b   --outdir "$outdir"
+```
+
+已验证结果:
+
+- 手工 continuation 最终:
+  - `phase_reached = stage3b`
+  - `psnr = 24.633636263443535`
+  - `residual_mean = 0.03258064016699791`
+  - `psnr_hr = 21.93410154162478`
+  - `residual_mean_hr = 0.04774709418416023`
+- 正式 CLI continuation 最终:
+  - `phase_reached = stage3b`
+  - `warm_start_stage3b = true`
+  - `psnr = 24.633623626096842`
+  - `residual_mean = 0.03258058801293373`
+  - `psnr_hr = 21.934121746007385`
+  - `residual_mean_hr = 0.047747090458869934`
+- CLI 与手工 continuation 的差值几乎为零:
+  - `delta psnr = -1.26e-05`
+  - `delta residual_mean = -5.22e-08`
+  - `delta psnr_hr = +2.02e-05`
+  - `delta residual_mean_hr = -3.73e-09`
+
+相对 gate 停在 `stage3sr` 的结果:
+
+- `psnr +0.479122`
+- `residual_mean -0.002337`
+- `sharpness +0.000883`
+- `psnr_hr +0.306722`
+- `residual_mean_hr -0.001824`
+- `sharpness_hr +0.000347`
+
+当前判断:
+
+- `Phase E` 的核心收益已经不再只是最小 smoke 里的局部正向信号。
+- 在更长 `stage3sr` 末态上继续跑 `stage3b`, 它仍然能稳定带来进一步收益。
+- `start_stage=stage3b --resume` 现在已经是正式可复用 workflow, 不需要再靠一次性 Python 片段。
+
+## 6J. `Phase E` 第一轮 continuation calibration: `iters_stage3b=64`
+
+```bash
+outdir=outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter64_20260310
+srcdir=outputs/refine_v2/full_view_sr_stage3b_phaseE_hr32_lr0p5_sub8_iter32_20260310
+mkdir -p "$outdir/state"
+cp "$srcdir/state/latest.pt" "$outdir/state/latest.pt"
+PYTHONPATH="$(pwd)" pixi run python3 scripts/refine_robust_v2.py   --config configs/demo/lyra_static.yaml   --gaussians outputs/demo/lyra_static/static_view_indices_fixed_5_0_1_2_3_4/lyra_static_demo_generated/gaussians_orig/gaussians_0.ply   --scene-stem 00172   --view-ids 5,0,1,2,3,4   --pose-root assets/demo/static/diffusion_output_generated   --intrinsics-root assets/demo/static/diffusion_output_generated   --rgb-root assets/demo/static/diffusion_output_generated   --reference-root outputs/flashvsr_reference/full_scale2x   --reference-mode super_resolved   --sr-scale 2.0   --target-subsample 8   --stage2a-mode enhanced   --enable-stage3b   --start-stage stage3b   --resume   --lambda-hr-rgb 32   --lambda-lr-consistency 0.5   --reference-render-shard-views 1   --iters-stage2a 32   --iters-stage3b 64   --lambda-means-anchor-stage3b 0.02   --lambda-rotation-reg-stage3b 0.02   --means-delta-cap-stage3b 0.01   --save-every 8   --stop-after stage3b   --outdir "$outdir"
+```
+
+已验证结果:
+
+- 真实目录:
+  - `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter64_20260310`
+- 最终:
+  - `phase_reached = stage3b`
+  - `warm_start_stage3b = true`
+  - `psnr = 24.962974696829484`
+  - `residual_mean = 0.031111249700188637`
+  - `psnr_hr = 22.124704905272846`
+  - `residual_mean_hr = 0.046562712639570236`
+
+相对 `iter32` continuation:
+
+- `psnr +0.329351`
+- `residual_mean -0.001469`
+- `sharpness +0.000560`
+- `psnr_hr +0.190583`
+- `residual_mean_hr -0.001184`
+- `sharpness_hr +0.000294`
+
+相对 auto gate 停在 `stage3sr` 的 source run:
+
+- `psnr +0.808461`
+- `residual_mean -0.003806`
+- `psnr_hr +0.497326`
+- `residual_mean_hr -0.003009`
+
+当前判断:
+
+- 已验证:
+  - 只把 `iters_stage3b` 从 `32` 提到 `64`, 就还能继续稳定提升。
+- 观察到的现象:
+  - `metrics_stage3b.json` 最后 5 个点仍持续改善。
+- 当前候选假设:
+  - `stage3b` 的第一瓶颈至少部分来自 iteration budget, `32 iter` 明显偏短。
+- 仍待验证:
+  - `means_delta_cap_stage3b=0.01` 是否已经成为新的限制
+  - `lambda_means_anchor_stage3b / lambda_rotation_reg_stage3b` 是否仍偏保守
+
 ## 7. 当前怎么理解 baseline
 
 - 如果你现在做的是 single-view 对比:

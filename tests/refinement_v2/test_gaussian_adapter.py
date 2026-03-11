@@ -42,3 +42,23 @@ def test_summarize_gaussian_stats_contains_expected_keys() -> None:
     assert "num_gaussians" in stats
     assert "scale_tail_ratio" in stats
     assert "opacity_lowconf_ratio" in stats
+
+
+def test_stage3b_clamp_uses_dedicated_means_delta_cap() -> None:
+    """`stage3b` 应优先使用自己的位移 cap, 而不是继续沿用 `stage2b` 的值."""
+
+    adapter = GaussianAdapter.from_tensor(_build_gaussians())
+    with torch.no_grad():
+        adapter.means.add_(0.05)
+
+    adapter.clamp_stage_constraints(
+        "stage3b",
+        StageHyperParams(
+            means_delta_cap=0.005,
+            means_delta_cap_stage3b=0.02,
+        ),
+    )
+
+    max_delta = float((adapter.means.detach() - adapter.initial_means).abs().max().item())
+    assert max_delta <= 0.02 + 1e-8
+    assert max_delta > 0.005 + 1e-8

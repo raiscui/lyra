@@ -283,11 +283,14 @@ class GaussianAdapter(nn.Module):
 
             if stage_name not in {"stage2b", "stage3b", "phase4"}:
                 return
-            if hparams.means_delta_cap <= 0:
+            means_delta_cap = hparams.means_delta_cap_stage3b if stage_name == "stage3b" else hparams.means_delta_cap
+            if means_delta_cap <= 0:
                 return
 
-            min_means = self.initial_means - hparams.means_delta_cap
-            max_means = self.initial_means + hparams.means_delta_cap
+            # `Phase E` 允许单独放宽或收紧 stage3b 的位移范围.
+            # 这样不会再被 `stage2b` 的旧 cap 绑死.
+            min_means = self.initial_means - means_delta_cap
+            max_means = self.initial_means + means_delta_cap
             self.means.data.clamp_(min=min_means, max=max_means)
 
     def summarize_gaussian_stats(self) -> dict[str, float]:

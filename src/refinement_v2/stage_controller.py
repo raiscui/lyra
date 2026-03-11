@@ -56,6 +56,37 @@ class StageController:
             return False
         return diagnostics.get("local_overlap_persistent", False)
 
+    def should_enter_stage3b(self, diagnostics: dict) -> bool:
+        """判断是否进入 `Phase E` 风格的 SR-driven limited geometry.
+
+        这条路径只在 `Stage 3SR` 已完成且 supervision 仍明确是 HR 主监督时打开.
+        这样可以避免 geometry release 在不稳定的上游状态里过早发生.
+        """
+
+        if not self.run_config.enable_stage3b:
+            return False
+        if not diagnostics.get("stage3a_completed", False):
+            return False
+        if not diagnostics.get("stage3sr_enabled", False):
+            return False
+        if not diagnostics.get("phase3s_completed", False):
+            return False
+        if not diagnostics.get("stage3sr_completed", False):
+            return False
+        if diagnostics.get("stage3sr_supervision_mode") != "full_frame_hr":
+            return False
+        if diagnostics.get("ghosting_acceptable", False):
+            return False
+        if diagnostics.get("global_shift_detected", False):
+            return False
+        if diagnostics.get("weight_map_unstable", False):
+            return False
+        if diagnostics.get("geometry_overfit_risk", False):
+            return False
+        if not diagnostics.get("need_geometry", False):
+            return False
+        return diagnostics.get("local_overlap_persistent", False)
+
     def should_prune_now(self, iteration: int) -> bool:
         """判断当前 iteration 是否该触发 pruning.
 

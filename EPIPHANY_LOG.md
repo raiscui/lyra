@@ -303,3 +303,122 @@
   - `docs/cmd.md` 中的 `6E`
   - `docs/plans/2026-03-06-long-lrm-style-post-refinement.md` 的 `Current Continuation Order`
   - 新一轮 `lambda_lr_consistency≈0.5` 近邻 sweep 的真实结果
+
+## [2026-03-10 09:49:30 UTC] 主题: 最小可用的 Phase E 不需要新起第二套 geometry pipeline, 关键是让 geometry release 继续吃同一套 HR 主监督
+
+### 发现来源
+- 本轮为实现 `Phase E`, 回读了现有 `stage3sr` full-frame HR 路径和 `stage2b` limited geometry 路径
+- 随后完成了 `stage3b` 的最小实现与真实 smoke
+
+### 核心问题
+- 如果 `Phase E` 直接复制一份 `stage2b`, 很容易出现一个隐性问题:
+  - 上一阶段还在吃 HR 主监督 + LR consistency
+  - 一进入 geometry release 就突然换成另一套更偏 native 的 loss
+- 这会让“SR 是否真正推动结构”这个问题本身变得不纯
+
+### 为什么重要
+- `Phase E` 最核心的价值不是“终于能动 means 了”
+- 而是“geometry release 仍然沿着同一套 SR 主监督语义继续前进”
+- 只有这样, 才能更真实地回答 SR 是否真的在改结构, 而不是只在改纹理
+
+### 当前结论
+- 最小可用的 `Phase E` 可以这样落:
+  - 复用 `Phase C` 的 full-frame HR reference-space 主监督循环
+  - 在此基础上只新增 geometry release 与对应 regularizers
+  - 不必先复制第二套完整 geometry pipeline
+- 真实 smoke 已经证明这条实现链路能跑到 `stage3b`, 而且在最小 smoke 中相对 `stage3sr` 已有正向收益
+
+### 后续讨论入口
+- 下一轮优先看:
+  - `outputs/refine_v2/phaseE_stage3b_smoke_sub8_20260310`
+  - 更长 iter 的 `stage3b` 对照
+  - 是否需要给 `stage3b` 拆独立超参数面
+
+## [2026-03-10 10:20:00 UTC] 主题: 新阶段如果继续复用旧阶段超参数, 会把后续实验归因直接污染掉
+
+### 发现来源
+- 本轮继续做 `Phase E` 时, 发现最小版 `stage3b` 虽然已经能跑, 但仍复用 `stage2b` 的 iteration / regularizer / means clamp
+- 随后补了独立参数面, 并用真实 smoke 验证这些新参数已经进入运行时
+
+### 核心问题
+- 一个新阶段即便已经有独立代码路径, 只要仍绑定旧阶段超参数, 后续长跑就很难回答“收益到底来自新阶段语义, 还是来自旧阶段配置”
+
+### 为什么重要
+- 这类问题不会立刻让代码报错
+- 但会在实验解释层面悄悄制造歧义, 让 GPU 预算被浪费在归因不清的对照上
+
+### 当前结论
+- `Phase E` 的正确继续方式不是立刻乱扫参数
+- 而是先把 `stage3b` 的独立参数面补齐, 再做 apples-to-apples 长跑
+- 真实 smoke 已证明:
+  - `iters_stage3b`
+  - `lambda_means_anchor_stage3b`
+  - `lambda_rotation_reg_stage3b`
+  - `means_delta_cap_stage3b`
+  都已经真实进入运行时
+
+### 后续讨论入口
+- 下次继续时优先看:
+  - `outputs/refine_v2/phaseE_stage3b_hparams_smoke_sub8_20260310`
+  - `docs/plans/2026-03-06-long-lrm-style-post-refinement.md` 的 `Phase E`
+  - `docs/cmd.md` 的 `6G`
+
+## [2026-03-10 11:22:00 UTC] 主题: auto gate 的“默认是否继续”与 continuation 的“继续后是否有收益”是两件不同的问题
+
+### 发现来源
+- 更长的 `Phase E` auto-gate run 停在了 `stage3sr`
+- 随后从同一条 `stage3sr` 末态继续接 `stage3b`, 又拿到了明确正向收益
+- 最后把这条 continuation 路径固化成了正式 CLI workflow
+
+### 核心问题
+- 很容易把“auto gate 没放行”误写成“这个阶段没有价值”。
+- 但这两者不是一回事。
+
+### 为什么重要
+- 如果不区分这两层语义, 后续就会在错误的问题上浪费 GPU:
+  - 明明该先问“默认门槛是否过保守”
+  - 却又回到“Phase E 到底成立不成立”
+
+### 当前结论
+- 已验证:
+  - auto gate 停在 `stage3sr`
+  - continuation 继续跑 `stage3b` 仍然能带来 `+0.479 psnr` / `-0.002337 residual_mean` 等增益
+- 所以下一步的正确问题应该是:
+  - `stage3b` 内部超参数怎么调
+  - auto gate 默认阈值要不要跟着放宽
+- 而不是继续怀疑 `Phase E` 本身是否成立
+
+### 后续讨论入口
+- `outputs/refine_v2/full_view_sr_stage3b_phaseE_hr32_lr0p5_sub8_iter32_20260310`
+- `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter32_20260310`
+- `docs/cmd.md` 的 `6H` / `6I`
+
+## [2026-03-10 11:45:00 UTC] 主题: `Phase E` 现在的第一瓶颈已不再是“是否成立”, 而是 continuation 预算线设得太短
+
+### 发现来源
+- 本轮对正式 CLI continuation 做了第一轮 calibration
+- 只把 `iters_stage3b` 从 `32` 提到 `64`, 其余 `stage3b` regularizer 与 cap 全部保持不变
+
+### 核心问题
+- 如果 `stage3b` 在 `iter32` 尾部还持续改善, 但 backlog 还把它当成“先扫 regularizer”, 那么后续很多 sweep 都会混入一个更基本的偏差:
+  - 预算本身就没给够
+
+### 为什么重要
+- 这会让后续实验解释变脏
+- 你会误以为某个 cap / regularizer 很关键, 但其实它只是在补偿一个过短的优化窗口
+
+### 当前结论
+- 已验证:
+  - `iters_stage3b=64` 相比 `iter32` continuation 继续提升:
+    - `psnr +0.329351`
+    - `residual_mean -0.001469`
+    - `psnr_hr +0.190583`
+    - `residual_mean_hr -0.001184`
+- 仍未验证:
+  - 64 之后是否还应该继续加预算
+  - 还是 `means_delta_cap_stage3b` / `lambda_*_stage3b` 开始成为新的主瓶颈
+
+### 后续讨论入口
+- `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter64_20260310`
+- `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter32_20260310`
+- `docs/cmd.md` 的下一条 `Phase E calibration` 记录

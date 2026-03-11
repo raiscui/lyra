@@ -734,19 +734,107 @@ Status (2026-03-10 refresh):
 
 ### Phase E: 允许 SR 真正改变结构,而不只是改纹理
 
+Status (2026-03-10 refresh):
+
+- `Phase E` 的最小版已经落地, 后续第一轮补强与 continuation workflow 也已完成:
+  - 新增 `enable_stage3b`
+  - 新增 `StageController.should_enter_stage3b(...)`
+  - 新增 `run_stage3b()`
+  - 复用 `Phase C` 的 full-frame HR 主监督路径, 在其后允许有限 geometry 更新
+- `Phase E` continuation 现在也有正式入口:
+  - `start_stage=stage3b`
+  - `warm_start_stage3b`
+  - `--resume` + `state/latest.pt` 可直接把 `stage3sr` 末态续到 `stage3b`
+- `stage3b` 专属超参数面也已经落地:
+  - `iters_stage3b`
+  - `lambda_means_anchor_stage3b`
+  - `lambda_rotation_reg_stage3b`
+  - `means_delta_cap_stage3b`
+- 对应回归已验证:
+  - `PYTHONPATH="$(pwd)" pixi run pytest -q tests/refinement_v2`
+  - 结果: `122 passed`
+- 真实 smoke 也已成功验证:
+  - `outputs/refine_v2/phaseE_stage3b_smoke_sub8_20260310`
+  - 已确认:
+    - `phase_reached = stage3b`
+    - `metrics_stage3sr.json` 与 `metrics_stage3b.json` 都存在
+    - 同一条 run 内 `stage3b` 相比 `stage3sr`:
+      - `psnr +0.8069`
+      - `residual_mean -0.007219`
+      - `psnr_hr +0.5378`
+      - `residual_mean_hr -0.005412`
+- 新一条专属参数 smoke 也已验证:
+  - `outputs/refine_v2/phaseE_stage3b_hparams_smoke_sub8_20260310`
+  - `metrics_stage3b.json` 最后一点明确记录:
+    - `iters_budget = 2`
+    - `lambda_means_anchor_active = 0.02`
+    - `lambda_rotation_reg_active = 0.02`
+    - `means_delta_cap_active = 0.01`
+- 更长的 auto-gate apples-to-apples run 也已验证:
+  - `outputs/refine_v2/full_view_sr_stage3b_phaseE_hr32_lr0p5_sub8_iter32_20260310`
+  - 这条 run 最终停在:
+    - `phase_reached = stage3sr`
+    - `residual_mean = 0.034917574375867844`
+  - 当前解释不是“`stage3b` 没收益”, 而是:
+    - 这条 run 的 `stage3sr` 已经把 overlap 压到当前 gate 以下
+- 从同一条 `stage3sr` 末态继续接 `stage3b` 也已验证:
+  - 手工 continuation:
+    - `outputs/refine_v2/full_view_sr_stage3b_phaseE_resume_from_stage3sr_hr32_lr0p5_sub8_iter32_20260310`
+  - 正式 CLI continuation:
+    - `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter32_20260310`
+  - 两条 continuation 都收敛到几乎同一结果:
+    - `psnr ≈ 24.6336`
+    - `residual_mean ≈ 0.0325806`
+    - `psnr_hr ≈ 21.9341`
+    - `residual_mean_hr ≈ 0.0477471`
+  - 相比 gate 停在 `stage3sr` 的结果:
+    - `psnr +0.4791`
+    - `residual_mean -0.002337`
+    - `psnr_hr +0.3067`
+    - `residual_mean_hr -0.001824`
+- 第一轮 continuation calibration 也已验证:
+  - `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter64_20260310`
+  - 做法:
+    - 保持 `lambda_means_anchor_stage3b=0.02`
+    - 保持 `lambda_rotation_reg_stage3b=0.02`
+    - 保持 `means_delta_cap_stage3b=0.01`
+    - 只把 `iters_stage3b` 从 `32` 提到 `64`
+  - 最终:
+    - `psnr = 24.962974696829484`
+    - `residual_mean = 0.031111249700188637`
+    - `psnr_hr = 22.124704905272846`
+    - `residual_mean_hr = 0.046562712639570236`
+  - 相比 `iter32` continuation:
+    - `psnr +0.3294`
+    - `residual_mean -0.001469`
+    - `psnr_hr +0.1906`
+    - `residual_mean_hr -0.001184`
+  - 已观察到:
+    - `metrics_stage3b.json` 尾部 5 个点仍持续改善
+- 当前剩余限制也要明确:
+  - auto gate 仍然偏保守, 还没有决定要不要调阈值
+  - `32 iter` 已可确认偏短, 但 `64 iter` 之后是否继续加预算还没最终回答
+  - `means_delta_cap_stage3b` 与 `lambda_*_stage3b` 还没有做正式 calibration
+  - 还没有把 `stage3b` 与 densify / prune 更紧地耦合
+
 目标:
 
 - 让 SR 信息可以对 geometry 产生有限但真实的影响
 
 要点:
 
-- 当前 `Stage 3SR` 只训练:
-  - `opacity`
-  - `scales`
-  - `colors`
-- 更接近 SplatSuRe / 3DGS 主训练形态的版本,至少要评估两条路:
-  1. 在 SR 阶段允许有限 geometry 更新
-  2. 把 SR 阶段和 densify / prune 更紧地耦合
+- 当前 `stage3b` 已经做到:
+  - 在 `Stage 3SR` 之后继续沿用同一套 HR 主监督 + LR consistency
+  - 同时有限释放 `means / rotations`
+- 当前 `stage3b` 也已经不再和 `stage2b` 绑定同一套 geometry 配置:
+  - iteration budget
+  - means anchor 权重
+  - rotation regularizer 权重
+  - means delta cap
+- 更接近 SplatSuRe / 3DGS 主训练形态的后续版本, 当前至少还要评估两条路:
+  1. 用正式 `start_stage=stage3b --resume` workflow 做 `Phase E` 内部 calibration
+  2. 再决定 auto gate 的 `residual_mean` 阈值是否要放宽
+  3. 把 SR 阶段和 densify / prune 更紧地耦合
 
 完成标志:
 
@@ -1717,31 +1805,38 @@ git commit -s -m "feat: add dry run validation for post refinement"
 
 截至 `2026-03-10` 的最新实验刷新, 这个 backlog 顺序已经再次更新。
 
-原因不再是 baseline 还没稳定, 而是当前已经拿到了四类更强的新证据:
+原因是当前又多了六条关键新证据:
 
-- `Phase D` 不只是 `phase0` 可用, 更重的 `full-view + sub8 + stage2a` HR 导出 smoke 也已经完成
-- `Phase C` 的 `hr=32, lr=0.5, iter32` 已经在 native `psnr` 上超过 `Phase A iter20`
-- 同一轮里, native `sharpness` 也已经超过 `Phase A iter20`
-- 当前剩下的差距只剩 native `residual_mean +0.000488`, 问题已经从“目标是否成立”切换成“最后这点 trade-off 要怎么压过去”
+- `HR-only` 对照已经证明: 直接把 `lambda_lr_consistency` 设成 `0` 会显著伤害 native-space 指标, 不能把“删 LR”当成当前主线答案
+- `Phase E` 的最小版 `stage3b` 已经真实跑通, 而且在最小 smoke 里相对同 run 的 `stage3sr` 已经出现正向收益
+- `stage3b` 的独立超参数面也已经真正落地并完成真实 smoke, 因此接下来不需要再为 `Phase E` 补 CLI / config 基础设施
+- 更长的 auto-gate run 已经证明: 不是每条长跑都会自动进入 `stage3b`, 因为 `stage3sr` 可能先把 residual 压到当前 gate 以下
+- 但从同一条 `stage3sr` 末态继续接 `stage3b`, 已经再次拿到稳定正向收益, 而且 `start_stage=stage3b --resume` 的正式 CLI workflow 也已经验证通过
+- 第一轮 continuation calibration 也已经证明: 只把 `iters_stage3b` 从 `32` 提到 `64`, 指标还能继续明显改善, 所以 `32 iter` 不能再当作充分预算
 
 因此如果从今天的代码现实继续往前走, 推荐顺序应改成:
 
-1. 继续压 `Phase C`
-   - 统一保持 `--target-subsample 8`
-   - 优先围绕 `lambda_lr_consistency≈0.5` 做近邻 sweep
-   - 当前最有信息量的点是:
-     - `0.6`
-     - `0.4`
-   - 目标不是再证明 `Phase C` 能不能跑, 而是确认 native `residual_mean` 能否也一起超过 `Phase A`, 同时不牺牲现有 HR 指标
-2. 如果近邻 sweep 后仍然只能在 native `psnr` 和 `residual_mean` 之间二选一, 再评估 `Phase E`
-   - 核心问题会变成:
-     - 是否允许 SR 信息有限影响 geometry / densify
-     - 让最后一点 residual gap 不再只靠 appearance loss 去硬压
-3. `Phase B` 暂时后移
-   - 只有当新的 `Phase C` 目标下又重新暴露出 coverage 不足或显存利用问题时, 才回头重做“全图 weighted SR”
-4. 原来的 `Continuation Task B / D / A`
-   - 现在都不再是主线 blocker
-   - 可以按需要补文档, 但不应再抢占当前主线 GPU 预算
+1. 继续推进 `Phase E`
+   - 直接基于正式 `start_stage=stage3b --resume` workflow 继续做 `Phase E` 内部 calibration
+   - 第一轮已回答:
+     - `iters_stage3b=64` 明显优于 `iter32`
+   - 当前更有信息量的下一刀变成:
+     - 在 `iters_stage3b>=64` 的前提下量化 `means_delta_cap_stage3b`
+     - 再量化 `lambda_means_anchor_stage3b`
+     - 再量化 `lambda_rotation_reg_stage3b`
+2. 在有一轮小范围 calibration 之后, 再决定 auto gate 是否要放宽
+   - 因为现在已经能分清两件事:
+     - auto gate 没放行
+     - continuation 继续跑 `stage3b` 仍然有收益
+   - 同时第一轮 calibration 还说明:
+     - 预算本身就是变量
+   - 所以下一步应先回答“默认要不要继续放 geometry”, 而不是继续猜 `Phase E` 本身是否成立
+3. `Phase C` 的 `0.4 / 0.6` 近邻 sweep 暂时继续后移
+   - `0.6` 的中间证据没有显示出明显优势
+   - `0.0` 已经明确证明不能直接删 LR
+   - 当前更有信息量的是沿着已经成立的 `Phase E` 做 geometry continuation calibration
+4. `Phase B` 继续后移
+   - 只有当 continuation 再次暴露 coverage 或显存问题时, 才回头重做“全图 weighted SR”
 
 ## Historical Execution Order
 

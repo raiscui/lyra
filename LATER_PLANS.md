@@ -108,3 +108,45 @@
      - `0.4`
   2. 如果 native `residual_mean` 仍始终压不过 `Phase A`, 再评估 `Phase E`
   3. `Phase B` 只在新的 objective 下重新暴露 coverage / 显存问题时再回头
+
+## 2026-03-10 09:49:30 UTC
+
+- `Phase E` 的最小版 `stage3b` 已经落地并完成真实 smoke:
+  - `outputs/refine_v2/phaseE_stage3b_smoke_sub8_20260310`
+- 当前值得继续的后手顺序更新为:
+  1. 跑一条更长的真实 `stage3b` 对照, 与 `Phase C hr32 lr0.5 iter32` 做 apples-to-apples 比较
+  2. 如果 `stage3b` 长跑仍持续改进, 再考虑是否给它拆出独立超参数面:
+     - `iters_stage3b`
+     - `means_delta_cap_stage3b`
+     - `lambda_means_anchor_stage3b`
+     - `lambda_rotation_reg_stage3b`
+  3. `Phase C` 的 `0.4` / `0.6` 近邻 sweep 现在后移, 除非后面要重新审视 `Phase E` 的收益归因
+
+## 2026-03-10 10:20:00 UTC
+
+- 已完成并可从后续待办里移除:
+  - 给 `stage3b` 拆独立超参数面
+- 当前新的 `Phase E` 后手顺序:
+  1. 用 `--target-subsample 8` 跑一条更长的真实 `stage3b` 对照, 明确带上:
+     - `--iters-stage3b`
+     - `--lambda-means-anchor-stage3b`
+     - `--lambda-rotation-reg-stage3b`
+     - `--means-delta-cap-stage3b`
+  2. 用这条更长 run 和 `outputs/refine_v2/full_view_sr_stage3sr_phaseC_hr32_lr0p5_sub8_iter32_20260310` 做 apples-to-apples 比较
+  3. 如果长跑仍有持续收益, 再做 `Phase E` 内部 calibration
+  4. 更后面的版本再评估 `stage3b` 与 densify / prune 的耦合
+
+## 2026-03-10 11:22:00 UTC
+
+- `Phase E` 当前最新 continuation 顺序更新为:
+  1. 直接基于正式 CLI workflow 做 `stage3b` calibration:
+     - `--start-stage stage3b`
+     - `--resume`
+     - `--iters-stage3b`
+     - `--lambda-means-anchor-stage3b`
+     - `--lambda-rotation-reg-stage3b`
+     - `--means-delta-cap-stage3b`
+  2. 在拿到 1-2 组 calibration 证据后, 再决定要不要放宽 auto gate 的 `residual_mean` 阈值
+  3. 再后面才考虑 `stage3b` 与 densify / prune 的耦合
+- 已可从“待补基础设施”中移除:
+  - `start_stage=stage3b` continuation 入口

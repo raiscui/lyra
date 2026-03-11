@@ -306,3 +306,100 @@
 ### 总结感悟
 - 当主线实验已经跨过 baseline 的关键门槛时, backlog 必须跟着换挡, 不能继续围着旧问题打转。
 - 这轮最重要的不是又多出一个目录, 而是把问题重新定义成“剩下这点 residual gap 怎么办”。
+
+## [2026-03-10 09:49:30 UTC] 任务名称: 实现 Phase E 最小版 `stage3b`
+
+### 任务内容
+- 停止继续 `Phase C` 参数调优
+- 在现有 `Phase C` / `Stage 3SR` 主监督路径上实现 `Phase E`
+- 让 SR 信息第一次能通过独立阶段去推动有限 geometry 更新
+
+### 完成过程
+- 先回读 `docs/plans/2026-03-06-long-lrm-style-post-refinement.md` 的 `Phase E` 设计和现有 `stage2b` 实现
+- 再把 `stage3sr` 的 full-frame HR reference-space 主监督循环抽成共享 helper
+- 在不重写第二套 geometry pipeline 的前提下, 新增:
+  - `enable_stage3b`
+  - `should_enter_stage3b(...)`
+  - `run_stage3b()`
+  - `compute_stage3b_losses(...)`
+  - `tests/refinement_v2/test_runner_stage3b.py`
+- 跑通了:
+  - 定向测试 `25 passed`
+  - 全量回归 `117 passed`
+  - 真实 smoke `outputs/refine_v2/phaseE_stage3b_smoke_sub8_20260310`
+
+### 总结感悟
+- `Phase E` 最稳的切口, 不是复制一份 `stage2b`, 而是复用 `Phase C` 已经跑通的 HR 主监督路径, 再只把 geometry 这一层有限放开。
+- 这样做的好处是, 新阶段的“监督语义”是连续的, 不会刚进入 geometry 就突然切回另一套目标函数。
+
+## [2026-03-10 10:20:00 UTC] 任务名称: 为 Phase E 补齐 `stage3b` 独立超参数面
+
+### 任务内容
+- 把 `stage3b` 从 `stage2b` 的共享 geometry 配置中拆出来
+- 为 `Phase E` 增加独立的 iteration / regularizer / means clamp 参数入口
+- 用测试和真实 smoke 验证这些参数已经真实进入运行时
+
+### 完成过程
+- 在 `src/refinement_v2/config.py` 中新增 `stage3b` 专属字段和 CLI, 同时用兼容 fallback 保持已有命令不变
+- 在 `src/refinement_v2/runner.py` 中新增 geometry 参数解析 helper, 让 `stage3b` 单独读取自己的 budget 和 regularizer
+- 在 `src/refinement_v2/gaussian_adapter.py` 中让 `stage3b` 的 clamp 优先使用 `means_delta_cap_stage3b`
+- 新增和更新测试:
+  - `tests/refinement_v2/test_config.py`
+  - `tests/refinement_v2/test_gaussian_adapter.py`
+  - `tests/refinement_v2/test_runner_stage3b.py`
+- 跑通了:
+  - 定向回归 `30 passed`
+  - 全量 `tests/refinement_v2` `119 passed`
+- 最后补了一条真实 smoke:
+  - `outputs/refine_v2/phaseE_stage3b_hparams_smoke_sub8_20260310`
+
+### 总结感悟
+- 新阶段如果长期借用旧阶段的超参数, 很容易让后续实验归因变脏。
+- 最稳的做法不是立刻大调参, 而是先把“独立参数面”这层基础设施做干净, 再去跑长程对照。
+
+## [2026-03-10 11:22:00 UTC] 任务名称: 收口 Phase E 长程结果并固化 `start_stage=stage3b`
+
+### 任务内容
+- 跑更长的 `Phase E stage3b` apples-to-apples 对照
+- 分析为什么 auto-gate 长跑没有进入 `stage3b`
+- 把 continuation workflow 固化成正式 CLI 入口
+
+### 完成过程
+- 先跑了更长 auto-gate run:
+  - `outputs/refine_v2/full_view_sr_stage3b_phaseE_hr32_lr0p5_sub8_iter32_20260310`
+- 再读取 `diagnostics.json` 与 `state/latest.pt`, 确认它停在 `stage3sr` 的原因是:
+  - `residual_mean` 已低于 `0.045` 的 `local_overlap_persistent` 门槛
+  - 也就是 gate 没放行, 不是 `stage3b` 自己失败
+- 随后做了最小 continuation 实验:
+  - 手工从 `stage3sr` 末态续跑 `stage3b`
+  - 结果继续优于纯 `stage3sr`
+- 再把这个路径正式工程化:
+  - `config.py` 支持 `start_stage=stage3b`
+  - `runner.py` 新增 `bootstrap_stage3b_from_current_gaussians()` 与 `warm_start_stage3b`
+  - `test_runner_stage3b.py` 新增 start-stage 回归
+- 最后用正式 CLI 再跑一条真实 continuation:
+  - `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter32_20260310`
+  - 并验证它与手工 continuation 最终结果几乎一致
+
+### 总结感悟
+- auto gate 回答的是“默认还要不要继续放 geometry”, 不是“继续放 geometry 会不会还有收益”。
+- 当这两件事开始分离时, 最正确的做法不是立刻改 gate, 而是先补一个正式 continuation 入口, 把问题拆开验证。
+
+## [2026-03-10 11:45:00 UTC] 任务名称: 完成 Phase E 第一轮 continuation calibration
+
+### 任务内容
+- 基于正式 `start_stage=stage3b --resume` workflow 做第一轮 `stage3b` 校准
+- 不先乱动 regularizer, 先单独验证 `iters_stage3b` 是否不足
+- 统一保持 `--target-subsample 8`
+
+### 完成过程
+- 先读取 `iter32` continuation 的 `metrics_stage3b.json`, 发现尾部连续改善, 因而把“预算可能偏短”设为主假设
+- 复制 source run 的 `state/latest.pt`, 启动真实 continuation:
+  - `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter64_20260310`
+- 只把 `iters_stage3b` 提到 `64`, 其余 `stage3b` 参数保持不变
+- 跑完后读取 `diagnostics.json` 与 `metrics_stage3b.json`, 完成对 `iter32` continuation 和 `stage3sr` source run 的双重对比
+
+### 总结感悟
+- 这轮最重要的不是“64 比 32 好一点”, 而是正式把一个模糊判断变成了证据:
+  - `32 iter` 明显不够
+- 因为这一刀只改了预算, 所以后续如果再扫 cap / regularizer, 归因会干净很多

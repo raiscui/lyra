@@ -40,6 +40,23 @@ def test_stage2b_requires_explicit_enable_flag() -> None:
     assert disabled.should_enter_stage2b(diagnostics) is False
 
 
+def test_stage3b_requires_explicit_enable_flag() -> None:
+    """Stage 3B 默认也不能偷偷进入,必须显式开启."""
+
+    disabled = StageController(_build_run_config(enable_stage3b=False), StageHyperParams())
+    diagnostics = {
+        "stage3a_completed": True,
+        "stage3sr_enabled": True,
+        "phase3s_completed": True,
+        "stage3sr_completed": True,
+        "stage3sr_supervision_mode": "full_frame_hr",
+        "need_geometry": True,
+        "local_overlap_persistent": True,
+    }
+
+    assert disabled.should_enter_stage3b(diagnostics) is False
+
+
 def test_stage2b_requires_local_overlap_and_blocks_global_shift() -> None:
     """Stage 2B 应该更像局部结构重叠,而不是整体错位."""
 
@@ -89,6 +106,50 @@ def test_stage2b_waits_for_stage3sr_when_patch_supervision_is_enabled() -> None:
             "stage3sr_enabled": True,
             "phase3s_completed": True,
             "stage3sr_completed": True,
+        }
+    ) is True
+
+
+def test_stage3b_requires_full_frame_hr_stage3sr_and_local_overlap() -> None:
+    """Stage 3B 只在 full-frame HR 的 Stage 3SR 完成后才允许打开."""
+
+    enabled = StageController(_build_run_config(enable_stage3b=True), StageHyperParams())
+
+    assert enabled.should_enter_stage3b(
+        {
+            "stage3a_completed": True,
+            "stage3sr_enabled": True,
+            "phase3s_completed": True,
+            "stage3sr_completed": False,
+            "stage3sr_supervision_mode": "full_frame_hr",
+            "need_geometry": True,
+            "local_overlap_persistent": True,
+        }
+    ) is False
+    assert enabled.should_enter_stage3b(
+        {
+            "stage3a_completed": True,
+            "stage3sr_enabled": True,
+            "phase3s_completed": True,
+            "stage3sr_completed": True,
+            "stage3sr_supervision_mode": "patch",
+            "need_geometry": True,
+            "local_overlap_persistent": True,
+        }
+    ) is False
+    assert enabled.should_enter_stage3b(
+        {
+            "stage3a_completed": True,
+            "stage3sr_enabled": True,
+            "phase3s_completed": True,
+            "stage3sr_completed": True,
+            "stage3sr_supervision_mode": "full_frame_hr",
+            "need_geometry": True,
+            "local_overlap_persistent": True,
+            "global_shift_detected": False,
+            "ghosting_acceptable": False,
+            "weight_map_unstable": False,
+            "geometry_overfit_risk": False,
         }
     ) is True
 

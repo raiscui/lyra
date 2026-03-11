@@ -39,6 +39,7 @@ class RefinementRunConfig:
     target_subsample: int = 1
     start_stage: str = "stage2a"
     stage2a_mode: str = "auto"
+    enable_stage3b: bool = False
     enable_stage2b: bool = False
     enable_pruning: bool = False
     enable_pose_diagnostic: bool = False
@@ -66,6 +67,7 @@ class StageHyperParams:
     ema_decay: float = 0.90
     iters_stage2a: int = 600
     iters_stage2b: int = 300
+    iters_stage3b: int | None = None
     iters_pose: int = 100
     iters_joint: int = 200
     lr_opacity: float = 1e-2
@@ -90,8 +92,11 @@ class StageHyperParams:
     depth_anchor_alpha_threshold: float = 0.05
     depth_anchor_source: str = "baseline_render"
     lambda_means_anchor: float = 0.01
+    lambda_means_anchor_stage3b: float | None = None
     lambda_rotation_reg: float = 0.01
+    lambda_rotation_reg_stage3b: float | None = None
     means_delta_cap: float = 0.02
+    means_delta_cap_stage3b: float | None = None
     scale_tail_threshold: float = 0.25
     sampling_radius_threshold: float = 1.5
     opacity_low_threshold: float = 0.10
@@ -104,6 +109,24 @@ class StageHyperParams:
     min_gaussians_to_keep: int = 1
     plateau_patience: int = 10
     plateau_delta: float = 1e-4
+
+    def __post_init__(self) -> None:
+        """补齐 `stage3b` 专属超参数的兼容默认值.
+
+        `Phase E` 是后来加的阶段.
+        如果这里直接把旧字段语义打断, 已有命令和测试都会被迫重写.
+        因此先让 `stage3b` 默认继承 `stage2b` / 通用 geometry 参数,
+        只有显式传入 `*_stage3b` 时才覆盖.
+        """
+
+        if self.iters_stage3b is None:
+            self.iters_stage3b = self.iters_stage2b
+        if self.lambda_means_anchor_stage3b is None:
+            self.lambda_means_anchor_stage3b = self.lambda_means_anchor
+        if self.lambda_rotation_reg_stage3b is None:
+            self.lambda_rotation_reg_stage3b = self.lambda_rotation_reg
+        if self.means_delta_cap_stage3b is None:
+            self.means_delta_cap_stage3b = self.means_delta_cap
 
 
 def _parse_frame_indices(raw_value: str | None) -> list[int] | None:
@@ -252,7 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--start-stage",
         type=str,
         default="stage2a",
-        choices=["stage2a", "stage2b"],
+        choices=["stage2a", "stage2b", "stage3b"],
         help="Optimization entry stage after Phase 0 / Phase 1 preparation.",
     )
     parser.add_argument(
@@ -266,6 +289,11 @@ def build_parser() -> argparse.ArgumentParser:
             "`legacy` forces native cleanup only, "
             "`enhanced` forces native cleanup + Phase 3S + Stage 3SR."
         ),
+    )
+    parser.add_argument(
+        "--enable-stage3b",
+        action="store_true",
+        help="Enable Phase E style SR-driven limited geometry refinement after Stage 3SR.",
     )
     parser.add_argument("--enable-stage2b", action="store_true", help="Enable limited geometry refinement.")
     parser.add_argument(
@@ -287,7 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--stop-after",
         type=str,
         default=None,
-        choices=["phase0", "phase1", "stage2a", "stage2b", "phase3", "phase4"],
+        choices=["phase0", "phase1", "stage2a", "stage3b", "stage2b", "phase3", "phase4"],
         help="Stop after a specific stage for debugging.",
     )
     parser.add_argument("--device", type=str, default="cuda", help="Device string, e.g. cuda or cpu.")
@@ -308,6 +336,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ema-decay", type=float, default=0.90)
     parser.add_argument("--iters-stage2a", type=int, default=600)
     parser.add_argument("--iters-stage2b", type=int, default=300)
+    parser.add_argument(
+        "--iters-stage3b",
+        type=int,
+        default=None,
+        help="Optional dedicated iteration budget for Phase E stage3b. Defaults to --iters-stage2b.",
+    )
     parser.add_argument("--iters-pose", type=int, default=100)
     parser.add_argument("--iters-joint", type=int, default=200)
     parser.add_argument("--lr-opacity", type=float, default=1e-2)
@@ -392,7 +426,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Depth anchor reference source. V1 currently implements baseline_render only.",
     )
     parser.add_argument("--lambda-means-anchor", type=float, default=0.01)
+    parser.add_argument(
+        "--lambda-means-anchor-stage3b",
+        type=float,
+        default=None,
+        help="Optional dedicated means-anchor weight for Phase E stage3b. Defaults to --lambda-means-anchor.",
+    )
     parser.add_argument("--lambda-rotation-reg", type=float, default=0.01)
+    parser.add_argument(
+        "--lambda-rotation-reg-stage3b",
+        type=float,
+        default=None,
+        help="Optional dedicated rotation regularization weight for Phase E stage3b. Defaults to --lambda-rotation-reg.",
+    )
+    parser.add_argument(
+        "--means-delta-cap",
+        type=float,
+        default=0.02,
+        help="Maximum absolute xyz offset allowed for limited geometry stages.",
+    )
+    parser.add_argument(
+        "--means-delta-cap-stage3b",
+        type=float,
+        default=None,
+        help="Optional dedicated xyz clamp for Phase E stage3b. Defaults to --means-delta-cap.",
+    )
     parser.add_argument("--sampling-radius-threshold", type=float, default=1.5)
     parser.add_argument("--opacity-prune-threshold", type=float, default=0.05)
     parser.add_argument("--prune-every", type=int, default=2)
@@ -435,6 +493,7 @@ def load_effective_config_from_cli(
         target_subsample=args.target_subsample,
         start_stage=args.start_stage,
         stage2a_mode=args.stage2a_mode,
+        enable_stage3b=args.enable_stage3b,
         enable_stage2b=args.enable_stage2b,
         enable_pruning=args.enable_pruning,
         enable_pose_diagnostic=args.enable_pose_diagnostic,
@@ -455,6 +514,7 @@ def load_effective_config_from_cli(
         ema_decay=args.ema_decay,
         iters_stage2a=args.iters_stage2a,
         iters_stage2b=args.iters_stage2b,
+        iters_stage3b=args.iters_stage3b,
         iters_pose=args.iters_pose,
         iters_joint=args.iters_joint,
         lr_opacity=args.lr_opacity,
@@ -479,7 +539,11 @@ def load_effective_config_from_cli(
         depth_anchor_alpha_threshold=args.depth_anchor_alpha_threshold,
         depth_anchor_source=args.depth_anchor_source,
         lambda_means_anchor=args.lambda_means_anchor,
+        lambda_means_anchor_stage3b=args.lambda_means_anchor_stage3b,
         lambda_rotation_reg=args.lambda_rotation_reg,
+        lambda_rotation_reg_stage3b=args.lambda_rotation_reg_stage3b,
+        means_delta_cap=args.means_delta_cap,
+        means_delta_cap_stage3b=args.means_delta_cap_stage3b,
         sampling_radius_threshold=args.sampling_radius_threshold,
         opacity_prune_threshold=args.opacity_prune_threshold,
         prune_every=args.prune_every,

@@ -890,3 +890,387 @@
   - `docs/plans/2026-03-06-long-lrm-style-post-refinement.md`
 - 是否需要新增或更新 skill:
   - 否。本轮知识更偏项目当前 backlog 决策, 现阶段写回文档和 EPIPHANY 更合适。
+
+## [2026-03-10 09:05:30 UTC] `lambda_lr_consistency=0.6` 近邻实验的中间证据
+
+### 现象
+
+- 用户在 `lr=0.6, iter32, sub8` 运行过程中主动中断了实验。
+- 当前中间产物 `metrics_stage3sr.json` 已存在, 最新长度为 `26`。
+- 最新中间点读数为:
+  - `psnr = 24.109913076209125`
+  - `residual_mean = 0.03496415540575981`
+  - `sharpness = 0.0030633641872555017`
+  - `psnr_hr = 21.528477663293394`
+  - `residual_mean_hr = 0.050447121262550354`
+  - `loss_lr_consistency = 0.015626876149326566`
+
+### 初步结论
+
+- 这条 `0.6` 近邻点到中途为止没有表现出“明显压过 `0.5 iter32`”的证据。
+- 和已完成的 `0.5 iter32` 相比, 它当前是:
+  - native `psnr` 略低
+  - native `residual_mean` 略高
+  - `HR-space` 指标也略低
+- 因此现阶段还不能据此得出“继续加 LR consistency 就能把 residual 压过去”的结论。
+- 但同样也不能从这条中途中断 run 直接反推出“应当彻底丢掉 LR consistency”。
+
+## [2026-03-10 09:19:30 UTC] `HR-only` 对照完成: 直接移除 LR consistency 会显著伤害 native 指标
+
+### 现象
+
+- 真实输出目录:
+  - `outputs/refine_v2/full_view_sr_stage3sr_phaseC_hr32_lr0p0_sub8_iter32_20260310`
+- 最终 `diagnostics.json` 显示:
+  - `phase_reached = stage3sr`
+  - `stopped_reason = metrics_plateau`
+  - `psnr = 22.271083371818634`
+  - `residual_mean = 0.049804605543613434`
+  - `sharpness = 0.00288753816857934`
+  - `psnr_hr = 21.283824302586495`
+  - `residual_mean_hr = 0.04892662912607193`
+
+### 对比
+
+- 相比 `lr=0.5 iter32`:
+  - `psnr -1.883485`
+  - `residual_mean +0.014887`
+  - `sharpness -0.000304`
+  - `psnr_hr -0.332138`
+  - `residual_mean_hr -0.000728`
+- 相比 `Phase A iter20`:
+  - `psnr -1.729887`
+  - `residual_mean +0.015375`
+  - `sharpness -0.000068`
+
+### 结论
+
+- 已验证结论:
+  - 当前主线里, 直接把 `lambda_lr_consistency` 设为 `0` 会显著破坏 native-space 指标。
+  - 它并没有换来更强的 `HR-space` 胜利, 反而 `psnr_hr` 也更低。
+- 这条证据说明:
+  - `LR consistency` 不是无意义累赘。
+  - 它现在仍然在提供关键的约束作用。
+- 因此下一步更合理的是:
+  - 继续补 `0.4` 近邻点
+  - 而不是把主线直接切成纯 `HR-only`
+
+## [2026-03-10 09:49:30 UTC] Phase E 最小实现与真实 smoke
+
+### 现象
+
+- 用户要求暂停 `Phase C` 参数调优, 先实现 `Phase E`。
+- 本轮最小实现选择的是:
+  - 不重写第二套 geometry pipeline
+  - 直接复用 `Phase C` 的 full-frame HR reference-space 主监督路径
+  - 在其后新增 `stage3b`, 允许有限 geometry 更新
+- 代码层新增了:
+  - `enable_stage3b`
+  - `StageController.should_enter_stage3b(...)`
+  - `run_stage3b()`
+  - `compute_stage3b_losses(...)`
+
+### 静态验证
+
+- `python3 -m py_compile` 通过:
+  - `src/refinement_v2/config.py`
+  - `src/refinement_v2/losses.py`
+  - `src/refinement_v2/stage_controller.py`
+  - `src/refinement_v2/runner.py`
+  - `tests/refinement_v2/test_runner_stage3b.py`
+- 定向测试:
+  - `PYTHONPATH="$(pwd)" pixi run pytest -q tests/refinement_v2/test_config.py tests/refinement_v2/test_stage_controller.py tests/refinement_v2/test_runner_stage3b.py`
+  - 结果: `25 passed`
+- 全量回归:
+  - `PYTHONPATH="$(pwd)" pixi run pytest -q tests/refinement_v2`
+  - 结果: `117 passed`
+
+### 动态验证
+
+- 真实 smoke 目录:
+  - `outputs/refine_v2/phaseE_stage3b_smoke_sub8_20260310`
+- 命令口径:
+  - `--enable-stage3b`
+  - `--stage2a-mode enhanced`
+  - `--lambda-hr-rgb 32`
+  - `--lambda-lr-consistency 0.5`
+  - `--target-subsample 8`
+  - `--iters-stage2a 2`
+  - `--iters-stage2b 2`
+  - `--stop-after stage3b`
+- 已确认:
+  - `diagnostics.json` 存在
+  - `phase_reached = stage3b`
+  - `stopped_reason = metrics_plateau`
+- 同一条 run 内部对比:
+  - `stage3sr` 最后一点:
+    - `psnr = 19.628720259216244`
+    - `residual_mean = 0.06401330977678299`
+    - `psnr_hr = 18.475841290772486`
+    - `residual_mean_hr = 0.07501371204853058`
+  - `stage3b` 最后一点:
+    - `psnr = 20.43559102089945`
+    - `residual_mean = 0.05679432675242424`
+    - `psnr_hr = 19.01363852913593`
+    - `residual_mean_hr = 0.06960125267505646`
+
+### 结论
+
+- 已验证结论:
+  - `Phase E` 的最小版本已经落地, 不再只是文档里的概念。
+  - 它能在真实 full-view `sub8` 资产上实际进入 `stage3b`。
+  - 在最小 smoke 里, `stage3b` 相比同一条 run 的 `stage3sr` 已经带来正向改进:
+    - `psnr +0.806871`
+    - `residual_mean -0.007219`
+    - `psnr_hr +0.537797`
+    - `residual_mean_hr -0.005412`
+- 当前限制也要明确:
+  - 这还是最小版 `Phase E`
+  - 仍复用了 `iters_stage2b`、`lambda_means_anchor`、`lambda_rotation_reg`、`means_delta_cap`
+  - 还没有独立的 `stage3b` 专属超参数面
+
+## [2026-03-10 10:20:00 UTC] Phase E 继续补 `stage3b` 独立超参数面
+
+### 现象
+
+- `Phase E` 的最小版 `stage3b` 已经能跑, 但运行期仍复用:
+  - `iters_stage2b`
+  - `lambda_means_anchor`
+  - `lambda_rotation_reg`
+  - `means_delta_cap`
+- 这会让后续 `Phase E` 长跑难以做纯净归因。
+
+### 假设
+
+- 如果先把 `stage3b` 的 iteration / geometry regularizer / means clamp 从 `stage2b` 解绑,
+- 后续 `Phase E` 的长跑与 calibration 会更容易解释, 也更不容易被旧 limited geometry 配置污染。
+
+### 实现
+
+- `src/refinement_v2/config.py`
+  - 新增 `iters_stage3b`
+  - 新增 `lambda_means_anchor_stage3b`
+  - 新增 `lambda_rotation_reg_stage3b`
+  - 新增 `means_delta_cap_stage3b`
+  - 新增 CLI:
+    - `--iters-stage3b`
+    - `--lambda-means-anchor-stage3b`
+    - `--lambda-rotation-reg-stage3b`
+    - `--means-delta-cap`
+    - `--means-delta-cap-stage3b`
+  - 用 `__post_init__` 让 `stage3b` 默认继承旧共享 geometry 参数, 保持兼容
+- `src/refinement_v2/runner.py`
+  - 新增 `_resolve_geometry_stage_hparams(...)`
+  - `stage3b` 改为读取独立 iteration / regularizer / clamp 配置
+  - `stage2b` 继续走历史配置, 但也统一复用同一个解析 helper
+  - metrics 里新增运行时证据:
+    - `iters_budget`
+    - `lambda_means_anchor_active`
+    - `lambda_rotation_reg_active`
+    - `means_delta_cap_active`
+- `src/refinement_v2/gaussian_adapter.py`
+  - `clamp_stage_constraints("stage3b", ...)` 现在优先读取 `means_delta_cap_stage3b`
+
+### 静态验证
+
+- `python3 -m py_compile src/refinement_v2/config.py src/refinement_v2/gaussian_adapter.py src/refinement_v2/runner.py tests/refinement_v2/test_config.py tests/refinement_v2/test_gaussian_adapter.py tests/refinement_v2/test_runner_stage3b.py`
+  - 通过
+- `PYTHONPATH="$(pwd)" pixi run pytest -q tests/refinement_v2/test_config.py tests/refinement_v2/test_gaussian_adapter.py tests/refinement_v2/test_runner_stage3b.py tests/refinement_v2/test_stage_controller.py`
+  - 结果: `30 passed`
+- `PYTHONPATH="$(pwd)" pixi run pytest -q tests/refinement_v2`
+  - 结果: `119 passed`
+
+### 动态验证
+
+- 真实 smoke 目录:
+  - `outputs/refine_v2/phaseE_stage3b_hparams_smoke_sub8_20260310`
+- 启动前显存:
+  - `0 MiB / 81920 MiB`
+- 关键 CLI:
+  - `--iters-stage2b 1`
+  - `--iters-stage3b 2`
+  - `--lambda-means-anchor 0.0`
+  - `--lambda-means-anchor-stage3b 0.02`
+  - `--lambda-rotation-reg 0.0`
+  - `--lambda-rotation-reg-stage3b 0.02`
+  - `--means-delta-cap 0.03`
+  - `--means-delta-cap-stage3b 0.01`
+- `diagnostics.json` 已确认:
+  - `phase_reached = stage3b`
+  - `stopped_reason = metrics_plateau`
+- `metrics_stage3b.json` 最后一点已明确记录:
+  - `iters_budget = 2`
+  - `lambda_means_anchor_active = 0.02`
+  - `lambda_rotation_reg_active = 0.02`
+  - `means_delta_cap_active = 0.01`
+- 同 run 内 `stage3b` 相比 `stage3sr`:
+  - `psnr 19.628720 -> 20.435591`
+  - `residual_mean 0.064013 -> 0.056794`
+  - `psnr_hr 18.475841 -> 19.013638`
+  - `residual_mean_hr 0.075014 -> 0.069601`
+
+### 结论
+
+- 已验证结论:
+  - `stage3b` 的独立超参数面已经真实落地, 不只是 CLI 层的空壳。
+  - 这次改动没有破坏 `tests/refinement_v2` 主线回归。
+- 当前下一步最有信息量的不是再补配置, 而是跑一条更长的 `stage3b` apples-to-apples 对照。
+
+## [2026-03-10 11:22:00 UTC] Phase E 长程与 continuation 收口
+
+### 现象 1: 更长 auto-gate `Phase E` run 没有进入 `stage3b`
+
+- 目录:
+  - `outputs/refine_v2/full_view_sr_stage3b_phaseE_hr32_lr0p5_sub8_iter32_20260310`
+- 最终结果:
+  - `phase_reached = stage3sr`
+  - `stopped_reason = metrics_plateau`
+  - `psnr = 24.154513879928512`
+  - `residual_mean = 0.034917574375867844`
+  - `psnr_hr = 21.62737934559564`
+  - `residual_mean_hr = 0.04957122728228569`
+
+### 假设 1
+
+- 这不是 `stage3b` 跑挂了, 而是 auto gate 没放行。
+
+### 静态证据
+
+- `src/refinement_v2/runner.py:1803`
+  - `local_overlap_persistent = residual_mean > 0.045`
+- `src/refinement_v2/stage_controller.py:59`
+  - `should_enter_stage3b(...)` 需要 `need_geometry=True` 且 `local_overlap_persistent=True`
+
+### 动态证据
+
+- source run 的 `state/latest.pt` 已确认:
+  - `stage_name = stage3sr`
+  - `stage3sr_completed = True`
+  - `phase3s_completed = True`
+  - `need_geometry = False`
+  - `local_overlap_persistent = False`
+- 这与最终 `residual_mean = 0.034917574375867844 < 0.045` 一致。
+
+### 结论 1
+
+- 已验证结论:
+  - 更长 auto path 停在 `stage3sr`, 不能解释成“`stage3b` 跑了但没收益”。
+  - 更准确的说法是: `stage3sr` 已经把 overlap 压到当前 geometry gate 以下。
+
+### 现象 2: 从同一条 `stage3sr` 末态继续接 `stage3b`, 指标还能继续改善
+
+- 手工 continuation:
+  - `outputs/refine_v2/full_view_sr_stage3b_phaseE_resume_from_stage3sr_hr32_lr0p5_sub8_iter32_20260310`
+- 正式 CLI continuation:
+  - `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter32_20260310`
+- 两条 continuation 都收敛到几乎同一结果:
+  - 手工:
+    - `psnr = 24.633636263443535`
+    - `residual_mean = 0.03258064016699791`
+    - `psnr_hr = 21.93410154162478`
+    - `residual_mean_hr = 0.04774709418416023`
+  - CLI:
+    - `psnr = 24.633623626096842`
+    - `residual_mean = 0.03258058801293373`
+    - `psnr_hr = 21.934121746007385`
+    - `residual_mean_hr = 0.047747090458869934`
+
+### 对比
+
+- continuation 相比 gate 停在 `stage3sr` 的结果:
+  - `psnr +0.479122`
+  - `residual_mean -0.002337`
+  - `sharpness +0.000883`
+  - `psnr_hr +0.306722`
+  - `residual_mean_hr -0.001824`
+  - `sharpness_hr +0.000347`
+- CLI 相比手工 continuation 的差值几乎为 0:
+  - `delta psnr = -1.2637e-05`
+  - `delta residual_mean = -5.2154e-08`
+  - `delta psnr_hr = +2.0204e-05`
+  - `delta residual_mean_hr = -3.7253e-09`
+
+### 结论 2
+
+- 已验证结论:
+  - `Phase E` 在更长 `stage3sr` 末态上继续接 `stage3b`, 仍然有稳定收益。
+  - 新增的 `start_stage=stage3b --resume` workflow 已经和手工 continuation 对齐, 可以作为正式实验入口使用。
+- 当前真正还没决定的只剩下:
+  - auto gate 是否应该放宽
+  - `stage3b` 内部超参数该怎么校准
+
+## [2026-03-10 11:34:00 UTC] Phase E calibration 预分析
+
+### 现象
+
+- 基线 continuation 目录:
+  - `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter32_20260310`
+- `metrics_stage3b.json` 尾部 8 个点持续单调改善:
+  - `psnr 24.5487 -> 24.6336`
+  - `residual_mean 0.032988 -> 0.032581`
+  - `psnr_hr 21.8726 -> 21.9265`
+  - `residual_mean_hr 0.048153 -> 0.047799`
+- 这说明当前最先值得验证的不是立刻放松 regularizer, 而是确认 `32 iter` 是否只是预算过短。
+
+### 当前假设
+
+- 主假设:
+  - `stage3b` 在 `iter=32` 时仍未收敛, 因此先把 `iters_stage3b` 提到 `64` 是最干净的第一刀。
+- 备选解释:
+  - 即便曲线仍在涨, 真正限制可能是 `means_delta_cap_stage3b=0.01` 或 anchor / rotation reg 偏强。
+- 推翻主假设的证据:
+  - 如果 `iter=64` 相比 `iter=32` 只带来极小增益, 或中后段开始恶化, 那就说明预算不是主要瓶颈。
+
+## [2026-03-10 11:45:00 UTC] Phase E 第一轮 continuation calibration: `iters_stage3b=64`
+
+### 现象
+
+- 新目录:
+  - `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter64_20260310`
+- 配置口径:
+  - 正式 `--start-stage stage3b --resume`
+  - `--target-subsample 8`
+  - 仅把 `iters_stage3b` 从 `32` 改到 `64`
+  - 其余保持:
+    - `lambda_means_anchor_stage3b = 0.02`
+    - `lambda_rotation_reg_stage3b = 0.02`
+    - `means_delta_cap_stage3b = 0.01`
+- 最终 `diagnostics.json`:
+  - `phase_reached = stage3b`
+  - `stopped_reason = metrics_plateau`
+  - `warm_start_stage3b = true`
+  - `psnr = 24.962974696829484`
+  - `residual_mean = 0.031111249700188637`
+  - `psnr_hr = 22.124704905272846`
+  - `residual_mean_hr = 0.046562712639570236`
+
+### 静态 / 动态证据
+
+- 相比 `iter32` continuation:
+  - `psnr +0.329351070733`
+  - `residual_mean -0.001469338313`
+  - `psnr_hr +0.190583159265`
+  - `residual_mean_hr -0.001184377819`
+- 相比 auto gate 停在 `stage3sr`:
+  - `psnr +0.808460816901`
+  - `residual_mean -0.003806324676`
+  - `psnr_hr +0.497325559677`
+  - `residual_mean_hr -0.003008514643`
+- `metrics_stage3b.json` 尾部 5 个点仍连续改善:
+  - `psnr 24.9266 -> 24.9630`
+  - `residual_mean 0.031259 -> 0.031111`
+  - `psnr_hr 22.1017 -> 22.1244`
+  - `residual_mean_hr 0.046685 -> 0.046543`
+
+### 结论
+
+- 已验证结论:
+  - `Phase E` 的 continuation 不只是“多跑一点也许更好”, 而是已经证明 `iters_stage3b=64` 明显优于 `iter32`。
+  - 这说明第一轮 calibration 已经回答了一个核心问题:
+    - `32 iter` 不是一个充分预算。
+- 当前候选假设:
+  - 预算仍可能是主要瓶颈之一。
+- 最强备选解释:
+  - 真正卡住的也可能不是 iter 本身, 而是 `means_delta_cap_stage3b=0.01` 或两个 regularizer 偏强。
+- 下一步最小可证伪实验:
+  - 保持 `iters_stage3b>=64`, 再扫 `means_delta_cap_stage3b` 与 `lambda_*_stage3b`。

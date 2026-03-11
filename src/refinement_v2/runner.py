@@ -17,13 +17,12 @@ from .gaussian_adapter import GaussianAdapter
 from .losses import (
     build_depth_anchor_valid_mask,
     compute_depth_anchor_loss,
-    compute_means_anchor_loss,
     compute_opacity_sparse_loss,
     compute_patch_perceptual_loss,
     compute_pose_regularization,
-    compute_rotation_regularization_loss,
     compute_sampling_smooth_loss,
     compute_scale_tail_loss,
+    compute_stage3b_losses,
     compute_weighted_rgb_loss,
     downsample_rgb_tensor,
 )
@@ -120,6 +119,7 @@ class RefinementRunner:
             "used_joint_fallback": False,
             "stage2a_mode_requested": self.run_config.stage2a_mode,
             "stage3sr_enabled": self._stage2a_should_run_stage3sr(),
+            "stage3b_enabled": self.run_config.enable_stage3b,
             "render_devices": [str(device) for device in self.render_devices],
             "depth_anchor_enabled": bool(self.hparams.enable_depth_anchor and self.hparams.lambda_depth_anchor > 0.0),
             "depth_anchor_weight": self.hparams.lambda_depth_anchor,
@@ -1416,41 +1416,66 @@ class RefinementRunner:
         loss_patch_perceptual = loss_patch_perceptual / patch_set_denominator
         return loss_patch_rgb, loss_patch_perceptual
 
-    def _run_stage3sr_full_frame_hr(
+    def _resolve_geometry_stage_hparams(self, stage_name: str) -> dict[str, float | int]:
+        """解析当前 geometry 阶段应使用的超参数.
+
+        `stage2b` 继续沿用历史参数.
+        `stage3b` 则优先读取独立超参数面,避免继续被旧 limited geometry 口径绑住.
+        """
+
+        if stage_name == "stage3b":
+            return {
+                "iters": int(self.hparams.iters_stage3b),
+                "lambda_means_anchor": float(self.hparams.lambda_means_anchor_stage3b),
+                "lambda_rotation_reg": float(self.hparams.lambda_rotation_reg_stage3b),
+                "means_delta_cap": float(self.hparams.means_delta_cap_stage3b),
+            }
+
+        return {
+            "iters": int(self.hparams.iters_stage2b),
+            "lambda_means_anchor": float(self.hparams.lambda_means_anchor),
+            "lambda_rotation_reg": float(self.hparams.lambda_rotation_reg),
+            "means_delta_cap": float(self.hparams.means_delta_cap),
+        }
+
+    def _run_reference_supervised_stage(
         self,
         *,
         stage_name: str,
         export_file_name: str,
+        geometry_stage: bool,
     ) -> dict[str, Any]:
-        """运行 `Phase C` 风格的 full-frame HR supervision.
+        """运行 reference-space 主监督阶段.
 
-        当前最小版坚持两层语义:
-        1. SR 6 视频是 reference 分辨率主监督
-        2. native LR 退成 HR output 的下采样一致性约束
+        `geometry_stage=False` 时,它就是当前 `Phase C` 的 `stage3sr`.
+        `geometry_stage=True` 时,它就是 `Phase E` 的 `stage3b`:
+        在保持 HR 主监督 + LR consistency 的同时, 允许有限 geometry 更新.
         """
 
         self._ensure_depth_anchor_reference(stage_name)
         self.current_stage = stage_name
-        self.gaussians.freeze_for_stage("stage3sr")
-        optimizer = self.gaussians.build_optimizer("stage3sr", self.hparams)
+        train_stage_name = 'stage3b' if geometry_stage else 'stage3sr'
+        self.gaussians.freeze_for_stage(train_stage_name)
+        optimizer = self.gaussians.build_optimizer(train_stage_name, self.hparams)
         self.last_sr_patch_sets_used = 0
+        geometry_hparams = self._resolve_geometry_stage_hparams(stage_name)
 
         final_metrics: dict[str, Any] = {}
         use_depth_anchor = self._stage_uses_depth_anchor(stage_name)
-        for iter_idx in range(self.hparams.iters_stage2a):
+        total_iters = int(geometry_hparams["iters"]) if geometry_stage else self.hparams.iters_stage2a
+        lambda_means_anchor = float(geometry_hparams["lambda_means_anchor"])
+        lambda_rotation_reg = float(geometry_hparams["lambda_rotation_reg"])
+        for iter_idx in range(total_iters):
             optimizer.zero_grad(set_to_none=True)
 
-            # Phase C 的 native render 只负责:
-            # 1. 构造 residual / robust weight
-            # 2. 提供 sampling-smooth 的可见性统计
-            # 如果当前没有启用 depth anchor, 这条分支本身不需要参与反传.
-            # 提前关掉 autograd, 可以避免 native 图和 HR 图同时常驻显存.
+            # native render 仍然只负责 residual / robust weight 与可见性统计.
+            # 如果当前阶段没开 depth anchor, 这一支不需要保留反传图.
             if use_depth_anchor:
                 render_output = self.render_current_scene()
             else:
                 with torch.no_grad():
                     render_output = self.render_current_scene()
-            pred_rgb_native = render_output["images_pred"]
+            pred_rgb_native = render_output['images_pred']
             render_meta = self._extract_render_meta(render_output)
             self.latest_render_meta = render_meta
 
@@ -1466,7 +1491,7 @@ class RefinementRunner:
             loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
             if use_depth_anchor:
                 loss_depth_anchor, depth_anchor_valid_ratio, depth_anchor_skip_reason = self._compute_depth_anchor_loss_for_view_range(
-                    render_output.get("depths_pred"),
+                    render_output.get('depths_pred'),
                     start_index=0,
                     end_index=self.scene.gt_images.shape[1],
                 )
@@ -1487,11 +1512,26 @@ class RefinementRunner:
                 render_meta=render_meta,
                 radius_threshold=self.hparams.sampling_radius_threshold,
             )
+            if geometry_stage:
+                # `Phase E` 允许 geometry 参与优化,但仍要被 anchor / rotation reg 拉住.
+                # 这样 SR 信息能推动结构,又不会一下子把点云拉飞.
+                loss_means_anchor, loss_rotation_reg = compute_stage3b_losses(
+                    self.gaussians.means,
+                    self.gaussians.initial_means,
+                    self.gaussians.rotations,
+                    self.gaussians.initial_rotations,
+                )
+            else:
+                loss_means_anchor = torch.zeros((), dtype=pred_rgb_native.dtype, device=pred_rgb_native.device)
+                loss_rotation_reg = torch.zeros((), dtype=pred_rgb_native.dtype, device=pred_rgb_native.device)
+
             base_loss = (
                 self.hparams.lambda_scale_tail * loss_scale
                 + self.hparams.lambda_opacity_sparse * loss_opacity
                 + self.hparams.lambda_depth_anchor * loss_depth_anchor
                 + self.hparams.lambda_sampling_smooth * loss_sampling_smooth
+                + lambda_means_anchor * loss_means_anchor
+                + lambda_rotation_reg * loss_rotation_reg
             )
             base_loss.backward()
 
@@ -1514,11 +1554,11 @@ class RefinementRunner:
                 reference_scene,
                 views_per_shard=self.hparams.reference_render_shard_views,
             ):
-                start_index = int(shard_payload["start_index"])
-                end_index = int(shard_payload["end_index"])
-                shard_scene = shard_payload["scene"]
-                shard_output = shard_payload["output"]
-                pred_rgb_hr_shard = shard_output["images_pred"]
+                start_index = int(shard_payload['start_index'])
+                end_index = int(shard_payload['end_index'])
+                shard_scene = shard_payload['scene']
+                shard_output = shard_payload['output']
+                pred_rgb_hr_shard = shard_output['images_pred']
                 reference_rgb_shard = self._get_reference_images(
                     shard_scene,
                     device=pred_rgb_hr_shard.device,
@@ -1553,7 +1593,7 @@ class RefinementRunner:
                     dtype=pred_rgb_hr_shard.dtype,
                 )
                 if residual_map_native_shard is None or lr_weight_map_shard is None or gt_rgb_shard is None:
-                    raise RuntimeError("Phase C full-frame HR shard preparation should never return None tensors.")
+                    raise RuntimeError('Phase C/Phase E shard preparation should never return None tensors.')
 
                 hr_weight_map_shard = self._build_reference_supervision_weight_map(
                     residual_map_native_shard,
@@ -1607,7 +1647,7 @@ class RefinementRunner:
 
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-            self.gaussians.clamp_stage_constraints("stage3sr", self.hparams)
+            self.gaussians.clamp_stage_constraints(train_stage_name, self.hparams)
 
             pred_rgb_hr_cpu = torch.cat(pred_rgb_hr_cpu_shards, dim=1)
             pred_rgb_lr_cpu = torch.cat(pred_rgb_lr_cpu_shards, dim=1)
@@ -1622,6 +1662,8 @@ class RefinementRunner:
                 + self.hparams.lambda_opacity_sparse * float(loss_opacity.item())
                 + self.hparams.lambda_depth_anchor * float(loss_depth_anchor.item())
                 + self.hparams.lambda_sampling_smooth * float(loss_sampling_smooth.item())
+                + lambda_means_anchor * float(loss_means_anchor.item())
+                + lambda_rotation_reg * float(loss_rotation_reg.item())
             )
             final_metrics = self._summarize_prediction(
                 pred_rgb_lr_cpu,
@@ -1631,22 +1673,33 @@ class RefinementRunner:
             )
             final_metrics.update(
                 {
-                    "loss_total": loss_total_value,
-                    "loss_hr_rgb": loss_hr_rgb_value,
-                    "loss_lr_consistency": loss_lr_consistency_value,
-                    "loss_scale_tail": float(loss_scale.item()),
-                    "loss_opacity_sparse": float(loss_opacity.item()),
-                    "loss_sampling_smooth": float(loss_sampling_smooth.item()),
-                    "stage3sr_supervision_mode": "full_frame_hr",
-                    "psnr_hr": self._compute_psnr(pred_rgb_hr_cpu, reference_rgb_cpu),
-                    "sharpness_hr": self._compute_sharpness(pred_rgb_hr_cpu),
-                    "residual_mean_hr": float(hr_residual_map.mean().item()),
-                    "weight_mean_hr": float(hr_weight_map.mean().item()),
-                    "psnr_native_render": native_metrics["psnr"],
-                    "sharpness_native_render": native_metrics["sharpness"],
-                    "residual_mean_native_render": native_metrics.get("residual_mean", 0.0),
+                    'loss_total': loss_total_value,
+                    'loss_hr_rgb': loss_hr_rgb_value,
+                    'loss_lr_consistency': loss_lr_consistency_value,
+                    'loss_scale_tail': float(loss_scale.item()),
+                    'loss_opacity_sparse': float(loss_opacity.item()),
+                    'loss_sampling_smooth': float(loss_sampling_smooth.item()),
+                    'stage3sr_supervision_mode': 'full_frame_hr',
+                    'psnr_hr': self._compute_psnr(pred_rgb_hr_cpu, reference_rgb_cpu),
+                    'sharpness_hr': self._compute_sharpness(pred_rgb_hr_cpu),
+                    'residual_mean_hr': float(hr_residual_map.mean().item()),
+                    'weight_mean_hr': float(hr_weight_map.mean().item()),
+                    'psnr_native_render': native_metrics['psnr'],
+                    'sharpness_native_render': native_metrics['sharpness'],
+                    'residual_mean_native_render': native_metrics.get('residual_mean', 0.0),
                 }
             )
+            if geometry_stage:
+                final_metrics.update(
+                    {
+                        'loss_means_anchor': float(loss_means_anchor.item()),
+                        'loss_rotation_reg': float(loss_rotation_reg.item()),
+                        'iters_budget': total_iters,
+                        'lambda_means_anchor_active': lambda_means_anchor,
+                        'lambda_rotation_reg_active': lambda_rotation_reg,
+                        'means_delta_cap_active': float(geometry_hparams['means_delta_cap']),
+                    }
+                )
             if use_depth_anchor:
                 final_metrics.update(
                     self._build_depth_anchor_metrics(
@@ -1664,12 +1717,29 @@ class RefinementRunner:
                 break
 
         self._safe_export_ply(export_file_name)
-        self.diagnostics_state["stage3sr_completed"] = True
-        self.diagnostics_state["stage3sr_supervision_mode"] = "full_frame_hr"
-        self.diagnostics_state["phase_reached"] = stage_name
-        self.diagnostics_state["global_shift_detected"] = False
+        if geometry_stage:
+            self.diagnostics_state['stage3b_completed'] = True
+        else:
+            self.diagnostics_state['stage3sr_completed'] = True
+            self.diagnostics_state['stage3sr_supervision_mode'] = 'full_frame_hr'
+        self.diagnostics_state['phase_reached'] = stage_name
+        self.diagnostics_state['global_shift_detected'] = False
         self._update_stage2b_diagnostics(final_metrics)
         return final_metrics
+
+    def _run_stage3sr_full_frame_hr(
+        self,
+        *,
+        stage_name: str,
+        export_file_name: str,
+    ) -> dict[str, Any]:
+        """运行 `Phase C` 风格的 full-frame HR supervision."""
+
+        return self._run_reference_supervised_stage(
+            stage_name=stage_name,
+            export_file_name=export_file_name,
+            geometry_stage=False,
+        )
 
     def _summarize_prediction(
         self,
@@ -2255,18 +2325,17 @@ class RefinementRunner:
         self._update_stage2b_diagnostics(final_metrics)
         return final_metrics
 
-    def bootstrap_stage2b_from_current_gaussians(self) -> dict[str, Any]:
-        """把当前输入高斯视为“已完成 Stage 2A”的 warm start.
+    def _bootstrap_geometry_from_current_gaussians(self, *, warm_start_key: str) -> dict[str, Any]:
+        """把当前输入高斯视为 geometry continuation 的 warm start.
 
-        这个入口用于显式支持:
-        - 输入已经是 `gaussians_stage2a.ply`
-        - 本轮只想继续做 `Stage 2B`
+        这个入口同时服务:
+        - `start_stage=stage2b`
+        - `start_stage=stage3b`
 
-        这里不会再做新的 Stage 2A optimizer step.
-        只会:
-        1. 重新渲染当前高斯
-        2. 更新权重图与统计
-        3. 生成是否进入 `Stage 2B` 的 diagnostics
+        两者的共同需求都是:
+        1. 不再重复跑前面的 appearance optimizer
+        2. 先把当前高斯重新渲染一遍
+        3. 重建后续 geometry 阶段需要的权重图与 diagnostics
         """
 
         self.current_stage = "stage2a"
@@ -2298,9 +2367,28 @@ class RefinementRunner:
 
         self.diagnostics_state["phase_reached"] = "stage2a"
         self.diagnostics_state["stage3a_completed"] = True
-        self.diagnostics_state["warm_start_stage2b"] = True
+        self.diagnostics_state[warm_start_key] = True
         self.diagnostics_state["stage2a_bootstrap"] = metrics
         self._update_stage2b_diagnostics(metrics)
+        return metrics
+
+    def bootstrap_stage2b_from_current_gaussians(self) -> dict[str, Any]:
+        """把当前输入高斯视为“已完成 Stage 2A”的 warm start."""
+
+        return self._bootstrap_geometry_from_current_gaussians(warm_start_key="warm_start_stage2b")
+
+    def bootstrap_stage3b_from_current_gaussians(self) -> dict[str, Any]:
+        """把当前输入高斯视为“已完成 Stage 3SR”的 warm start.
+
+        这条路径主要用于 continuation / resume:
+        - 输入已经是 `gaussians_stage3sr.ply` 或 `latest.pt` 中的 `stage3sr` 末态
+        - 只想继续接一段 `stage3b`
+        """
+
+        metrics = self._bootstrap_geometry_from_current_gaussians(warm_start_key="warm_start_stage3b")
+        self.diagnostics_state["stage3sr_enabled"] = True
+        self.diagnostics_state["stage3sr_completed"] = True
+        self.diagnostics_state["stage3sr_supervision_mode"] = "full_frame_hr"
         return metrics
 
     def _safe_export_ply(self, file_name: str) -> None:
@@ -2459,9 +2547,12 @@ class RefinementRunner:
         self.current_stage = "stage2b"
         self.gaussians.freeze_for_stage("stage2b")
         optimizer = self.gaussians.build_optimizer("stage2b", self.hparams)
+        geometry_hparams = self._resolve_geometry_stage_hparams("stage2b")
+        lambda_means_anchor = float(geometry_hparams["lambda_means_anchor"])
+        lambda_rotation_reg = float(geometry_hparams["lambda_rotation_reg"])
 
         final_metrics: dict[str, Any] = {}
-        for iter_idx in range(self.hparams.iters_stage2b):
+        for iter_idx in range(int(geometry_hparams["iters"])):
             render_output = self.render_current_scene()
             pred_rgb = render_output["images_pred"]
             gt_rgb = self._get_gt_images(device=pred_rgb.device, dtype=pred_rgb.dtype)
@@ -2475,8 +2566,9 @@ class RefinementRunner:
             loss_scale = compute_scale_tail_loss(self.gaussians.scales, self.hparams.scale_tail_threshold)
             loss_opacity = compute_opacity_sparse_loss(self.gaussians.opacity)
             loss_patch_rgb, loss_patch_perceptual = self._compute_patch_losses(residual_map, loss_rgb)
-            loss_means_anchor = compute_means_anchor_loss(self.gaussians.means, self.gaussians.initial_means)
-            loss_rotation_reg = compute_rotation_regularization_loss(
+            loss_means_anchor, loss_rotation_reg = compute_stage3b_losses(
+                self.gaussians.means,
+                self.gaussians.initial_means,
                 self.gaussians.rotations,
                 self.gaussians.initial_rotations,
             )
@@ -2485,8 +2577,8 @@ class RefinementRunner:
                 loss_total
                 + self.hparams.lambda_patch_rgb * loss_patch_rgb
                 + self.hparams.lambda_patch_perceptual * loss_patch_perceptual
-                + self.hparams.lambda_means_anchor * loss_means_anchor
-                + self.hparams.lambda_rotation_reg * loss_rotation_reg
+                + lambda_means_anchor * loss_means_anchor
+                + lambda_rotation_reg * loss_rotation_reg
             )
 
             loss_total.backward()
@@ -2510,6 +2602,10 @@ class RefinementRunner:
                     "loss_patch_perceptual": float(loss_patch_perceptual.item()),
                     "loss_means_anchor": float(loss_means_anchor.item()),
                     "loss_rotation_reg": float(loss_rotation_reg.item()),
+                    "iters_budget": int(geometry_hparams["iters"]),
+                    "lambda_means_anchor_active": lambda_means_anchor,
+                    "lambda_rotation_reg_active": lambda_rotation_reg,
+                    "means_delta_cap_active": float(geometry_hparams["means_delta_cap"]),
                     "sr_patch_sets_used": int(self.last_sr_patch_sets_used),
                 }
             )
@@ -2520,6 +2616,22 @@ class RefinementRunner:
         self.diagnostics_state["global_shift_detected"] = final_metrics.get("residual_mean", 0.0) > 0.08
         self.diagnostics_state["local_overlap_persistent"] = final_metrics.get("residual_mean", 0.0) > 0.03
         return final_metrics
+
+    def run_stage3b(self) -> dict[str, Any]:
+        """运行 `Phase E` 的 SR-driven limited geometry.
+
+        当前最小版只支持建立在 `Phase C` full-frame HR supervision 之上的 geometry release.
+        这样实现最直接, 也最贴近“让 SR 真正影响结构”这个目标.
+        """
+
+        if self._resolve_stage3sr_supervision_mode() != "full_frame_hr":
+            raise RuntimeError("stage3b currently requires full-frame HR supervision.")
+
+        return self._run_reference_supervised_stage(
+            stage_name="stage3b",
+            export_file_name="gaussians_stage3b.ply",
+            geometry_stage=True,
+        )
 
     def run_phase3_pose_only(self) -> dict[str, Any]:
         """运行 tiny pose-only diagnostic."""
@@ -2649,6 +2761,7 @@ class RefinementRunner:
             "used_pose_refinement": self.diagnostics_state.get("used_pose_refinement", False),
             "used_joint_fallback": self.diagnostics_state.get("used_joint_fallback", False),
             "warm_start_stage2b": self.diagnostics_state.get("warm_start_stage2b", False),
+            "warm_start_stage3b": self.diagnostics_state.get("warm_start_stage3b", False),
             "baseline": baseline,
             "final": final_metrics,
             "artifacts": dict(self.visual_artifacts),
@@ -2730,8 +2843,11 @@ class RefinementRunner:
         """运行完整 refinement 流程."""
 
         explicit_stage2b_start = self.run_config.start_stage == "stage2b"
+        explicit_stage3b_start = self.run_config.start_stage == "stage3b"
         if explicit_stage2b_start and not self.run_config.enable_stage2b:
             raise RuntimeError("start_stage=stage2b requires enable_stage2b=True.")
+        if explicit_stage3b_start and not self.run_config.enable_stage3b:
+            raise RuntimeError("start_stage=stage3b requires enable_stage3b=True.")
 
         final_metrics = self.run_phase0()
         if self.run_config.stop_after == "phase0":
@@ -2743,15 +2859,32 @@ class RefinementRunner:
 
         if explicit_stage2b_start:
             final_metrics = self.bootstrap_stage2b_from_current_gaussians()
+        elif explicit_stage3b_start:
+            final_metrics = self.bootstrap_stage3b_from_current_gaussians()
         else:
             final_metrics = self.run_stage2a()
 
         if self.run_config.stop_after == "stage2a":
             return self.export_final_outputs(final_metrics)
 
+        if explicit_stage3b_start:
+            self.run_phase3s_build_sr_selection()
+            final_metrics = self.run_stage3b()
+            if self.run_config.stop_after == "stage3b":
+                return self.export_final_outputs(final_metrics)
+
+        stage3b_ran = False
+        if not explicit_stage3b_start and self.controller.should_enter_stage3b(self.diagnostics_state):
+            final_metrics = self.run_stage3b()
+            stage3b_ran = True
+            if self.run_config.stop_after == "stage3b":
+                return self.export_final_outputs(final_metrics)
+
         # 显式 `start_stage=stage2b` 表示用户已经决定继续几何阶段.
         # 这种情况下不应再被自动 gate 拦住.
-        if explicit_stage2b_start or self.controller.should_enter_stage2b(self.diagnostics_state):
+        if not explicit_stage3b_start and not stage3b_ran and (
+            explicit_stage2b_start or self.controller.should_enter_stage2b(self.diagnostics_state)
+        ):
             final_metrics = self.run_stage2b()
             if self.run_config.stop_after == "stage2b":
                 return self.export_final_outputs(final_metrics)
