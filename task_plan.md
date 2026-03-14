@@ -551,3 +551,63 @@
 - backlog 往前推进为:
   1. 在 `iters_stage3b>=64` 的前提下继续做 `means_delta_cap_stage3b` 与 regularizer calibration
   2. 再决定 auto gate 是否要跟着放宽
+
+## 2026-03-14 00:00:00 UTC
+
+### 新任务: 定位 `assets/demo/static/diffusion_output_generated_my` 生成链路
+
+- [ ] 阶段1: 定位生成目标目录与 `rgb/*.mp4`、`pose/*.npz`、`intrinsics/*.npz` 的代码路径
+- [ ] 阶段2: 验证 `pose` 与 `intrinsics` 的语义依据
+- [ ] 阶段3: 验证 `0..5` 子目录分别代表什么
+- [ ] 阶段4: 回写六文件并输出带行号结论
+
+### 当前背景
+
+- 用户要的不是泛泛描述, 而是:
+  - 真实写文件的函数/调用链
+  - `pose` 矩阵语义的证据
+  - `intrinsics` 四元组语义的证据
+  - `0..5` 子目录含义
+- 本轮明确不改代码, 只做只读排查。
+
+### 当前行动
+
+- 先用 `rg` 与 `ast-grep` 搜索 `diffusion_output_generated_my`、`rgb`、`pose`、`intrinsics`、`.mp4`、`.npz` 的落盘路径。
+- 然后回读被命中的导出函数、调用入口和相机数据来源。
+- 最后把“已验证事实”和“推断”分开整理。
+
+## 2026-03-14 00:20:00 UTC
+
+### 阶段完成: `diffusion_output_generated_my` 生成链路已定位完毕
+
+- [x] 阶段1: 定位生成目标目录与 `rgb/*.mp4`、`pose/*.npz`、`intrinsics/*.npz` 的代码路径
+- [x] 阶段2: 验证 `pose` 与 `intrinsics` 的语义依据
+- [x] 阶段3: 验证 `0..5` 子目录分别代表什么
+- [x] 阶段4: 回写六文件并输出带行号结论
+
+### 已验证结果
+
+- 精确入口命令在 `README.md`:
+  - `gen3c_single_image_sdg.py --video_save_folder assets/demo/static/diffusion_output_generated_my`
+- 真实写文件脚本是:
+  - `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py`
+- 真实 mp4 编码 helper 是:
+  - `cosmos_predict1/utils/io.py::save_video`
+- `pose.npz` 保存的是:
+  - `generated_w2cs.inverse()`
+  - 即 `c2w`
+- `intrinsics.npz` 保存的是:
+  - `K[0,0], K[1,1], K[0,2], K[1,2]`
+  - 即 `[fx, fy, cx, cy]`
+- `0..5` 目录含义已对应到固定轨迹:
+  - `0 left`
+  - `1 right`
+  - `2 up`
+  - `3 zoom_out`
+  - `4 zoom_in`
+  - `5 clockwise`
+
+### 当前行动
+
+- 把关键文件路径、行号、动态验证结果整理成最终答复。
+- 明确区分“已验证事实”和“推断”。

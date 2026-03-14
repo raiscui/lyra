@@ -212,6 +212,25 @@
   - 更长 iter
   - 或开始下调 `lambda_lr_consistency`
 
+## [2026-03-14 00:20:00 UTC] 任务名称: 定位 `diffusion_output_generated_my` 生成链路与相机资产语义
+
+### 任务内容
+- 只读排查 `/workspace/lyra/assets/demo/static/diffusion_output_generated_my`
+- 定位真正写出 `rgb/*.mp4`、`pose/*.npz`、`intrinsics/*.npz` 的脚本与函数
+- 验证 `pose`、`intrinsics` 与 `0..5` 子目录的语义, 并区分事实与推断
+
+### 完成过程
+- 先从 `README.md` 精确命中生成命令, 确认目标目录由 `gen3c_single_image_sdg.py --video_save_folder .../diffusion_output_generated_my` 生成
+- 再用 `rg` 和 `ast-grep` 抓出 `np.savez(...)`、`save_video(...)`、`generate_camera_trajectory(...)` 的落盘位置
+- 回读 `gen3c_single_image_sdg.py` 中 normal path 与 resume path 两套写盘分支
+- 继续回读 `camera_utils.py`、`radym.py`、`provider.py`、`refinement_v2/data_loader.py` 与测试, 核对下游对 `pose/intrinsics` 的解释契约
+- 最后直接读取真实 `dj-style.npz` 与 `dj-style.mp4` 元数据, 用动态证据确认帧数、分辨率、四元组与轨迹方向
+
+### 总结感悟
+- 这类目录的核心生成器不是 `sample.py`, 而是 static SDG 脚本 `gen3c_single_image_sdg.py`
+- `0..5` 目录名本质上是六条固定轨迹的 `traj_idx`, 后续才被当作 multi-view 的 `view_id`
+- `pose.npz` 当前资产语义不是 renderer 内部的 `cam_view`, 而是 raw `c2w`; 只有在 refinement 入口处才被转换成 `inverse(c2w).T`
+
 ## [2026-03-10 07:47:33 UTC] 任务名称: 回收 Phase C iter20 长跑结果并完成文档收口
 
 ### 任务内容

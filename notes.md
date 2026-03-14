@@ -1274,3 +1274,78 @@
   - 真正卡住的也可能不是 iter 本身, 而是 `means_delta_cap_stage3b=0.01` 或两个 regularizer 偏强。
 - 下一步最小可证伪实验:
   - 保持 `iters_stage3b>=64`, 再扫 `means_delta_cap_stage3b` 与 `lambda_*_stage3b`。
+
+## [2026-03-14 00:00:00 UTC] 主题: `diffusion_output_generated_my` 生成链路与相机资产语义
+
+### 现象
+
+- `README.md` 里给出了精确命令:
+  - `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py`
+  - `--video_save_folder assets/demo/static/diffusion_output_generated_my`
+- 实际磁盘目录 `/workspace/lyra/assets/demo/static/diffusion_output_generated_my` 的布局是:
+  - `0..5/pose/dj-style.npz`
+  - `0..5/intrinsics/dj-style.npz`
+  - `0..5/rgb/dj-style.mp4`
+  - `0..5/latent/dj-style.pkl`
+
+### 已验证事实
+
+- 目录布局由 `gen3c_single_image_sdg.py` 的 `_build_output_paths()` 统一生成:
+  - `pose -> <video_save_folder>/pose/<clip>.npz`
+  - `intrinsics -> <video_save_folder>/intrinsics/<clip>.npz`
+  - `rgb -> <video_save_folder>/rgb/<clip>.mp4`
+- `demo_multi_trajectory()` 会把根目录进一步改成 `<video_save_folder>/<traj_idx>`:
+  - `0 -> left`
+  - `1 -> right`
+  - `2 -> up`
+  - `3 -> zoom_out`
+  - `4 -> zoom_in`
+  - `5 -> clockwise`
+- `pose.npz` 的写出内容不是 `w2c`, 而是 `generated_w2cs.inverse()` 之后的 `generated_c2ws`.
+- `generate_camera_trajectory()` 的返回值文档明确写的是 `generated_w2cs`.
+- `intrinsics.npz` 的写出内容是 `3x3 K` 里的:
+  - `K[0,0]`
+  - `K[1,1]`
+  - `K[0,2]`
+  - `K[1,2]`
+- 下游 `DataField.CAMERA_INTRINSICS` 的契约明确是 OpenCV pinhole `[fx, fy, cx, cy]`.
+- 下游 provider 的契约明确是:
+  - 原始 `c2w` -> `cam_view = inverse(c2w).T`
+- `refinement_v2/data_loader.py` 也明确写了:
+  - 当前真实资产里的外部 `pose.npz` 保存的是 raw pose / c2w
+  - 只有当 key 显式是 `cam_view` 时才不做转换
+- 实际资产 `dj-style.npz` 的 key 只有 `data` 和 `inds`, 不含 `cam_view`.
+- 实际资产 `rgb/dj-style.mp4` 经 `ffprobe` 验证是:
+  - `width=1280`
+  - `height=704`
+  - `nb_frames=121`
+  - `fps=24`
+- 实际资产 `intrinsics/dj-style.npz` 经读取验证:
+  - shape `(121, 4)`
+  - 六个目录内都是同一组四元组
+  - 第一帧数值是 `[887.8512, 868.12115, 640.0, 352.0]`
+  - 其中 `cx=640 = width/2`, `cy=352 = height/2`
+- 实际资产 `pose/dj-style.npz` 经读取验证:
+  - shape `(121, 4, 4)`
+  - `inds = [0..120]`
+  - 首帧是单位矩阵
+  - 末帧旋转子矩阵行列式为 `1.0`
+- 实际资产位移趋势与 `demo_multi_trajectory()` 映射一致:
+  - `0` 最后一帧 `x<0`
+  - `1` 最后一帧 `x>0`
+  - `2` 最后一帧 `y<0`
+  - `3` 最后一帧 `z<0`
+  - `4` 最后一帧 `z>0`
+  - `5` 中段有位移、首尾回到原点, 符合 orbit/clockwise
+
+### 当前结论
+
+- `/workspace/lyra/assets/demo/static/diffusion_output_generated_my` 这类目录的静态路径, 是由 `gen3c_single_image_sdg.py` 生成的, 不是 `sample.py` 写出来的。
+- `pose/*.npz` 当前真实资产语义可判定为 `camera-to-world (c2w)`.
+- `intrinsics/*.npz` 当前真实资产语义可判定为 OpenCV pinhole `[fx, fy, cx, cy]`.
+- `0..5` 子目录不是“样本编号”, 而是六条固定相机轨迹的 `traj_idx`, downstream 再把它们当作 multi-view 的 `view_id`.
+
+### 仍属推断的部分
+
+- `clockwise` 目录里的完整旋转方向是“从观察者视角顺时针”还是“从世界坐标绕物体正向转一圈”, 单靠目录名和中间位移还不能完全证明。
+- 但它确实是 `camera_utils.generate_camera_trajectory(... trajectory_type=\"clockwise\")` 生成的 orbit/spiral 轨迹, 这一点已被代码证据确认。
