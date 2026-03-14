@@ -756,3 +756,46 @@
   - `task_plan.md`
   - `WORKLOG.md`
   - `ERRORFIX.md`
+
+## 2026-03-14 17:08:00 UTC
+
+### 新任务: 把 `gen3c_single_image_sdg.py` 的视频编码质量固定为 9
+
+- [ ] 阶段1: 确认 `gen3c_single_image_sdg.py` 当前保存 mp4 的所有写入点
+- [ ] 阶段2: 统一改为固定质量 9
+- [ ] 阶段3: 做最小验证并回写六文件
+
+### 当前状态
+
+**目前在阶段1**
+- 已确认该脚本有两处 `save_video(..., video_save_quality=8, ...)`。
+- 用户要求只改 `gen3c_single_image_sdg.py`, 本轮不碰 `gen3c_dynamic_sdg.py`。
+
+## 2026-03-14 17:10:00 UTC
+
+### 阶段完成: `gen3c_single_image_sdg.py` 视频编码质量已固定为 9
+
+- [x] 阶段1: 确认 `gen3c_single_image_sdg.py` 当前保存 mp4 的所有写入点
+- [x] 阶段2: 统一改为固定质量 9
+- [x] 阶段3: 做最小验证并回写六文件
+
+### 已完成内容
+
+- 在 `gen3c_single_image_sdg.py` 新增:
+  - `SDG_VIDEO_SAVE_QUALITY = 9`
+- 已把该脚本中两处 `save_video(...)` 调用都改为复用这一个常量。
+- 明确没有改动:
+  - `gen3c_dynamic_sdg.py`
+
+### 验证结果
+
+- 搜索确认:
+  - `SDG_VIDEO_SAVE_QUALITY = 9`
+  - 两处写视频路径都已改为 `video_save_quality=SDG_VIDEO_SAVE_QUALITY`
+- 语法检查通过:
+  - `python3 -m py_compile cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py`
+
+### 当前状态
+
+**本任务已完成**
+- `gen3c_single_image_sdg.py` 现在固定以质量 9 写 mp4。

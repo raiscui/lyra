@@ -46,6 +46,12 @@ from cosmos_predict1.diffusion.inference.gen3c_single_image import (
 import torch.nn.functional as F
 torch.enable_grad(False)
 
+#
+# 统一收口单图 SDG 的 mp4 编码质量.
+# 这样 resume 补写和正常生成都会保持同一档位,避免局部漏改.
+#
+SDG_VIDEO_SAVE_QUALITY = 9
+
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Video to world generation demo script")
     # Add common arguments
@@ -750,7 +756,7 @@ def demo(args):
                     fps=args.fps,
                     H=int(video.shape[1]),
                     W=int(video.shape[2]),
-                    video_save_quality=8,
+                    video_save_quality=SDG_VIDEO_SAVE_QUALITY,
                     video_save_path=rgb_save_path,
                 )
                 log.info(f"[RESUME] Decoded video from latent and saved to {rgb_save_path}")
@@ -997,7 +1003,7 @@ def demo(args):
                 fps=args.fps,
                 H=int(final_video_to_save.shape[1]),
                 W=int(final_video_to_save.shape[2]),
-                video_save_quality=8,
+                video_save_quality=SDG_VIDEO_SAVE_QUALITY,
                 video_save_path=video_save_path,
             )
             log.info(f"[RESUME] Saved video to {video_save_path}")

@@ -62,16 +62,16 @@ CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) torchrun --nproc_per_node=1 cosmos_pre
 CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) torchrun --nproc_per_node=1 cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py \
     --checkpoint_dir checkpoints \
     --num_gpus 1 \
-    --input_image_path assets/demo/static/diffusion_input/images/xhc.png \
-    --video_save_folder assets/demo/static/diffusion_output_generated_xhc \
+    --input_image_path assets/demo/static/diffusion_input/images/xhc-bai.png \
+    --video_save_folder assets/demo/static/diffusion_output_generated_xhc_bai \
     --prompt "in the style of Makoto Shinkai,注意镜头移动时候,镜头光斑,灯光光影的正常,不要贴在墙上" \
     --negative_prompt "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, jerky movements, low frame rate, artifacting, color banding, unnatural transitions, outdated special effects, fake elements, unconvincing visuals, poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of poor quality. 光线和镜头光斑像贴纸一样贴在墙上,光线拐弯 " \
     --foreground_masking \
     --multi_trajectory \
     --moge_version v2 \
-    --auto_center_depth_quantile 0.25 \
-    --translation_reference_depth_scale 0.9 \
-    --total_movement_distance_factor 1.4
+    --auto_center_depth_quantile 0.2 \
+    --translation_reference_depth_scale 0.95 \
+    --total_movement_distance_factor 1.5
 ```
 
 
