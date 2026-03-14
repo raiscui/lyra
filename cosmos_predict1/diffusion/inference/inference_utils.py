@@ -31,6 +31,7 @@ from cosmos_predict1.diffusion.model.model_t2w import DiffusionT2WModel
 from cosmos_predict1.diffusion.model.model_v2w import DiffusionV2WModel
 from cosmos_predict1.diffusion.model.model_v2w_multiview import DiffusionMultiviewV2WModel
 from cosmos_predict1.diffusion.model.model_world_interpolator import DiffusionWorldInterpolatorWModel
+from cosmos_predict1.diffusion.inference.output_naming import DEFAULT_SINGLE_VIDEO_SAVE_NAME
 from cosmos_predict1.diffusion.training.models.extend_model import ExtendDiffusionModel
 from cosmos_predict1.utils import log
 from cosmos_predict1.utils.config_helper import get_config_module, override
@@ -90,7 +91,7 @@ def add_common_arguments(parser):
     parser.add_argument(
         "--video_save_name",
         type=str,
-        default="output",
+        default=DEFAULT_SINGLE_VIDEO_SAVE_NAME,
         help="Output filename for generating a single video",
     )
     parser.add_argument(

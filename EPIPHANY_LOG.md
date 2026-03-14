@@ -422,3 +422,39 @@
 - `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter64_20260310`
 - `outputs/refine_v2/full_view_sr_stage3b_phaseE_cli_resume_from_stage3sr_hr32_lr0p5_sub8_iter32_20260310`
 - `docs/cmd.md` 的下一条 `Phase E calibration` 记录
+
+## [2026-03-14 16:26:00 UTC] 主题: 纯命名/路径 helper 不应该藏在重推理模块里
+
+### 发现来源
+- 本轮给 sdg 推理脚本补输出命名测试时, 首版把 helper 直接写进了 `inference_utils.py`
+- 随后运行:
+  - `python3 -m pytest tests/test_inference_output_naming.py -q`
+- collection 阶段直接报:
+  - `ModuleNotFoundError: No module named 'imageio'`
+
+### 核心问题
+- `inference_utils.py` 本身承载的是整套推理运行时依赖
+- 一旦把纯字符串 helper 塞进去, 最小单测也会被 `imageio`、模型依赖、视频处理依赖一起绑住
+- 这会让“本来几毫秒就该验证完”的测试, 退化成环境耦合问题
+
+### 为什么重要
+- 这类问题不只会出现在命名规则
+- 以后凡是:
+  - 路径规划
+  - 参数归一化
+  - 轻量配置映射
+  - 纯数据结构转换
+- 如果逻辑本身不需要推理栈, 就应该抽到轻量模块, 否则测试成本会持续升高
+
+### 当前结论
+- 本轮已经把命名 helper 抽到:
+  - `cosmos_predict1/diffusion/inference/output_naming.py`
+- 结果是:
+  - 纯语法检查通过
+  - 定向测试 `6 passed`
+  - 不再依赖 `imageio` 才能验证文件名规则
+
+### 后续讨论入口
+- 下次如果还要给推理入口补“纯逻辑”测试, 先问自己:
+  - 这段逻辑真的需要 import 整个推理栈吗?
+  - 能不能先拆进一个标准库级别的轻量模块?

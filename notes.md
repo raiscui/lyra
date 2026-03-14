@@ -1349,3 +1349,85 @@
 
 - `clockwise` 目录里的完整旋转方向是“从观察者视角顺时针”还是“从世界坐标绕物体正向转一圈”, 单靠目录名和中间位移还不能完全证明。
 - 但它确实是 `camera_utils.generate_camera_trajectory(... trajectory_type=\"clockwise\")` 生成的 orbit/spiral 轨迹, 这一点已被代码证据确认。
+
+## [2026-03-14 16:17:47 UTC] 主题: `gen3c_*_sdg.py` 输出文件名过长
+
+### 现象
+
+- 用户执行 `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py` 时, 会生成形如:
+  - `xhc_in the style of Makoto Shinkai,注意镜头移动时候,镜头光斑,灯光光影的正常,不要贴在墙上.mp4`
+- 这个文件名同时存在:
+  - 很长
+  - 含空格
+  - 含逗号等标点
+- 同一个 `clip_name` 还会被复用于:
+  - `rgb/*.mp4`
+  - `pose/*.npz`
+  - `intrinsics/*.npz`
+  - `latent/*.pkl`
+
+### 静态证据
+
+- `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py:148` 的 `_build_clip_name(...)` 当前逻辑是:
+  - 先取输入图片 stem
+  - 再把 `prompt` 原样拼接到 `clip_name`
+  - batch 模式再追加 `index`
+- `cosmos_predict1/diffusion/inference/gen3c_dynamic_sdg.py:148` 也有同样逻辑。
+- 对照脚本 `cosmos_predict1/diffusion/inference/gen3c_single_image.py:576` 使用的是:
+  - `args.video_save_name`
+  - 或 batch index
+  - 不会把整段 prompt 直接拼进 `.mp4` 名字
+
+### 当前主假设
+
+- 这是历史兼容逻辑留下来的命名策略。
+- 它想解决的是“同一个输入图,不同 prompt 不能重名”。
+- 但做法过于直接,把整段 prompt 当文件名的一部分,导致可读性和路径安全性都变差。
+
+### 最强备选解释
+
+- 这套逻辑不只是为了区分 prompt, 还承担了 resume/断点续跑兼容旧产物的职责。
+- 如果直接把命名改成短名, 有可能让旧目录里的产物在预扫描时“看起来像不存在”, 从而重复生成。
+
+### 验证计划
+
+- 在轻量模块 `inference_utils.py` 中收拢“安全短名”生成逻辑。
+- 在两个 `*_sdg.py` 中同时替换, 避免同类脚本行为分叉。
+- 给新命名补最小单元测试。
+- 若发现旧命名确实参与 resume, 则保留 legacy 名称回退检查, 避免破坏历史产物复用。
+
+### 验证结果
+
+- 上述“命名 helper 直接放在 `inference_utils.py` 并跑测试”的子假设不成立。
+- 动态证据:
+  - `python3 -m pytest tests/test_inference_output_naming.py -q`
+  - 首轮报错:
+    - `ModuleNotFoundError: No module named 'imageio'`
+  - 说明纯命名测试被重推理依赖拖住了。
+- 因此已回滚该做法,改成:
+  - 新建轻量模块 `cosmos_predict1/diffusion/inference/output_naming.py`
+  - 脚本改为从该模块导入命名 helper
+  - 测试也只 import 轻量模块
+
+### 最终结论
+
+- 已验证根因不是 `save_video()` 或 mp4 编码层。
+- 真正导致长文件名的代码路径是:
+  - `gen3c_single_image_sdg.py` / `gen3c_dynamic_sdg.py`
+  - 旧 `_build_clip_name(...)` 把整段 prompt 原样拼进 `clip_name`
+- 最终修复策略是:
+  - 新生成默认走 `输入 stem + 短 prompt hash`
+  - 显式 `--video_save_name` 继续优先
+  - 旧长文件名产物若已存在, 仍能被 resume 逻辑识别并复用
+
+### 本轮关键验证命令与输出
+
+- 语法检查:
+  - `python3 -m py_compile cosmos_predict1/diffusion/inference/output_naming.py cosmos_predict1/diffusion/inference/inference_utils.py cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py cosmos_predict1/diffusion/inference/gen3c_dynamic_sdg.py tests/test_inference_output_naming.py`
+  - 结果: 通过
+- 定向测试:
+  - `python3 -m pytest tests/test_inference_output_naming.py -q`
+  - 结果: `6 passed in 0.02s`
+- 用用户示例 prompt 实际演算:
+  - 输出 `clip_name = xhc_97e474c6`
+  - 目标视频路径 `rgb/xhc_97e474c6.mp4`

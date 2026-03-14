@@ -17,12 +17,15 @@ import argparse
 import os
 import copy
 import torch
-from pathlib import Path
 import random
 import numpy as np
 from typing import Dict, Any
 from cosmos_predict1.diffusion.inference.inference_utils import (
     add_common_arguments,
+)
+from cosmos_predict1.diffusion.inference.output_naming import (
+    build_legacy_sdg_clip_name,
+    build_sdg_clip_name,
 )
 from cosmos_predict1.diffusion.inference.gen3c_pipeline import Gen3cPipeline
 from cosmos_predict1.utils import log, misc
@@ -146,14 +149,26 @@ def validate_args(args):
     assert (args.num_video_frames - 1) % 120 == 0, "num_video_frames must be 121, 241, 361, ... (N*120+1)"
 
 def _build_clip_name(args: argparse.Namespace, current_video_path: str, prompt: str | None, index: int) -> str:
-    """构造输出文件名的 key(与脚本历史行为保持一致)."""
+    """构造输出文件名的 key,避免把整段 prompt 直接拼进路径."""
 
-    clip_name = Path(current_video_path).stem
-    if prompt is not None and prompt != "":
-        clip_name = f"{clip_name}_{prompt}"
-    if args.batch_input_path is not None:
-        clip_name = f"{clip_name}_{index}"
-    return clip_name
+    return build_sdg_clip_name(
+        video_save_name=args.video_save_name,
+        visual_input_path=current_video_path,
+        prompt=prompt,
+        batch_input_path=args.batch_input_path,
+        index=index,
+    )
+
+
+def _build_legacy_clip_name(args: argparse.Namespace, current_video_path: str, prompt: str | None, index: int) -> str:
+    """复现历史命名,用于断点续跑兼容旧产物."""
+
+    return build_legacy_sdg_clip_name(
+        visual_input_path=current_video_path,
+        prompt=prompt,
+        batch_input_path=args.batch_input_path,
+        index=index,
+    )
 
 
 def _build_output_paths(args: argparse.Namespace, clip_name: str) -> dict[str, str]:
@@ -244,6 +259,36 @@ def _get_progress_status(args: argparse.Namespace, out_paths: dict[str, str]) ->
     }
 
 
+def _resolve_output_plan(
+    args: argparse.Namespace,
+    current_video_path: str,
+    prompt: str | None,
+    index: int,
+) -> tuple[str, dict[str, str], dict[str, bool]]:
+    """优先采用新短名,但保留对旧长文件名产物的 resume 能力."""
+
+    clip_name = _build_clip_name(args, current_video_path, prompt, index)
+    out_paths = _build_output_paths(args, clip_name)
+    status = _get_progress_status(args, out_paths)
+
+    legacy_clip_name = _build_legacy_clip_name(args, current_video_path, prompt, index)
+    if args.overwrite_existing or legacy_clip_name == clip_name:
+        return clip_name, out_paths, status
+
+    legacy_paths = _build_output_paths(args, legacy_clip_name)
+    legacy_status = _get_progress_status(args, legacy_paths)
+    if any(status.values()):
+        return clip_name, out_paths, status
+    if any(legacy_status.values()):
+        log.info(
+            f"[RESUME] Found legacy-named outputs for clip `{clip_name}`. "
+            f"Continuing with existing files under `{legacy_clip_name}`."
+        )
+        return legacy_clip_name, legacy_paths, legacy_status
+
+    return clip_name, out_paths, status
+
+
 def demo(args):
     """Run video-to-world generation demo.
 
@@ -302,9 +347,7 @@ def demo(args):
             work_items.append({"index": i, "skip_reason": "Visual input is missing."})
             continue
 
-        clip_name = _build_clip_name(args, current_video_path, current_prompt, i)
-        out_paths = _build_output_paths(args, clip_name)
-        status = _get_progress_status(args, out_paths)
+        clip_name, out_paths, status = _resolve_output_plan(args, current_video_path, current_prompt, i)
 
         if args.overwrite_existing:
             need_pose = True
