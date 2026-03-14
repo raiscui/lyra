@@ -22,7 +22,12 @@ import numpy as np
 import torch
 
 from cosmos_predict1.auxiliary.guardrail.common import presets as guardrail_presets
-from cosmos_predict1.auxiliary.t5_text_encoder import CosmosT5TextEncoder, DummyT5TextEncoder
+from cosmos_predict1.auxiliary.t5_text_encoder import (
+    DEFAULT_T5_MODEL_DIR,
+    DEFAULT_T5_MODEL_NAME,
+    CosmosT5TextEncoder,
+    DummyT5TextEncoder,
+)
 
 
 class BaseWorldGenerationPipeline(ABC):
@@ -131,8 +136,10 @@ class BaseWorldGenerationPipeline(ABC):
             # - 这里的 T5 prompt encoder 明确使用 Hugging Face 的 `google-t5/t5-11b`.
             # - 默认只从本地固定目录加载,避免"看起来名字一样但其实不是同一个模型"的误用.
             # - 如果目录不存在或不完整,`CosmosT5TextEncoder` 会抛出带指引的错误.
-            t5_dir = "/model/HuggingFace/google-t5/t5-11b"
-            self.text_encoder = CosmosT5TextEncoder(model_name="google-t5/t5-11b", cache_dir=t5_dir)
+            self.text_encoder = CosmosT5TextEncoder(
+                model_name=DEFAULT_T5_MODEL_NAME,
+                cache_dir=DEFAULT_T5_MODEL_DIR,
+            )
 
     def _load_text_guardrail(self):
         """Load text safety classifier models.

@@ -183,3 +183,74 @@
 - 本轮按上面口径重跑后, 实际结果为:
   - `113 passed`
 - 这说明前两种报错都属于环境口径错误, 不是本次代码回归.
+
+## [2026-03-14 16:26:00 UTC] 问题: sdg 推理脚本把整段 prompt 直接拼进输出文件名
+
+### 问题
+- 执行 `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py` 时, 默认会生成类似:
+  - `xhc_in the style of Makoto Shinkai,注意镜头移动时候,镜头光斑,灯光光影的正常,不要贴在墙上.mp4`
+- 这会导致:
+  - 文件名过长
+  - 含空格和标点
+  - 同一长名字还会同步污染 `pose/*.npz`、`intrinsics/*.npz`、`latent/*.pkl`
+
+### 原因
+- `gen3c_single_image_sdg.py` 与 `gen3c_dynamic_sdg.py` 的旧 `_build_clip_name(...)` 为了区分“同图不同 prompt”, 直接把完整 prompt 原样拼进 `clip_name`
+- 这个策略虽然能避免重名, 但没有考虑路径安全性和可读性
+
+### 修复
+- 把命名逻辑抽到轻量模块 `cosmos_predict1/diffusion/inference/output_naming.py`
+- 新规则改成:
+  - 显式 `--video_save_name` 时, 使用清洗后的自定义名字
+  - 默认情况下, 使用 `输入 stem + 短 prompt hash`
+  - batch 模式继续追加 `index`
+- 同时在两个 `*_sdg.py` 里加入 legacy 回退:
+  - 如果历史目录里已经存在旧长文件名产物, resume 仍会继续沿用旧路径, 不会误判成“需要重跑”
+
+### 验证
+- 语法检查通过:
+  - `python3 -m py_compile cosmos_predict1/diffusion/inference/output_naming.py cosmos_predict1/diffusion/inference/inference_utils.py cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py cosmos_predict1/diffusion/inference/gen3c_dynamic_sdg.py tests/test_inference_output_naming.py`
+- 定向测试通过:
+  - `python3 -m pytest tests/test_inference_output_naming.py -q`
+  - `6 passed in 0.02s`
+- 用用户这条 prompt 实际演算后, 结果为:
+  - `xhc_97e474c6`
+  - `rgb/xhc_97e474c6.mp4`
+
+## [2026-03-14 16:58:00 UTC] 问题: google-t5 默认值仍可能回落到 `~/.cache`
+
+### 问题
+- 主 pipeline 虽然已经显式把 T5 prompt encoder 指到 `/model/HuggingFace/google-t5/t5-11b`
+- 但 `CosmosT5TextEncoder` 类自己的默认 `cache_dir` 仍然是 `~/.cache`
+- 一旦其他入口直接 `CosmosT5TextEncoder()` 实例化, 就可能重新走到 HuggingFace 默认缓存链路
+
+### 原因
+- 路径策略只在上层入口修过一次
+- 底层编码器类没有把同一规则沉到默认值层
+- 结果就是:
+  - 主入口看起来是对的
+  - 但默认行为并不安全
+
+### 修复
+- 在 `cosmos_predict1/auxiliary/t5_text_encoder.py` 中新增:
+  - `DEFAULT_T5_MODEL_NAME`
+  - `DEFAULT_T5_MODEL_DIR`
+- 把 `CosmosT5TextEncoder` 默认 `cache_dir` 改为 `/model/HuggingFace/google-t5/t5-11b`
+- 让 `BaseWorldGenerationPipeline` 直接复用同一份常量, 不再保留另一份手写字符串
+- 新增 `tests/test_t5_text_encoder.py` 锁住:
+  - 直接实例化默认值
+  - 主 pipeline 的传参行为
+
+### 验证
+- 语法检查通过:
+  - `python3 -m py_compile cosmos_predict1/auxiliary/t5_text_encoder.py cosmos_predict1/utils/base_world_generation_pipeline.py tests/test_t5_text_encoder.py`
+- 定向测试通过:
+  - `python3 -m pytest tests/test_t5_text_encoder.py -q`
+  - `2 passed in 1.37s`
+
+### 额外踩坑记录
+- 首轮测试在 collection 阶段报:
+  - `ModuleNotFoundError: No module named 'transformers'`
+- 第二轮又因 `BaseWorldGenerationPipeline` 导入 guardrail 依赖报:
+  - `ModuleNotFoundError: No module named 'better_profanity'`
+- 这次没有给生产代码增加环境分支, 而是把测试改成 stub 第三方依赖, 只验证路径选择逻辑

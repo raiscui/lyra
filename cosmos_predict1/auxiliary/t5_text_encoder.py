@@ -22,15 +22,22 @@ from transformers import T5EncoderModel, T5TokenizerFast
 
 transformers.logging.set_verbosity_error()
 
+#
+# T5 prompt encoder 的默认模型信息集中放在这里.
+# 这样无论是直接实例化编码器,还是上层 pipeline 调用,都不会再分叉到不同目录.
+#
+DEFAULT_T5_MODEL_NAME = "google-t5/t5-11b"
+DEFAULT_T5_MODEL_DIR = "/model/HuggingFace/google-t5/t5-11b"
+
 
 class CosmosT5TextEncoder(torch.nn.Module):
     """Handles T5 text encoding operations."""
 
     def __init__(
         self,
-        model_name: str = "google-t5/t5-11b",
+        model_name: str = DEFAULT_T5_MODEL_NAME,
         device: str = "cuda",
-        cache_dir: str = "~/.cache",
+        cache_dir: str = DEFAULT_T5_MODEL_DIR,
     ):
         """Initializes the T5 tokenizer and encoder.
 
@@ -89,7 +96,7 @@ class CosmosT5TextEncoder(torch.nn.Module):
             ValueError: If the input prompts list is empty.
 
         Example:
-            >>> encoder = CosmosT5TextEncoder()
+            >>> encoder = CosmosT5TextEncoder(cache_dir=DEFAULT_T5_MODEL_DIR)
             >>> prompts = ["Hello world", "Another example"]
             >>> embeddings = encoder.encode_prompts(prompts, max_length=128)
         """

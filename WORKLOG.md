@@ -422,3 +422,46 @@
 - 这轮最重要的不是“64 比 32 好一点”, 而是正式把一个模糊判断变成了证据:
   - `32 iter` 明显不够
 - 因为这一刀只改了预算, 所以后续如果再扫 cap / regularizer, 归因会干净很多
+
+## [2026-03-14 16:26:00 UTC] 任务名称: 收敛 sdg 推理输出文件名, 避免 prompt 直拼路径
+
+### 任务内容
+- 修复 `gen3c_single_image_sdg.py` 与 `gen3c_dynamic_sdg.py` 生成过长输出文件名的问题
+- 让默认命名不再包含空格和标点
+- 保留对历史长文件名产物的 resume 兼容
+
+### 完成过程
+- 先用 `rg` 和 `ast-grep` 定位 `clip_name` 的生成链路, 确认问题点在两个 `*_sdg.py` 的 `_build_clip_name(...)`
+- 对照 `gen3c_single_image.py` 与 `add_common_arguments()` 的 `video_save_name` 语义, 决定不新增 CLI, 而是改良现有命名策略
+- 新建轻量模块 `cosmos_predict1/diffusion/inference/output_naming.py`, 集中放置:
+  - 安全文件名清洗
+  - `--video_save_name` 优先逻辑
+  - 默认 `输入 stem + 短 prompt hash`
+  - legacy 长文件名回退构造
+- 在 `gen3c_single_image_sdg.py` 与 `gen3c_dynamic_sdg.py` 中新增 `_resolve_output_plan(...)`, 让新命名优先, 但历史目录里已有旧产物时仍可继续 resume
+- 补充 `tests/test_inference_output_naming.py`, 再跑语法检查和定向测试完成验证
+
+### 总结感悟
+- 这次最值得复用的规律不是“怎么截断 prompt”, 而是“命名规则要同时考虑新产物可读性和旧产物续跑兼容性”
+- 另外, 纯字符串 helper 不应塞进重推理模块里。否则连最小单测都会被运行时依赖绑架
+
+## [2026-03-14 16:58:00 UTC] 任务名称: 统一 google-t5 默认加载目录到固定本地路径
+
+### 任务内容
+- 修复 `google-t5/t5-11b` 默认仍可能回落到 `~/.cache` 的问题
+- 让 `CosmosT5TextEncoder` 自身默认值与主 pipeline 使用同一份固定目录
+- 补最小回归测试, 锁住默认行为
+
+### 完成过程
+- 先用 `rg` 和 `ast-grep` 定位 T5 的加载链路, 确认:
+  - `BaseWorldGenerationPipeline` 已显式传 `/model/HuggingFace/google-t5/t5-11b`
+  - 但 `cosmos_predict1/auxiliary/t5_text_encoder.py` 的默认 `cache_dir` 仍是 `~/.cache`
+- 随后把 `DEFAULT_T5_MODEL_NAME` 与 `DEFAULT_T5_MODEL_DIR` 收敛到 `t5_text_encoder.py`
+- 再让 `BaseWorldGenerationPipeline` 直接复用这两个常量, 消除“双份字符串”
+- 最后新增 `tests/test_t5_text_encoder.py`, 分别验证:
+  - 直接 `CosmosT5TextEncoder()` 默认走固定本地目录
+  - 主 pipeline 传参也走同一份常量
+
+### 总结感悟
+- 这次真正需要修的不是“主入口有没有传对”, 而是“类默认值和主入口是否一致”
+- 只要底层默认值没收口, 新入口一出现, 问题就会回潮

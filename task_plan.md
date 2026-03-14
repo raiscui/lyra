@@ -611,3 +611,148 @@
 
 - 把关键文件路径、行号、动态验证结果整理成最终答复。
 - 明确区分“已验证事实”和“推断”。
+
+## 2026-03-14 16:17:47 UTC
+
+### 新任务: 收敛 diffusion 输出视频文件名, 避免把整段 prompt 直接拼进 `.mp4`
+
+- [ ] 阶段1: 定位 `gen3c_single_image_sdg.py` 及相关 helper 的文件名生成链路
+- [ ] 阶段2: 设计并实现安全、短且稳定的输出命名规则
+- [ ] 阶段3: 补最小回归验证, 确认不再生成带空格和标点的长文件名
+- [ ] 阶段4: 回写六文件并给出后续建议
+
+### 关键问题
+
+1. 当前长文件名是在哪一层生成的?
+   - 待验证。需要先确认是入口脚本直接拼接, 还是下层 `save_video` / 命名 helper 做的默认行为。
+2. 新命名规则应该优先保留什么?
+   - 候选假设: 保留输入图片 stem 作为人类可读前缀, 再用短 slug 或截断后的 prompt 片段补语义, 最后必要时加 hash 保证稳定和避免冲突。
+
+### 当前状态
+
+**目前在阶段1**
+- 正在用 `ast-grep` 和 `rg` 搜索 `.mp4` 输出命名链路。
+- 目标是先拿到静态证据, 再做最小正确修复。
+
+## 2026-03-14 16:26:00 UTC
+
+### 阶段完成: sdg 输出文件名已改为短安全名, 并保留 legacy resume 兼容
+
+- [x] 阶段1: 定位 `gen3c_single_image_sdg.py` 及相关 helper 的文件名生成链路
+- [x] 阶段2: 设计并实现安全、短且稳定的输出命名规则
+- [x] 阶段3: 补最小回归验证, 确认不再生成带空格和标点的长文件名
+- [x] 阶段4: 回写六文件并给出后续建议
+
+### 已完成内容
+
+- 已确认根因代码路径:
+  - `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py`
+  - `cosmos_predict1/diffusion/inference/gen3c_dynamic_sdg.py`
+- 已把新命名逻辑抽到:
+  - `cosmos_predict1/diffusion/inference/output_naming.py`
+- 已接入规则:
+  - 默认 `输入 stem + 短 prompt hash`
+  - 显式 `--video_save_name` 优先
+  - 已存在旧长文件名产物时, resume 继续兼容旧路径
+
+### 验证结果
+
+- `python3 -m py_compile ...` 已通过
+- `python3 -m pytest tests/test_inference_output_naming.py -q` 已通过:
+  - `6 passed in 0.02s`
+- 用用户示例 prompt 实际演算:
+  - `xhc_97e474c6`
+  - `rgb/xhc_97e474c6.mp4`
+
+### 当前状态
+
+**本任务已完成**
+- 接下来只需要在实际推理命令中直接使用当前脚本即可, 不必额外传长 prompt 到文件名。
+
+## 2026-03-14 16:41:00 UTC
+
+### 新任务: 把 google-t5 模型目录切到固定本地路径
+
+- [ ] 阶段1: 定位 google-t5 当前模型路径解析链路
+- [ ] 阶段2: 改成优先使用 /model/HuggingFace/google-t5/t5-11b
+- [ ] 阶段3: 做最小验证, 确认不再回落到 ~/.cache/huggingface/hub
+- [ ] 阶段4: 回写六文件并给出后续建议
+
+### 关键问题
+
+1. 当前是配置层写死了 cache 路径, 还是 loader 默认回落到了 HuggingFace cache?
+   - 待验证。需要先确认 google-t5 的 from_pretrained 调用和参数传递链路。
+2. 固定路径是否应该只改 google-t5, 还是抽象成通用模型根目录?
+   - 当前先按用户明确要求处理 google-t5, 除非代码结构显示顺手抽成单点更干净。
+
+### 当前状态
+
+**目前在阶段1**
+- 正在定位 google-t5 的配置来源、模型加载入口和路径拼接逻辑。
+- 目标是做一刀准确改动, 而不是只在外层再叠一个补丁。
+
+## 2026-03-14 16:58:00 UTC
+
+### 阶段完成: google-t5 默认本地目录已统一到固定路径
+
+- [x] 阶段1: 定位 google-t5 当前模型路径解析链路
+- [x] 阶段2: 改成优先使用 /model/HuggingFace/google-t5/t5-11b
+- [x] 阶段3: 做最小验证, 确认不再回落到 ~/.cache/huggingface/hub
+- [x] 阶段4: 回写六文件并给出后续建议
+
+### 现象
+
+- 主 pipeline 已经显式传入固定目录。
+- 但 `CosmosT5TextEncoder` 类自己的默认 `cache_dir` 仍然是 `~/.cache`。
+- 这意味着只要有别的入口直接实例化 `CosmosT5TextEncoder()`, 就仍然可能回到 HuggingFace 默认缓存链路。
+
+### 已验证结论
+
+- 已把 `google-t5/t5-11b` 的默认模型名与默认目录抽成单点常量:
+  - `DEFAULT_T5_MODEL_NAME`
+  - `DEFAULT_T5_MODEL_DIR`
+- `CosmosT5TextEncoder` 默认 `cache_dir` 已改为:
+  - `/model/HuggingFace/google-t5/t5-11b`
+- `BaseWorldGenerationPipeline` 现在也复用同一份常量, 不再自己写死另一份字符串。
+
+### 验证结果
+
+- 语法检查通过:
+  - `python3 -m py_compile cosmos_predict1/auxiliary/t5_text_encoder.py cosmos_predict1/utils/base_world_generation_pipeline.py tests/test_t5_text_encoder.py`
+- 定向测试通过:
+  - `python3 -m pytest tests/test_t5_text_encoder.py -q`
+  - `2 passed in 1.37s`
+
+### 过程中遇到的测试干扰
+
+- 首轮测试 collection 失败:
+  - `ModuleNotFoundError: No module named 'transformers'`
+- 第二轮测试失败:
+  - 导入 `BaseWorldGenerationPipeline` 时经过 guardrail 链路触发 `ModuleNotFoundError: No module named 'better_profanity'`
+- 这两条都已通过测试 stub 去耦解决, 没有改动生产逻辑。
+
+### 当前状态
+
+**本任务已完成**
+- 当前代码已经把 google-t5 的默认加载目录收口到固定本地路径。
+- 后续若还有新入口直接构造 `CosmosT5TextEncoder()`, 也会继承同样的固定目录行为。
+
+## 2026-03-14 17:02:00 UTC
+
+### 后续动作: 为 google-t5 路径修复创建独立 git 提交
+
+- [ ] 阶段1: 识别工作区内哪些改动属于本次 google-t5 修复
+- [ ] 阶段2: 仅暂存本次相关文件
+- [ ] 阶段3: 创建独立 commit, 不混入其他未提交改动
+
+### 当前状态
+
+**目前在阶段1**
+- 已观察到工作区还有 `sdg` 命名修复等其他未提交变更。
+- 本次 commit 将只包含:
+  - `cosmos_predict1/auxiliary/t5_text_encoder.py`
+  - `cosmos_predict1/utils/base_world_generation_pipeline.py`
+  - `tests/test_t5_text_encoder.py`
+  - `task_plan.md`
+  - `WORKLOG.md`
+  - `ERRORFIX.md`
