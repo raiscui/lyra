@@ -799,3 +799,109 @@
 
 **本任务已完成**
 - `gen3c_single_image_sdg.py` 现在固定以质量 9 写 mp4。
+
+## 2026-03-15 06:31:00 UTC
+
+### 新任务: 定位 `multi_trajectory` 生成 6 个相机运动的程序脚本与方法位置
+
+- [ ] 阶段1: 搜索 `multi_trajectory` 参数的定义与传递链路
+- [ ] 阶段2: 定位 6 个相机运动生成逻辑所在脚本、函数与关键代码位置
+- [ ] 阶段3: 用最小证据确认回答口径, 回写笔记与工作日志
+
+### 关键问题
+
+1. 用户问的是“6个相机运动由哪个脚本/方法生成”, 还是“`multi_trajectory` 参数在哪里被消费”? 
+   - 当前按两者都回答处理, 先找参数入口, 再找实际生成逻辑。
+2. 6个运动是否是写死的 6 条模板, 还是运行时动态组合出来的? 
+   - 待验证, 需要先看参数分支和轨迹生成函数。
+
+### 当前状态
+
+**目前在阶段1**
+- 已完成六文件历史上下文刷新。
+- 下一步用 `rg` + `ast-grep` 找 `multi_trajectory` 的定义、调用和生成链路。
+
+## 2026-03-15 06:35:00 UTC
+
+### 阶段完成: 已定位 `multi_trajectory` 对应 6 个相机运动的脚本、方法与代码位置
+
+- [x] 阶段1: 搜索 `multi_trajectory` 参数的定义与传递链路
+- [x] 阶段2: 定位 6 个相机运动生成逻辑所在脚本、函数与关键代码位置
+- [x] 阶段3: 用最小证据确认回答口径, 回写笔记与工作日志
+
+### 已验证结论
+
+- `--multi_trajectory` 的 shell 入口有两处:
+  - `scripts/bash/static_sdg.sh`
+  - `scripts/bash/dynamic_sdg.sh`
+- 实际枚举 6 条轨迹的位置有两处:
+  - `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py:1023-1043`
+  - `cosmos_predict1/diffusion/inference/gen3c_dynamic_sdg.py:870-912`
+- 两处 `demo_multi_trajectory(args)` 都定义了同一组 6 条轨迹:
+  - `left`, `right`, `up`, `zoom_out`, `zoom_in`, `clockwise`
+- 真正生成逐帧相机位姿序列的方法是:
+  - `cosmos_predict1/diffusion/inference/camera_utils.py:151-246`
+  - `generate_camera_trajectory(...)`
+- 底层分发:
+  - 平移类 -> `create_horizontal_trajectory(...)`
+  - 环绕类 -> `create_spiral_trajectory(...)`
+
+### 当前状态
+
+**本任务已完成**
+- 可以直接向用户给出“哪个脚本、哪个函数、哪几行”的精确回答。
+
+## 2026-03-15 06:38:00 UTC
+
+### 新任务: 把 `multi_trajectory` 与 6 条相机轨迹实现整理成可复用 Markdown 文档
+
+- [ ] 阶段1: 确认文档落点与现有相关文档, 避免重复或冲突
+- [ ] 阶段2: 编写面向其他项目复用的实现说明, 包含流程、6 条轨迹语义、伪代码与接入建议
+- [ ] 阶段3: 如包含 mermaid 图则验证语法, 再回写六文件并交付
+
+### 关键问题
+
+1. 文档只需要解释当前项目实现, 还是要抽象成“其他项目可移植方案”? 
+   - 当前按“先忠实描述当前实现, 再补一个可移植版本”处理。
+2. 是否值得加入流程图? 
+   - 值得。这个链路有“多轨迹枚举层”和“底层位姿生成层”两层, 图比纯文字更容易借鉴。
+
+### 当前状态
+
+**目前在阶段1**
+- 已经确认代码位置。
+- 下一步检查 `docs/` 下是否已有相同主题的文档, 然后新建一份可复用说明。
+
+## 2026-03-15 06:47:00 UTC
+
+### 阶段完成: `multi_trajectory` 可复用 Markdown 文档已产出并验证
+
+- [x] 阶段1: 确认文档落点与现有相关文档, 避免重复或冲突
+- [x] 阶段2: 编写面向其他项目复用的实现说明, 包含流程、6 条轨迹语义、伪代码与接入建议
+- [x] 阶段3: 如包含 mermaid 图则验证语法, 再回写六文件并交付
+
+### 已完成内容
+
+- 新增主文档:
+  - `docs/multi_trajectory_camera_implementation.md`
+- 新增流程图文档:
+  - `specs/2026-03-15-multi-trajectory-camera-flow.md`
+- 文档已覆盖:
+  - `demo_multi_trajectory(args)` 的批量枚举职责
+  - 6 条轨迹的 `traj_idx`、位移范围、底层轨迹族
+  - `generate_camera_trajectory(...)` 的分发逻辑
+  - `create_horizontal_trajectory(...)` / `create_spiral_trajectory(...)` 的实现方式
+  - 适合其他项目照搬的伪代码与落地建议
+
+### 验证结果
+
+- `beautiful-mermaid-rs --ascii < /tmp/multi_traj_flowchart.mmd` 通过
+- `beautiful-mermaid-rs --ascii < /tmp/multi_traj_sequence.mmd` 通过
+- 新文档半角标点检查通过:
+  - `multi_trajectory_camera_implementation.md 0`
+  - `2026-03-15-multi-trajectory-camera-flow.md 0`
+
+### 当前状态
+
+**本任务已完成**
+- 可以直接把 `docs/multi_trajectory_camera_implementation.md` 发给其他项目参考。

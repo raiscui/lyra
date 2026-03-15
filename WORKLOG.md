@@ -482,3 +482,44 @@
 ### 总结感悟
 - 这种“一份脚本里有多处相同 magic number”的场景, 用单点常量收口最稳
 - 这样后面如果还要继续从 `9` 改到别的值, 不会再漏掉某一条保存路径
+
+## [2026-03-15 06:35:30 UTC] 任务名称: 定位 `multi_trajectory` 六个相机运动的生成脚本与方法
+
+### 任务内容
+- 定位 `--multi_trajectory` 参数的入口脚本
+- 确认 6 个相机运动是在哪里枚举出来的
+- 确认真正生成相机轨迹矩阵的底层方法和代码位置
+
+### 完成过程
+- 先读取 `task_plan.md`、`WORKLOG.md`、`LATER_PLANS.md`、`EPIPHANY_LOG.md` 刷新上下文
+- 再用 `rg` 搜索 `multi_trajectory`、`demo_multi_trajectory`、`generate_camera_trajectory`
+- 随后用 `ast-grep` 验证 `demo_multi_trajectory` 的函数定义命中, 避免只靠字符串搜索
+- 最后串起 shell 入口脚本、SDG 入口函数和 `camera_utils.py` 里的底层轨迹生成函数
+
+### 总结感悟
+- 这个链路分成两层:
+  - 上层 SDG 入口脚本负责“枚举哪 6 条轨迹 + 给每条轨迹采样 movement_distance”
+  - 底层 `camera_utils.py` 负责“把轨迹名变成逐帧相机位姿序列”
+- 回答这类问题时, 只给底层函数名不够, 还必须把上层 `demo_multi_trajectory(args)` 的枚举位置一起指出来
+
+## [2026-03-15 06:47:30 UTC] 任务名称: 产出 `multi_trajectory` 相机运动实现复用文档
+
+### 任务内容
+- 把 `--multi_trajectory` 的实现方式整理成一份可给其他项目借鉴的 Markdown
+- 解释 6 条轨迹 preset 的职责、参数和底层轨迹生成方式
+- 用图表把批量枚举层和底层几何层的关系讲清楚
+
+### 完成过程
+- 先复核 `gen3c_single_image_sdg.py`、`gen3c_dynamic_sdg.py`、`camera_utils.py` 的关键实现位置
+- 新建 `docs/multi_trajectory_camera_implementation.md`, 把实现拆成:
+  - 参数入口
+  - 6 条轨迹枚举层
+  - 底层轨迹分发层
+  - 6 条轨迹的数学含义
+  - 给其他项目的最小可移植方案
+- 新建 `specs/2026-03-15-multi-trajectory-camera-flow.md`, 用 flowchart 和 sequenceDiagram 解释完整调用链
+- 最后用 `beautiful-mermaid-rs` 验证两段 mermaid 都能正确渲染
+
+### 总结感悟
+- 这套实现最值得复用的不是某一个轨迹公式, 而是"枚举层"和"几何层"分离的结构
+- 先把轨迹名字映射成统一接口, 再在底层分发几何生成器, 后续扩展新镜头时成本会低很多

@@ -1431,3 +1431,62 @@
 - 用用户示例 prompt 实际演算:
   - 输出 `clip_name = xhc_97e474c6`
   - 目标视频路径 `rgb/xhc_97e474c6.mp4`
+
+## 2026-03-15 06:34:00 UTC - `multi_trajectory` 六个相机运动生成链路定位
+
+### 现象
+- 用户询问: 开启 `multi_trajectory` 参数时, 程序里“6个相机运动”是由哪个脚本、哪个方法、哪个位置生成的。
+
+### 静态证据
+- shell 入口:
+  - `scripts/bash/static_sdg.sh:1-8` 调用 `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py --multi_trajectory`
+  - `scripts/bash/dynamic_sdg.sh:1-8` 调用 `cosmos_predict1/diffusion/inference/gen3c_dynamic_sdg.py --multi_trajectory`
+- 参数定义:
+  - `cosmos_predict1/diffusion/inference/gen3c_single_image_sdg.py:126-129`
+  - `cosmos_predict1/diffusion/inference/gen3c_dynamic_sdg.py:120-123`
+- 多轨迹入口:
+  - `gen3c_single_image_sdg.py:1023-1043` 的 `demo_multi_trajectory(args)`
+  - `gen3c_dynamic_sdg.py:870-912` 的 `demo_multi_trajectory(args)`
+- 这两个函数里都直接写死了 6 条轨迹字典:
+  - `left`
+  - `right`
+  - `up`
+  - `zoom_out`
+  - `zoom_in`
+  - `clockwise`
+- 底层真正生成相机位姿的方法是:
+  - `cosmos_predict1/diffusion/inference/camera_utils.py:151-246`
+  - 函数名: `generate_camera_trajectory(...)`
+- 该函数的分发关系:
+  - `left/right/up/zoom_in/zoom_out` -> `create_horizontal_trajectory(...)` (`camera_utils.py:48-97`)
+  - `clockwise/counterclockwise` -> `create_spiral_trajectory(...)` (`camera_utils.py:100-148`)
+
+### 动态证据
+- `ast-grep` 规则 `function_definition + identifier demo_multi_trajectory` 命中 2 处:
+  - `gen3c_single_image_sdg.py:1023-1043`
+  - `gen3c_dynamic_sdg.py:870-912`
+- `ast-grep` 搜索 `generate_camera_trajectory(trajectory_type=args.trajectory, ...)` 命中:
+  - `gen3c_single_image_sdg.py:827-837` 和 `674-684`
+  - `gen3c_dynamic_sdg.py:672-682` 和 `559-569`
+
+### 结论
+- “6个相机运动”不是在 `camera_utils.py` 里集中枚举的, 而是在两个 SDG 入口脚本各自的 `demo_multi_trajectory(args)` 里先枚举出来。
+- 真正把某个轨迹名转换成逐帧相机位姿序列的, 是 `camera_utils.py` 里的 `generate_camera_trajectory(...)`。
+
+## 2026-03-15 06:46:30 UTC - `multi_trajectory` 文档产出记录
+
+### 产出文件
+- `docs/multi_trajectory_camera_implementation.md`
+- `specs/2026-03-15-multi-trajectory-camera-flow.md`
+
+### 验证
+- `beautiful-mermaid-rs --ascii < /tmp/multi_traj_flowchart.mmd`
+- `beautiful-mermaid-rs --ascii < /tmp/multi_traj_sequence.mmd`
+- 两段 mermaid 均成功渲染为 Unicode 图.
+
+### 文档覆盖范围
+- `demo_multi_trajectory(args)` 的职责
+- 6 条轨迹 preset 的语义与范围
+- `generate_camera_trajectory(...)` 的分发逻辑
+- `create_horizontal_trajectory(...)` 与 `create_spiral_trajectory(...)` 的公式
+- 对其他项目的最小可移植方案与接入建议
